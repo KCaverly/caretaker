@@ -46,17 +46,12 @@ go build -o ct ./cmd/ct && ./ct
 
 A pinned status bar sits at the top at all times:
 
-```
- ☺    ✎  ✻  ❯                                       caretaker / feat-login
-────────────────────────────────────────────────────────────────────────────
-```
+The bar is a row of spaced **Nerd Font** glyphs (a Nerd Font is required). The caretaker shows a
+yellow smiley while you tend the deck and a red skull once you drop into a session; the nvim
+(code), claude (robot), and term (terminal) icons glow in their own colour when active and dim
+otherwise (faint until a workspace exists). The active repo / worktree shows on the right.
 
-The bar is a row of rounded zjstatus-style pills (Nerd Font powerline caps). The caretaker is a
-mode chip — a yellow **☺** while you tend the deck, a red **☠** once you drop into a session.
-The nvim (**✎**) / claude (**✻**) / term (**❯**) tabs fill with their own colour when active and
-stay muted otherwise, and the active repo / worktree shows as a chip on the right.
-
-- **Picker** (**☺**): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
+- **Picker** (smiley): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
   worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes).
 - Pressing **enter** on a worktree **activates** it: ct starts nvim + claude + a terminal in
   that worktree and drops you into the nvim view. The session segments light up and the active

@@ -38,7 +38,7 @@ func TestBarShowsWorkspaceWhenActive(t *testing.T) {
 
 	// No active workspace: icon-only tabs present, no repo/worktree label.
 	bar := m.renderBar()
-	for _, want := range []string{"☺", "✎", "✻", "❯"} {
+	for _, want := range []string{iconDeck, iconEditor, iconAgent, iconTerm} {
 		if !strings.Contains(bar, want) {
 			t.Errorf("bar missing tab icon %q", want)
 		}

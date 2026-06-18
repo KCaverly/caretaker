@@ -67,64 +67,63 @@ func (m Model) View() tea.View {
 	return v
 }
 
-// Rounded powerline caps (Nerd Font) that bracket each pill segment.
+// Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
-	pillCapLeft  = "\ue0b6" // left half-circle
-	pillCapRight = "\ue0b4" // right half-circle
+	iconDeck   = "" // fa-smile (U+F118)    — tending the deck (picker)
+	iconAway   = "󰚌" // md-skull (U+F068C)   — away in a session
+	iconEditor = "" // fa-code (U+F121)     — nvim
+	iconAgent  = "󰚩" // md-robot (U+F06A9)   — claude
+	iconTerm   = "" // fa-terminal (U+F120) — term
 )
 
 // renderBar draws the pinned status bar plus a light separator and a blank
-// spacing row (barHeight rows total), styled as zjstatus-like pills. The
-// caretaker is a coloured mode chip — yellow ☺ while you tend the deck, red ☠
-// once you drop into a session. The nvim / claude / term tabs are icon chips:
-// the active view fills with its own colour, the rest stay muted (and dimmer
-// still until a workspace exists). The current repo / worktree sits on the right.
+// spacing row (barHeight rows total). The four left icons (caretaker, nvim,
+// claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker shows a
+// yellow smiley while you tend the deck and a red skull once you drop into a
+// session; the session icons glow in their own colour when active and dim
+// otherwise (faint until a workspace exists). The current repo / worktree sits
+// on the right.
 func (m Model) renderBar() string {
 	has := m.current != nil
 
-	tab := func(glyph string, accent color.Color, active, enabled bool) string {
+	// All glyphs are bold (heaviest weight a cell allows); active gets its accent
+	// colour, idle is dim, and disabled is faint until a workspace exists.
+	glyph := func(g string, accent color.Color, active, enabled bool) string {
+		st := lipgloss.NewStyle().Bold(true)
 		switch {
 		case active:
-			return pill(glyph, cInk, accent)
+			return st.Foreground(accent).Render(g)
 		case enabled:
-			return pill(glyph, cFg, cSelBg)
+			return st.Foreground(cDim).Render(g)
 		default:
-			return pill(glyph, cDim, cFaint)
+			return st.Foreground(cFaint).Render(g)
 		}
 	}
 
-	// Caretaker mode chip.
-	ct := pill("☺", cInk, cYellow)
+	// Caretaker: smiley (tending the deck) vs skull (away in a session).
+	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
 	if m.screen != screenPicker {
-		ct = pill("☠", cInk, cRed)
+		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
 	}
 
-	tabs := strings.Join([]string{
-		tab("✎", cGreen, m.screen == screenEditor, has),
-		tab("✻", cPurple, m.screen == screenAgent, has),
-		tab("❯", cAccent, m.screen == screenTerminal, has),
-	}, " ")
-
-	left := " " + ct + "   " + tabs
+	// All four left icons share the same gap so they're equidistant.
+	left := "  " + strings.Join([]string{
+		ct,
+		glyph(iconEditor, cGreen, m.screen == screenEditor, has),
+		glyph(iconAgent, cPurple, m.screen == screenAgent, has),
+		glyph(iconTerm, cAccent, m.screen == screenTerminal, has),
+	}, "   ")
 
 	right := ""
 	if has {
-		right = pill(m.current.repo+" / "+m.current.worktree, cPurple, cSelBg) + " "
+		right = lipgloss.NewStyle().Bold(true).Foreground(cPurple).
+			Render(m.current.repo+" / "+m.current.worktree) + "  "
 	}
 
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
 	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
 	return bar + "\n" + sep + "\n"
-}
-
-// pill renders content as a rounded, filled segment: a left cap, the padded
-// fg-on-bg body, and a right cap (caps coloured to the body's background so the
-// ends read as rounded edges of the chip).
-func pill(content string, fg, bg color.Color) string {
-	capStyle := lipgloss.NewStyle().Foreground(bg)
-	body := lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg).Render(" " + content + " ")
-	return capStyle.Render(pillCapLeft) + body + capStyle.Render(pillCapRight)
 }
 
 // renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
