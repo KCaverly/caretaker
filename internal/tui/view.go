@@ -10,18 +10,18 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// Palette (tokyonight-ish).
+// Palette (gruvbox dark, medium contrast).
 var (
-	cAccent = lipgloss.Color("#7AA2F7")
-	cPurple = lipgloss.Color("#BB9AF7")
-	cGreen  = lipgloss.Color("#9ECE6A")
-	cYellow = lipgloss.Color("#E0AF68")
-	cRed    = lipgloss.Color("#F7768E")
-	cFg     = lipgloss.Color("#C0CAF5")
-	cDim    = lipgloss.Color("#565F89")
-	cFaint  = lipgloss.Color("#3B4261")
-	cSelBg  = lipgloss.Color("#283457")
-	cInk    = lipgloss.Color("#1A1B26")
+	cAccent = lipgloss.Color("#83A598") // bright blue
+	cPurple = lipgloss.Color("#D3869B") // bright purple
+	cGreen  = lipgloss.Color("#B8BB26") // bright green
+	cYellow = lipgloss.Color("#FABD2F") // bright yellow
+	cRed    = lipgloss.Color("#FB4934") // bright red
+	cFg     = lipgloss.Color("#EBDBB2") // fg1
+	cDim    = lipgloss.Color("#928374") // gray
+	cFaint  = lipgloss.Color("#665C54") // bg3
+	cSelBg  = lipgloss.Color("#504945") // bg2 (selection)
+	cInk    = lipgloss.Color("#1D2021") // bg0_h (hard)
 )
 
 var (
@@ -76,8 +76,8 @@ const (
 	iconTerm   = "" // fa-terminal (U+F120) — term
 )
 
-// renderBar draws the pinned status bar plus a light separator and a blank
-// spacing row (barHeight rows total). The four left icons (caretaker, nvim,
+// renderBar draws the pinned status bar plus a light separator directly
+// beneath it (barHeight rows total). The four left icons (caretaker, nvim,
 // claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker shows a
 // yellow smiley while you tend the deck and a red skull once you drop into a
 // session; the session icons glow in their own colour when active and dim
@@ -123,7 +123,7 @@ func (m Model) renderBar() string {
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
 	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
-	return bar + "\n" + sep + "\n"
+	return bar + "\n" + sep
 }
 
 // renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.

@@ -14,9 +14,9 @@ import (
 	"github.com/KCaverly/caretaker/internal/session"
 )
 
-// barHeight is the number of rows the top chrome occupies: the status bar, a
-// light separator line, and a blank spacing row beneath it.
-const barHeight = 3
+// barHeight is the number of rows the top chrome occupies: the status bar and
+// a light separator line directly beneath it.
+const barHeight = 2
 
 // Default reserved keys (not forwarded to embedded sessions); overridable via config.
 const (
