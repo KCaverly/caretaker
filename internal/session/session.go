@@ -109,6 +109,10 @@ func (s *Session) signal() {
 // SendKey forwards a key event to the program.
 func (s *Session) SendKey(k uv.KeyEvent) { s.emu.SendKey(k) }
 
+// SendMouse forwards a mouse event to the program (the emulator only encodes it
+// if the program has requested a mouse mode).
+func (s *Session) SendMouse(m uv.MouseEvent) { s.emu.SendMouse(m) }
+
 // Render returns the program's current screen as a styled string.
 func (s *Session) Render() string { return s.emu.Render() }
 

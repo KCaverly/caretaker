@@ -236,6 +236,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dirtyMsg:
 		return m, m.repaintCmd()
 
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
+	case tea.MouseReleaseMsg:
+		m.forwardMouse(msg)
+		return m, nil
+	case tea.MouseWheelMsg:
+		m.forwardMouse(msg)
+		return m, nil
+	case tea.MouseMotionMsg:
+		m.forwardMouse(msg)
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -281,6 +293,53 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.SendKey(toUVKey(msg))
 	}
 	return m, nil
+}
+
+// handleMouseClick switches tabs when a left-click lands on a bar icon, and
+// otherwise forwards the click to the active session.
+func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	mo := msg.Mouse()
+	if mo.Button == tea.MouseLeft {
+		if s, ok := m.tabAt(mo.X, mo.Y); ok {
+			return m.selectTab(s), nil
+		}
+	}
+	m.forwardMouse(msg)
+	return m, nil
+}
+
+// selectTab activates a clicked bar tab: the picker is always reachable; the
+// session tabs only switch when a workspace is active.
+func (m Model) selectTab(s screen) tea.Model {
+	if s == screenPicker || m.current != nil {
+		m.screen = s
+	}
+	return m
+}
+
+// forwardMouse relays a mouse event to the active session (translated below the
+// bar). The emulator only encodes it if the program has enabled mouse reporting.
+func (m Model) forwardMouse(msg tea.MouseMsg) {
+	if m.screen == screenPicker {
+		return
+	}
+	s := m.activeSession()
+	if s == nil || msg.Mouse().Y < barHeight {
+		return
+	}
+	shift := func(mo tea.Mouse) uv.Mouse {
+		return uv.Mouse{X: mo.X, Y: mo.Y - barHeight, Button: mo.Button, Mod: uv.KeyMod(mo.Mod)}
+	}
+	switch e := msg.(type) {
+	case tea.MouseClickMsg:
+		s.SendMouse(uv.MouseClickEvent(shift(e.Mouse())))
+	case tea.MouseReleaseMsg:
+		s.SendMouse(uv.MouseReleaseEvent(shift(e.Mouse())))
+	case tea.MouseWheelMsg:
+		s.SendMouse(uv.MouseWheelEvent(shift(e.Mouse())))
+	case tea.MouseMotionMsg:
+		s.SendMouse(uv.MouseMotionEvent(shift(e.Mouse())))
+	}
 }
 
 func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {

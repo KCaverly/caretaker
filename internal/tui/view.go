@@ -64,6 +64,7 @@ func (m Model) View() tea.View {
 	v := tea.NewView(chrome + "\n" + body)
 	v.AltScreen = true
 	v.Cursor = cursor
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
@@ -124,6 +125,38 @@ func (m Model) renderBar() string {
 	bar := left + strings.Repeat(" ", gap) + right
 	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
 	return bar + "\n" + sep
+}
+
+// tabAt maps bar coordinates to the tab/screen under them, if a click landed on
+// one of the four left icons. It mirrors renderBar's layout exactly: a 2-column
+// lead-in, each icon, and a 3-column gap between them; each icon's hit target
+// includes one column of slack on each side. Only the bar row (y == 0) counts.
+func (m Model) tabAt(x, y int) (screen, bool) {
+	if y != 0 {
+		return 0, false
+	}
+	caretaker := iconDeck
+	if m.screen != screenPicker {
+		caretaker = iconAway
+	}
+	zones := []struct {
+		glyph string
+		s     screen
+	}{
+		{caretaker, screenPicker},
+		{iconEditor, screenEditor},
+		{iconAgent, screenAgent},
+		{iconTerm, screenTerminal},
+	}
+	col := 2 // leading "  " in renderBar
+	for _, z := range zones {
+		w := lipgloss.Width(z.glyph)
+		if x >= col-1 && x < col+w+1 {
+			return z.s, true
+		}
+		col += w + 3 // glyph + the 3-space Join separator
+	}
+	return 0, false
 }
 
 // renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.

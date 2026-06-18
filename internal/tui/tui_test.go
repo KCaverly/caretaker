@@ -56,6 +56,54 @@ func TestBarShowsWorkspaceWhenActive(t *testing.T) {
 	}
 }
 
+func TestTabAtMapsIcons(t *testing.T) {
+	m := sampleModel()
+
+	if _, ok := m.tabAt(2, 1); ok {
+		t.Error("tabAt should ignore non-bar rows")
+	}
+
+	// Scanning the bar row should hit the four tabs left-to-right in order,
+	// regardless of each glyph's rendered width.
+	var seen []screen
+	for x := 0; x < 80; x++ {
+		if s, ok := m.tabAt(x, 0); ok {
+			if len(seen) == 0 || seen[len(seen)-1] != s {
+				seen = append(seen, s)
+			}
+		}
+	}
+	want := []screen{screenPicker, screenEditor, screenAgent, screenTerminal}
+	if len(seen) != len(want) {
+		t.Fatalf("expected tabs %v, got %v", want, seen)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("tab order mismatch: got %v want %v", seen, want)
+		}
+	}
+}
+
+func TestSelectTabGating(t *testing.T) {
+	m := sampleModel() // default screen is the picker
+
+	// Session tabs are ignored until a workspace is active.
+	if got := m.selectTab(screenEditor).(Model); got.screen != screenPicker {
+		t.Error("session tab should be ignored without an active workspace")
+	}
+
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w"}
+	if got := m.selectTab(screenEditor).(Model); got.screen != screenEditor {
+		t.Error("session tab should switch when a workspace is active")
+	}
+
+	// The picker tab is always reachable.
+	m.screen = screenTerminal
+	if got := m.selectTab(screenPicker).(Model); got.screen != screenPicker {
+		t.Error("picker tab should always be reachable")
+	}
+}
+
 func TestToUVKey(t *testing.T) {
 	uvk := toUVKey(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	if uvk.Code != 'a' || uvk.Text != "a" {
