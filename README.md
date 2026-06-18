@@ -61,9 +61,11 @@ otherwise (faint until a workspace exists). The active repo / worktree shows on 
   that worktree and drops you into the nvim view. The session segments light up and the active
   repo / worktree shows on the right.
 - **`ctrl+o`** cycles the session views (nvim → claude → terminal → nvim); **`ctrl+g`** returns
-  to the picker. You can also **click** any of the four bar icons to jump straight to that view
-  (the session icons are inert until a workspace is active). Sessions keep running — switching
-  never relaunches them, and they persist for ct's lifetime.
+  to the picker — and from the picker, **`ctrl+g`** jumps straight to your most recently opened
+  worktree, so it toggles you between the deck and your latest work. You can also **click** any
+  of the four bar icons to jump straight to that view (the session icons are inert until a
+  workspace is active). Sessions keep running — switching never relaunches them, and they
+  persist for ct's lifetime.
 
 Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `ctrl+c` quit.
 

@@ -361,6 +361,14 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
 	}
+	// The picker key jumps straight to the most recently activated worktree, so
+	// it toggles: session -> picker -> back to the most recent work.
+	if msg.String() == m.keyPicker {
+		if r, w, p, ok := m.mostRecentWorktree(); ok {
+			return m.activate(r, w, p)
+		}
+		return m, nil
+	}
 	if msg.String() == "tab" {
 		return m.toggleFocus()
 	}
@@ -558,6 +566,27 @@ func (m *Model) recomputeActive() {
 	}
 	m.active = items
 	m.activeCursor = clamp(m.activeCursor, 0, max(0, len(items)-1))
+}
+
+// mostRecentWorktree returns the worktree opened most recently in ct (across
+// all repos), or ok=false if none has ever been opened.
+func (m Model) mostRecentWorktree() (repoName, wtName, path string, ok bool) {
+	if m.state == nil {
+		return
+	}
+	var best int64
+	for _, g := range m.groups {
+		for _, wv := range g.Worktrees {
+			if wv.WT.IsMain {
+				continue
+			}
+			if t := m.state.Opened(wsKey(g.Repo.Name, wv.WT.Name)); t > best {
+				best = t
+				repoName, wtName, path, ok = g.Repo.Name, wv.WT.Name, wv.WT.Path, true
+			}
+		}
+	}
+	return
 }
 
 // computeRecentRanks finds the three worktrees opened most recently in ct

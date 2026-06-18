@@ -174,6 +174,62 @@ func TestRecentRanks(t *testing.T) {
 	}
 }
 
+func TestMostRecentWorktree(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	m := New(&Controller{}, session.NewManager())
+	m.groups = []Group{
+		{Repo: repo.Repo{Name: "r1"}, Worktrees: []WorktreeView{
+			{WT: repo.Worktree{Repo: "r1", Name: "a", Path: "/p/a"}},
+		}},
+		{Repo: repo.Repo{Name: "r2"}, Worktrees: []WorktreeView{
+			{WT: repo.Worktree{Repo: "r2", Name: "b", Path: "/p/b"}},
+		}},
+	}
+	m.state.LastOpened["r1/a"] = 100
+	m.state.LastOpened["r2/b"] = 200
+
+	r, w, p, ok := m.mostRecentWorktree()
+	if !ok || r != "r2" || w != "b" || p != "/p/b" {
+		t.Fatalf("got %q/%q/%q ok=%v, want r2/b//p/b", r, w, p, ok)
+	}
+
+	// No history → not ok.
+	empty := New(&Controller{}, session.NewManager())
+	if _, _, _, ok := empty.mostRecentWorktree(); ok {
+		t.Error("empty history should return ok=false")
+	}
+}
+
+func TestPickerKeyJumpsToRecent(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+	m.groups = []Group{{Repo: repo.Repo{Name: "repo"}, Worktrees: []WorktreeView{
+		{WT: repo.Worktree{Repo: "repo", Name: "wt", Path: t.TempDir()}},
+	}}}
+	m.state.LastOpened["repo/wt"] = 100
+
+	// In the picker, the picker key jumps to the most recent worktree.
+	mm, _ = m.handlePicker(ctrlKey('g'))
+	m = mm.(Model)
+	if m.screen != screenEditor {
+		t.Fatalf("expected editor after ctrl+g, got %v", m.screen)
+	}
+	if m.current == nil || m.current.key != "repo/wt" {
+		t.Fatalf("expected current repo/wt, got %+v", m.current)
+	}
+}
+
 func TestToUVKey(t *testing.T) {
 	uvk := toUVKey(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	if uvk.Code != 'a' || uvk.Text != "a" {
