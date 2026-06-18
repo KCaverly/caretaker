@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 )
 
@@ -101,6 +102,75 @@ func TestSelectTabGating(t *testing.T) {
 	m.screen = screenTerminal
 	if got := m.selectTab(screenPicker).(Model); got.screen != screenPicker {
 		t.Error("picker tab should always be reachable")
+	}
+}
+
+func TestActiveSortByRecency(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir()) // hermetic, empty state
+
+	m := New(&Controller{}, session.NewManager())
+	m.groups = []Group{{
+		Repo: repo.Repo{Name: "r"},
+		Worktrees: []WorktreeView{
+			{WT: repo.Worktree{Repo: "r", Name: "a"}, CommitTime: 10},
+			{WT: repo.Worktree{Repo: "r", Name: "b"}, CommitTime: 30},
+			{WT: repo.Worktree{Repo: "r", Name: "c"}, CommitTime: 20},
+		},
+	}}
+
+	// "a" was opened in ct most recently; "b"/"c" never opened, so they fall
+	// back to commit time (b=30 before c=20).
+	m.state.LastOpened["r/a"] = 1000
+	m.recomputeActive()
+
+	var got []string
+	for _, it := range m.active {
+		got = append(got, it.view.WT.Name)
+	}
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("recency order: got %v want %v", got, want)
+		}
+	}
+}
+
+func TestRecentRanks(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	m := New(&Controller{}, session.NewManager())
+	m.groups = []Group{
+		{Repo: repo.Repo{Name: "r1"}, Worktrees: []WorktreeView{
+			{WT: repo.Worktree{Repo: "r1", Name: "a"}},
+			{WT: repo.Worktree{Repo: "r1", Name: "b"}},
+		}},
+		{Repo: repo.Repo{Name: "r2"}, Worktrees: []WorktreeView{
+			{WT: repo.Worktree{Repo: "r2", Name: "c"}},
+			{WT: repo.Worktree{Repo: "r2", Name: "d"}}, // never opened
+		}},
+	}
+	m.state.LastOpened["r2/c"] = 300
+	m.state.LastOpened["r1/b"] = 200
+	m.state.LastOpened["r1/a"] = 100
+	m.computeRecentRanks()
+
+	for key, want := range map[string]int{"r2/c": 1, "r1/b": 2, "r1/a": 3} {
+		if got := m.recentRank[key]; got != want {
+			t.Errorf("rank %q: got %d want %d", key, got, want)
+		}
+	}
+	if _, ok := m.recentRank["r2/d"]; ok {
+		t.Error("never-opened worktree should not be ranked")
+	}
+
+	// The rank-1 worktree's row should show a leading "1".
+	m.recomputeActive()
+	row := m.activeRow(activeItem{repo: repo.Repo{Name: "r2"}, view: WorktreeView{WT: repo.Worktree{Repo: "r2", Name: "c"}}}, false, 40)
+	if !strings.Contains(row, "1") {
+		t.Errorf("rank-1 row should show 1: %q", row)
 	}
 }
 

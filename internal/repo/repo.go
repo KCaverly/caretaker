@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -28,7 +29,8 @@ type Worktree struct {
 
 // Status is the coarse git state of a worktree.
 type Status struct {
-	Dirty bool // uncommitted changes present
+	Dirty      bool  // uncommitted changes present
+	CommitTime int64 // HEAD commit time (unix seconds), 0 if unknown
 }
 
 // DiscoverRepos returns the git repositories that are immediate children of root,
@@ -117,7 +119,13 @@ func WorktreeStatus(wt Worktree) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	return Status{Dirty: strings.TrimSpace(out) != ""}, nil
+	st := Status{Dirty: strings.TrimSpace(out) != ""}
+	if ct, err := git(wt.Path, "log", "-1", "--format=%ct"); err == nil {
+		if t, err := strconv.ParseInt(strings.TrimSpace(ct), 10, 64); err == nil {
+			st.CommitTime = t
+		}
+	}
+	return st, nil
 }
 
 // CreateWorktree adds a new worktree at relPath (relative to the repo) on a new

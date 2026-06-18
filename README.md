@@ -52,7 +52,11 @@ yellow smiley while you tend the deck and a red skull once you drop into a sessi
 otherwise (faint until a workspace exists). The active repo / worktree shows on the right.
 
 - **Picker** (smiley): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
-  worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes).
+  worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes). Within each
+  repo, worktrees are ordered by when you last opened them in ct (most recent first), falling
+  back to git commit time for ones you haven't opened yet. The three most-recently-opened
+  worktrees overall get a `1`/`2`/`3` rank in the left column. Last-opened times are persisted to
+  `$XDG_STATE_HOME/ct/state.json` (default `~/.local/state/ct/state.json`).
 - Pressing **enter** on a worktree **activates** it: ct starts nvim + claude + a terminal in
   that worktree and drops you into the nvim view. The session segments light up and the active
   repo / worktree shows on the right.
@@ -61,7 +65,7 @@ otherwise (faint until a workspace exists). The active repo / worktree shows on 
   (the session icons are inert until a workspace is active). Sessions keep running — switching
   never relaunches them, and they persist for ct's lifetime.
 
-Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `q` quit.
+Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `ctrl+c` quit.
 
 ## Layout
 

@@ -34,6 +34,7 @@ var (
 	dimStyle     = lipgloss.NewStyle().Foreground(cDim)
 	liveStyle    = lipgloss.NewStyle().Foreground(cGreen)
 	dirtyStyle   = lipgloss.NewStyle().Foreground(cYellow)
+	recentStyle  = lipgloss.NewStyle().Foreground(cYellow)
 	selStyle     = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cSelBg)
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
@@ -115,9 +116,11 @@ func (m Model) renderBar() string {
 		glyph(iconTerm, cAccent, m.screen == screenTerminal, has),
 	}, "   ")
 
+	// Repo / worktree, de-emphasised (terminals can't shrink a run of text, so
+	// we reduce its weight and colour instead).
 	right := ""
 	if has {
-		right = lipgloss.NewStyle().Bold(true).Foreground(cPurple).
+		right = lipgloss.NewStyle().Foreground(cDim).
 			Render(m.current.repo+" / "+m.current.worktree) + "  "
 	}
 
@@ -267,10 +270,22 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 		dirtyChar = "✷"
 	}
 
-	if highlight {
-		return selBar(fmt.Sprintf("  ▸ %s %s %s", dotChar, dirtyChar, it.view.WT.Name), innerW)
+	// Leading rank column (1..3) for the worktrees most recently opened in ct,
+	// blank otherwise. A 6-column gutter keeps selected/unselected rows aligned.
+	rank := m.recentRank[wsKey(it.repo.Name, it.view.WT.Name)]
+	rankCh := " "
+	if rank > 0 {
+		rankCh = strconv.Itoa(rank)
 	}
 
+	if highlight {
+		return selBar(fmt.Sprintf("  %s ▸ %s %s %s", rankCh, dotChar, dirtyChar, it.view.WT.Name), innerW)
+	}
+
+	rankCol := " "
+	if rank > 0 {
+		rankCol = recentStyle.Render(rankCh)
+	}
 	dot := dimStyle.Render(dotChar)
 	if it.view.Live {
 		dot = liveStyle.Render(dotChar)
@@ -279,10 +294,16 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	if it.view.Dirty {
 		dirty = dirtyStyle.Render(dirtyChar)
 	}
-	return "    " + dot + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+	return "  " + rankCol + "   " + dot + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
 }
 
 func (m Model) renderFooter() string {
+	return m.centerFooter(m.footerContent())
+}
+
+// footerContent builds the two-row footer (status line + help line) before
+// centering.
+func (m Model) footerContent() string {
 	switch m.mode {
 	case modeCreateName:
 		return "\n" + helpStyle.Render(m.status)
@@ -300,7 +321,7 @@ func (m Model) renderFooter() string {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
 			keyhint("d", "stop"), keyhint("x", "remove"),
-			keyhint("tab", "new"), keyhint("q", "quit"),
+			keyhint("tab", "new"), keyhint("ctrl+c", "quit"),
 		}
 	}
 	help := strings.Join(hints, helpStyle.Render("  ·  "))
@@ -313,6 +334,22 @@ func (m Model) renderFooter() string {
 		return style.Render(m.status) + "\n" + help
 	}
 	return "\n" + help
+}
+
+// centerFooter horizontally centers each footer row within the deck width by
+// left-padding. Lines wider than the deck are left as-is (no wrapping), so the
+// footer keeps its row count.
+func (m Model) centerFooter(content string) string {
+	if m.width <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	for i, ln := range lines {
+		if pad := (m.width - lipgloss.Width(ln)) / 2; pad > 0 {
+			lines[i] = strings.Repeat(" ", pad) + ln
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // --- helpers ---

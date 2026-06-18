@@ -20,9 +20,10 @@ func NewController(cfg config.Config) *Controller {
 
 // WorktreeView is a worktree plus its current status.
 type WorktreeView struct {
-	WT    repo.Worktree
-	Live  bool // has running sessions
-	Dirty bool // uncommitted changes
+	WT         repo.Worktree
+	Live       bool  // has running sessions
+	Dirty      bool  // uncommitted changes
+	CommitTime int64 // HEAD commit time (unix seconds), fallback sort key
 }
 
 // Group is a repo and its worktrees.
@@ -48,7 +49,7 @@ func (c *Controller) Load() ([]Group, error) {
 		g := Group{Repo: r, Worktrees: make([]WorktreeView, 0, len(wts))}
 		for _, wt := range wts {
 			st, _ := repo.WorktreeStatus(wt)
-			g.Worktrees = append(g.Worktrees, WorktreeView{WT: wt, Dirty: st.Dirty})
+			g.Worktrees = append(g.Worktrees, WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: st.CommitTime})
 		}
 		groups = append(groups, g)
 	}

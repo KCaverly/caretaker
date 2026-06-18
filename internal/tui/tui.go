@@ -3,6 +3,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/state"
 )
 
 // barHeight is the number of rows the top chrome occupies: the status bar and
@@ -90,8 +92,9 @@ type activeItem struct {
 // Model is the ct UI: a pinned status bar plus the active screen (picker or an
 // embedded nvim/claude/terminal session).
 type Model struct {
-	ctrl *Controller
-	mgr  *session.Manager
+	ctrl  *Controller
+	mgr   *session.Manager
+	state *state.State
 
 	keyCycle, keyPicker string
 
@@ -115,6 +118,7 @@ type Model struct {
 	// "active" section
 	active       []activeItem
 	activeCursor int
+	recentRank   map[string]int // worktree key -> recency rank (1..3); absent = none
 
 	status        string
 	width, height int
@@ -140,7 +144,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	}
 
 	return Model{
-		ctrl: ctrl, mgr: mgr,
+		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyPicker: picker,
 		filter: filter, nameInput: name, focus: focusNew,
 	}
@@ -218,6 +222,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.groups = msg.groups
 		m.recomputeMatches()
 		m.recomputeActive()
+		m.computeRecentRanks()
 		return m, nil
 
 	case createdMsg:
@@ -268,6 +273,10 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	m.current = &workspaceRef{repo: repoName, worktree: wtName, key: key, sessions: ss}
 	m.screen = screenEditor
 	m.status = ""
+	if m.state != nil {
+		m.state.Touch(key)
+		_ = m.state.Save()
+	}
 	return m, m.loadCmd()
 }
 
@@ -407,8 +416,6 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q":
-		return m, tea.Quit
 	case "up", "k":
 		if m.activeCursor > 0 {
 			m.activeCursor--
@@ -534,6 +541,7 @@ func (m *Model) recomputeMatches() {
 func (m *Model) recomputeActive() {
 	var items []activeItem
 	for _, g := range m.groups {
+		var views []WorktreeView
 		for _, wv := range g.Worktrees {
 			if wv.WT.IsMain {
 				continue
@@ -541,11 +549,70 @@ func (m *Model) recomputeActive() {
 			if m.mgr != nil {
 				wv.Live = m.mgr.Has(wsKey(g.Repo.Name, wv.WT.Name))
 			}
+			views = append(views, wv)
+		}
+		m.sortByRecency(g.Repo.Name, views)
+		for _, wv := range views {
 			items = append(items, activeItem{repo: g.Repo, view: wv})
 		}
 	}
 	m.active = items
 	m.activeCursor = clamp(m.activeCursor, 0, max(0, len(items)-1))
+}
+
+// computeRecentRanks finds the three worktrees opened most recently in ct
+// (across all repos) and maps their keys to ranks 1..3 for badge display.
+func (m *Model) computeRecentRanks() {
+	m.recentRank = nil
+	if m.state == nil {
+		return
+	}
+	type wr struct {
+		key string
+		t   int64
+	}
+	var ws []wr
+	for _, g := range m.groups {
+		for _, wv := range g.Worktrees {
+			if wv.WT.IsMain {
+				continue
+			}
+			key := wsKey(g.Repo.Name, wv.WT.Name)
+			if t := m.state.Opened(key); t > 0 {
+				ws = append(ws, wr{key, t})
+			}
+		}
+	}
+	sort.SliceStable(ws, func(i, j int) bool { return ws[i].t > ws[j].t })
+
+	ranks := make(map[string]int, 3)
+	for i, w := range ws {
+		if i >= 3 {
+			break
+		}
+		ranks[w.key] = i + 1
+	}
+	m.recentRank = ranks
+}
+
+// sortByRecency orders a repo's worktrees most-recent-first: by when ct last
+// opened them, then (for never-opened ones) by HEAD commit time, then by name.
+func (m *Model) sortByRecency(repoName string, views []WorktreeView) {
+	opened := func(name string) int64 {
+		if m.state == nil {
+			return 0
+		}
+		return m.state.Opened(wsKey(repoName, name))
+	}
+	sort.SliceStable(views, func(i, j int) bool {
+		if oi, oj := opened(views[i].WT.Name), opened(views[j].WT.Name); oi != oj {
+			return oi > oj
+		}
+		if views[i].CommitTime != views[j].CommitTime {
+			return views[i].CommitTime > views[j].CommitTime
+		}
+		return views[i].WT.Name < views[j].WT.Name
+	})
 }
 
 func (m Model) selectedActive() (activeItem, bool) {
