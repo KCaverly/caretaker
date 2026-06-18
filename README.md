@@ -1,15 +1,15 @@
 # ct
 
 A terminal "deck" for managing git worktrees across your repos. Each worktree gets a
-**workspace** — an nvim window, one or more claude sessions, and one or more terminals —
-hosted by [zellij](https://zellij.dev), with one session full-screen at a time.
+**workspace** — an nvim window, a claude session, and a terminal — hosted *inside* ct under a
+pinned status bar, with one session full-screen at a time.
 
-Built with [Bubble Tea](https://charm.land/bubbletea) v2.
+Built with [Bubble Tea](https://charm.land/bubbletea) v2 and [charmbracelet/x/vt](https://github.com/charmbracelet/x).
 
 ## Requirements
 
 - Go 1.25+
-- `git`, `zellij`, and your editor/agent commands (`nvim`, `claude`) on `PATH`
+- `git`, and your editor/agent commands (`nvim`, `claude`) on `PATH`
 
 ## Configuration
 
@@ -20,14 +20,18 @@ Built with [Bubble Tea](https://charm.land/bubbletea) v2.
 root = "~/code"
 
 # Optional (defaults shown):
-editor  = "nvim"
-agent   = "claude"
-shell   = "$SHELL"
-backend = "zellij"
+editor = "nvim"
+agent  = "claude"
+shell  = "$SHELL"
 
 # Where new worktrees and their branches are created ({name} is the worktree name).
 worktree_path = ".worktrees/{name}"
 branch_name   = "{name}"
+
+# Reserved navigation keys (not forwarded to embedded sessions).
+[keys]
+cycle  = "ctrl+o"   # move one session view to the right
+picker = "ctrl+g"   # return to the CT picker
 ```
 
 ## Run
@@ -38,35 +42,35 @@ go run ./cmd/ct
 go build -o ct ./cmd/ct && ./ct
 ```
 
-### The deck
+## How it works
+
+A pinned status bar sits at the top at all times:
 
 ```
-ct
-
-caretaker
-  ▸ ● ✷ feat-login    feat-login
-    ○   (main)        main
-
-other-repo
-    ○   (main)        main
+ ☺    ✎  ✻  ❯                                       caretaker / feat-login
+────────────────────────────────────────────────────────────────────────────
 ```
 
-`●` = workspace running · `○` = stopped · `✷` = uncommitted changes.
+The bar is a row of rounded zjstatus-style pills (Nerd Font powerline caps). The caretaker is a
+mode chip — a yellow **☺** while you tend the deck, a red **☠** once you drop into a session.
+The nvim (**✎**) / claude (**✻**) / term (**❯**) tabs fill with their own colour when active and
+stay muted otherwise, and the active repo / worktree shows as a chip on the right.
 
-Keys: `enter` open · `n` new worktree · `a` +claude · `t` +terminal · `d` archive ·
-`x` remove · `r` refresh · `q` quit.
+- **Picker** (**☺**): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
+  worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes).
+- Pressing **enter** on a worktree **activates** it: ct starts nvim + claude + a terminal in
+  that worktree and drops you into the nvim view. The session segments light up and the active
+  repo / worktree shows on the right.
+- **`ctrl+o`** cycles the session views (nvim → claude → terminal → nvim); **`ctrl+g`** returns
+  to the picker. Sessions keep running — switching never relaunches them, and they persist for
+  ct's lifetime.
 
-Opening a worktree creates (if needed) a zellij session with nvim + claude + term tabs and
-attaches you full-screen; detach from zellij to return to the deck.
+Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `q` quit.
 
 ## Layout
 
 - `cmd/ct` — the `ct` entrypoint.
 - `internal/config` — config loading + defaults.
 - `internal/repo` — repo discovery and git worktree operations.
-- `internal/workspace` — the backend-agnostic workspace model.
-- `internal/backend` — the `Backend` interface; `internal/backend/zellij` implements it.
-- `internal/tui` — the Bubble Tea deck and its controller.
-
-A native PTY backend (no zellij dependency, with live per-session status) can be added behind
-the same `Backend` interface later.
+- `internal/session` — hosts programs on ptys with a terminal emulator (`x/vt`) per session.
+- `internal/tui` — the Bubble Tea model: status bar, picker, key routing, session rendering.

@@ -4,3 +4,6 @@
 
 # Test & coverage output
 *.out
+
+# Worktrees created by ct (default worktree_path)
+/.worktrees/

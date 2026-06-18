@@ -8,6 +8,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/KCaverly/caretaker/internal/repo"
+	"github.com/KCaverly/caretaker/internal/session"
 )
 
 func sampleModel() Model {
@@ -22,7 +23,7 @@ func sampleModel() Model {
 			{WT: repo.Worktree{Repo: "api", Name: "spike", Branch: "spike"}, Live: true},
 		}},
 	}
-	m := New(&Controller{})
+	m := New(&Controller{}, session.NewManager())
 	mm, _ := m.Update(tea.WindowSizeMsg{Width: 72, Height: 24})
 	m = mm.(Model)
 	m.groups = groups
@@ -33,7 +34,7 @@ func sampleModel() Model {
 
 func TestRenderLayout(t *testing.T) {
 	m := sampleModel()
-	out := m.render()
+	out := m.renderDeck(m.height - barHeight)
 	for _, want := range []string{"NEW", "ACTIVE", "caretaker", "feat-login", "bugfix", "spike"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q", want)
@@ -44,7 +45,7 @@ func TestRenderLayout(t *testing.T) {
 	}
 	if testing.Verbose() {
 		m.focus = focusActive
-		t.Logf("\n%s", m.render())
+		t.Logf("\n%s", m.renderDeck(m.height-barHeight))
 	}
 }
 
@@ -87,6 +88,6 @@ func TestCreateModeInlineInput(t *testing.T) {
 		t.Errorf("footer should not contain the input prompt in create mode")
 	}
 	if testing.Verbose() {
-		t.Logf("\n%s", m.render())
+		t.Logf("\n%s", m.renderDeck(m.height-barHeight))
 	}
 }

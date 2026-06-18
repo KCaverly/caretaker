@@ -6,8 +6,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/KCaverly/caretaker/internal/backend/zellij"
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/tui"
 )
 
@@ -24,13 +24,11 @@ func run() error {
 		return err
 	}
 
-	be, err := zellij.New()
-	if err != nil {
-		return err
-	}
+	mgr := session.NewManager()
+	defer mgr.CloseAll() // reap all ptys on exit
 
-	ctrl := tui.NewController(cfg, be)
-	p := tea.NewProgram(tui.New(ctrl))
+	ctrl := tui.NewController(cfg)
+	p := tea.NewProgram(tui.New(ctrl, mgr))
 	_, err = p.Run()
 	return err
 }

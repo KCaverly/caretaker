@@ -7,10 +7,64 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/sahilm/fuzzy"
 
 	"github.com/KCaverly/caretaker/internal/repo"
+	"github.com/KCaverly/caretaker/internal/session"
 )
+
+// barHeight is the number of rows the top chrome occupies: the status bar, a
+// light separator line, and a blank spacing row beneath it.
+const barHeight = 3
+
+// Default reserved keys (not forwarded to embedded sessions); overridable via config.
+const (
+	defaultKeyCycle  = "ctrl+o" // cycle to the next session view
+	defaultKeyPicker = "ctrl+g" // return to the CT picker
+)
+
+// screen is the active view: the picker or one of the session views.
+type screen int
+
+const (
+	screenPicker screen = iota
+	screenEditor
+	screenAgent
+	screenTerminal
+)
+
+// next cycles among the session views (editor → agent → terminal → editor).
+func (s screen) next() screen {
+	switch s {
+	case screenEditor:
+		return screenAgent
+	case screenAgent:
+		return screenTerminal
+	default:
+		return screenEditor
+	}
+}
+
+// sessionIndex maps a session screen to its index in a workspace's sessions.
+func sessionIndex(s screen) int {
+	switch s {
+	case screenEditor:
+		return 0
+	case screenAgent:
+		return 1
+	case screenTerminal:
+		return 2
+	default:
+		return -1
+	}
+}
+
+// workspaceRef is the currently-activated workspace and its live sessions.
+type workspaceRef struct {
+	repo, worktree, key string
+	sessions            []*session.Session
+}
 
 type focus int
 
@@ -33,10 +87,17 @@ type activeItem struct {
 	view WorktreeView
 }
 
-// Model is the deck: a "new" repo finder on top and an "active" worktree
-// navigator below.
+// Model is the ct UI: a pinned status bar plus the active screen (picker or an
+// embedded nvim/claude/terminal session).
 type Model struct {
-	ctrl   *Controller
+	ctrl *Controller
+	mgr  *session.Manager
+
+	keyCycle, keyPicker string
+
+	screen  screen
+	current *workspaceRef
+
 	groups []Group
 
 	focus focus
@@ -59,8 +120,8 @@ type Model struct {
 	width, height int
 }
 
-// New builds the deck model.
-func New(ctrl *Controller) Model {
+// New builds the model.
+func New(ctrl *Controller, mgr *session.Manager) Model {
 	filter := textinput.New()
 	filter.Placeholder = "filter repos…"
 	filter.Prompt = "› "
@@ -70,7 +131,19 @@ func New(ctrl *Controller) Model {
 	name.Placeholder = "branch-name"
 	name.Prompt = "› "
 
-	return Model{ctrl: ctrl, filter: filter, nameInput: name, focus: focusNew}
+	cycle, picker := ctrl.Keys()
+	if cycle == "" {
+		cycle = defaultKeyCycle
+	}
+	if picker == "" {
+		picker = defaultKeyPicker
+	}
+
+	return Model{
+		ctrl: ctrl, mgr: mgr,
+		keyCycle: cycle, keyPicker: picker,
+		filter: filter, nameInput: name, focus: focusNew,
+	}
 }
 
 // --- messages ---
@@ -85,18 +158,13 @@ type createdMsg struct {
 	err error
 }
 
-type ensuredMsg struct {
-	wt  repo.Worktree
-	err error
-}
-
-type attachedMsg struct{ err error }
-
 type actionDoneMsg struct{ err error }
+
+type dirtyMsg struct{}
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.loadCmd(), textinput.Blink)
+	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd())
 }
 
 func (m Model) loadCmd() tea.Cmd {
@@ -106,16 +174,40 @@ func (m Model) loadCmd() tea.Cmd {
 	}
 }
 
+// repaintCmd blocks until a session's screen changes, then asks for a re-render.
+func (m Model) repaintCmd() tea.Cmd {
+	mgr := m.mgr
+	return func() tea.Msg {
+		<-mgr.Dirty()
+		return dirtyMsg{}
+	}
+}
+
+func (m Model) sessionSize() (int, int) {
+	return m.width, max(1, m.height-barHeight)
+}
+
+func (m Model) activeSession() *session.Session {
+	if m.current == nil {
+		return nil
+	}
+	i := sessionIndex(m.screen)
+	if i < 0 || i >= len(m.current.sessions) {
+		return nil
+	}
+	return m.current.sessions[i]
+}
+
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		// Size the inputs so their placeholders render fully (the placeholder
-		// buffer is sized to the input width).
 		inputW := max(10, m.width-12)
 		m.filter.SetWidth(inputW)
 		m.nameInput.SetWidth(inputW)
+		w, h := m.sessionSize()
+		m.mgr.Resize(w, h)
 		return m, nil
 
 	case loadedMsg:
@@ -133,34 +225,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "create error: " + msg.err.Error()
 			return m, m.loadCmd()
 		}
-		// Open the freshly created worktree.
-		wt := msg.wt
-		m.status = "opening " + wt.Name + "…"
-		return m, func() tea.Msg { return ensuredMsg{wt: wt, err: m.ctrl.Ensure(wt)} }
-
-	case ensuredMsg:
-		if msg.err != nil {
-			m.status = "open error: " + msg.err.Error()
-			return m, m.loadCmd()
-		}
-		cmd, err := m.ctrl.AttachCmd(msg.wt)
-		if err != nil {
-			m.status = "attach error: " + err.Error()
-			return m, nil
-		}
-		return m, tea.ExecProcess(cmd, func(err error) tea.Msg { return attachedMsg{err} })
-
-	case attachedMsg:
-		if msg.err != nil {
-			m.status = "session ended: " + msg.err.Error()
-		}
-		return m, m.loadCmd()
+		return m.activate(msg.wt.Repo, msg.wt.Name, msg.wt.Path)
 
 	case actionDoneMsg:
 		if msg.err != nil {
 			m.status = msg.err.Error()
 		}
 		return m, m.loadCmd()
+
+	case dirtyMsg:
+		return m, m.repaintCmd()
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
@@ -169,15 +243,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// activate ensures the workspace's sessions are running and switches to the
+// editor view.
+func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
+	key := repoName + "/" + wtName
+	w, h := m.sessionSize()
+	ss, err := m.mgr.Activate(key, dir, m.ctrl.Specs(), w, h)
+	if err != nil {
+		m.status = "open error: " + err.Error()
+		return m, m.loadCmd()
+	}
+	m.current = &workspaceRef{repo: repoName, worktree: wtName, key: key, sessions: ss}
+	m.screen = screenEditor
+	m.status = ""
+	return m, m.loadCmd()
+}
+
+// --- key handling ---
+
 func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.screen != screenPicker {
+		return m.handleSessionKey(msg)
+	}
+	return m.handlePicker(msg)
+}
+
+func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case m.keyCycle:
+		m.screen = m.screen.next()
+		return m, nil
+	case m.keyPicker:
+		m.screen = screenPicker
+		return m, nil
+	}
+	if s := m.activeSession(); s != nil {
+		s.SendKey(toUVKey(msg))
+	}
+	return m, nil
+}
+
+func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case modeCreateName:
 		return m.handleCreateKey(msg)
 	case modeConfirmRemove:
 		return m.handleConfirmKey(msg)
 	}
-
-	// Normal mode.
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
 	}
@@ -251,28 +363,16 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.loadCmd()
 	case "enter":
 		if it, ok := m.selectedActive(); ok {
-			wt := it.view.WT
-			m.status = "opening " + wt.Name + "…"
-			return m, func() tea.Msg { return ensuredMsg{wt: wt, err: m.ctrl.Ensure(wt)} }
-		}
-	case "a":
-		if it, ok := m.selectedActive(); ok {
-			wt := it.view.WT
-			return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.AddAgent(wt)} }
-		}
-	case "t":
-		if it, ok := m.selectedActive(); ok {
-			wt := it.view.WT
-			return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.AddTerminal(wt)} }
+			return m.activate(it.repo.Name, it.view.WT.Name, it.view.WT.Path)
 		}
 	case "d":
 		if it, ok := m.selectedActive(); ok {
-			wt := it.view.WT
-			m.status = "archiving " + wt.Name + "…"
-			return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Archive(wt)} }
+			m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
+			m.status = "stopped " + it.view.WT.Name
+			return m, m.loadCmd()
 		}
 	case "x":
-		if it, ok := m.selectedActive(); ok {
+		if it, ok := m.selectedActive(); ok && !it.view.WT.IsMain {
 			m.mode = modeConfirmRemove
 			m.status = fmt.Sprintf("remove worktree %q and its branch? (y/n)", it.view.WT.Name)
 		}
@@ -315,6 +415,7 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
+		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		r, wt := it.repo, it.view.WT
 		m.status = "removing " + wt.Name + "…"
 		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt)} }
@@ -322,6 +423,30 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.mode = modeNormal
 	m.status = ""
 	return m, nil
+}
+
+// stopWorkspace closes a workspace's sessions and, if it was current, returns to
+// the picker.
+func (m *Model) stopWorkspace(key string) {
+	m.mgr.Close(key)
+	if m.current != nil && m.current.key == key {
+		m.current = nil
+		m.screen = screenPicker
+	}
+}
+
+func wsKey(repoName, wtName string) string { return repoName + "/" + wtName }
+
+// toUVKey converts a Bubble Tea key event into the ultraviolet key event the
+// emulator expects (the field layouts are identical).
+func toUVKey(k tea.KeyPressMsg) uv.KeyPressEvent {
+	return uv.KeyPressEvent{
+		Text:        k.Text,
+		Mod:         uv.KeyMod(k.Mod),
+		Code:        k.Code,
+		ShiftedCode: k.ShiftedCode,
+		BaseCode:    k.BaseCode,
+	}
 }
 
 // --- derived state ---
@@ -353,6 +478,9 @@ func (m *Model) recomputeActive() {
 		for _, wv := range g.Worktrees {
 			if wv.WT.IsMain {
 				continue
+			}
+			if m.mgr != nil {
+				wv.Live = m.mgr.Has(wsKey(g.Repo.Name, wv.WT.Name))
 			}
 			items = append(items, activeItem{repo: g.Repo, view: wv})
 		}

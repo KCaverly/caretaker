@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strconv"
 	"strings"
 
@@ -24,38 +25,113 @@ var (
 )
 
 var (
-	badgeStyle    = lipgloss.NewStyle().Bold(true).Foreground(cInk).Background(cAccent).Padding(0, 1)
-	subtitleStyle = lipgloss.NewStyle().Foreground(cDim).Italic(true)
-	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(cPurple)
-	countStyle    = lipgloss.NewStyle().Foreground(cDim)
-	repoHdrStyle  = lipgloss.NewStyle().Bold(true).Foreground(cFg)
-	repoStyle     = lipgloss.NewStyle().Foreground(cFg)
-	nameStyle     = lipgloss.NewStyle().Foreground(cFg)
-	dimStyle      = lipgloss.NewStyle().Foreground(cDim)
-	liveStyle     = lipgloss.NewStyle().Foreground(cGreen)
-	dirtyStyle    = lipgloss.NewStyle().Foreground(cYellow)
-	selStyle      = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cSelBg)
-	helpKeyStyle  = lipgloss.NewStyle().Foreground(cAccent)
-	helpStyle     = lipgloss.NewStyle().Foreground(cDim)
-	errStyle      = lipgloss.NewStyle().Foreground(cRed)
+	barSep       = lipgloss.NewStyle().Foreground(cFaint)
+	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(cPurple)
+	countStyle   = lipgloss.NewStyle().Foreground(cDim)
+	repoHdrStyle = lipgloss.NewStyle().Bold(true).Foreground(cFg)
+	repoStyle    = lipgloss.NewStyle().Foreground(cFg)
+	nameStyle    = lipgloss.NewStyle().Foreground(cFg)
+	dimStyle     = lipgloss.NewStyle().Foreground(cDim)
+	liveStyle    = lipgloss.NewStyle().Foreground(cGreen)
+	dirtyStyle   = lipgloss.NewStyle().Foreground(cYellow)
+	selStyle     = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cSelBg)
+	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
+	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
+	errStyle     = lipgloss.NewStyle().Foreground(cRed)
 )
 
 // View implements tea.Model.
 func (m Model) View() tea.View {
-	v := tea.NewView(m.render())
+	w, h := m.width, m.height
+	if w < 24 || h < 12 {
+		v := tea.NewView("ct — please enlarge the terminal")
+		v.AltScreen = true
+		return v
+	}
+
+	chrome := m.renderBar()
+	var body string
+	var cursor *tea.Cursor
+	if m.screen == screenPicker {
+		body = m.renderDeck(h - barHeight)
+	} else if s := m.activeSession(); s != nil {
+		body = s.Render()
+		if x, y, visible := s.Cursor(); visible {
+			cursor = tea.NewCursor(x, y+barHeight)
+		}
+	}
+
+	v := tea.NewView(chrome + "\n" + body)
 	v.AltScreen = true
+	v.Cursor = cursor
 	return v
 }
 
-func (m Model) render() string {
-	w, h := m.width, m.height
-	if w < 24 || h < 12 {
-		return "ct — please enlarge the terminal"
+// Rounded powerline caps (Nerd Font) that bracket each pill segment.
+const (
+	pillCapLeft  = "\ue0b6" // left half-circle
+	pillCapRight = "\ue0b4" // right half-circle
+)
+
+// renderBar draws the pinned status bar plus a light separator and a blank
+// spacing row (barHeight rows total), styled as zjstatus-like pills. The
+// caretaker is a coloured mode chip — yellow ☺ while you tend the deck, red ☠
+// once you drop into a session. The nvim / claude / term tabs are icon chips:
+// the active view fills with its own colour, the rest stay muted (and dimmer
+// still until a workspace exists). The current repo / worktree sits on the right.
+func (m Model) renderBar() string {
+	has := m.current != nil
+
+	tab := func(glyph string, accent color.Color, active, enabled bool) string {
+		switch {
+		case active:
+			return pill(glyph, cInk, accent)
+		case enabled:
+			return pill(glyph, cFg, cSelBg)
+		default:
+			return pill(glyph, cDim, cFaint)
+		}
 	}
 
-	title := m.renderTitle()
+	// Caretaker mode chip.
+	ct := pill("☺", cInk, cYellow)
+	if m.screen != screenPicker {
+		ct = pill("☠", cInk, cRed)
+	}
+
+	tabs := strings.Join([]string{
+		tab("✎", cGreen, m.screen == screenEditor, has),
+		tab("✻", cPurple, m.screen == screenAgent, has),
+		tab("❯", cAccent, m.screen == screenTerminal, has),
+	}, " ")
+
+	left := " " + ct + "   " + tabs
+
+	right := ""
+	if has {
+		right = pill(m.current.repo+" / "+m.current.worktree, cPurple, cSelBg) + " "
+	}
+
+	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
+	bar := left + strings.Repeat(" ", gap) + right
+	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
+	return bar + "\n" + sep + "\n"
+}
+
+// pill renders content as a rounded, filled segment: a left cap, the padded
+// fg-on-bg body, and a right cap (caps coloured to the body's background so the
+// ends read as rounded edges of the chip).
+func pill(content string, fg, bg color.Color) string {
+	capStyle := lipgloss.NewStyle().Foreground(bg)
+	body := lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg).Render(" " + content + " ")
+	return capStyle.Render(pillCapLeft) + body + capStyle.Render(pillCapRight)
+}
+
+// renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
+func (m Model) renderDeck(h int) string {
+	w := m.width
 	footer := m.renderFooter()
-	bodyH := h - lipgloss.Height(title) - lipgloss.Height(footer) - 1
+	bodyH := h - lipgloss.Height(footer)
 
 	// Size the NEW box to its content (header, blank, input, blank, then repos),
 	// capped at half the body so ACTIVE always keeps room.
@@ -78,11 +154,7 @@ func (m Model) render() string {
 	newBox := box(m.renderNew(innerW, newRows), innerW, newContentH, m.focus == focusNew)
 	activeBox := box(m.renderActive(innerW, activeRows), innerW, activeContentH, m.focus == focusActive)
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, newBox, activeBox, footer)
-}
-
-func (m Model) renderTitle() string {
-	return "\n" + badgeStyle.Render("ct") + "  " + subtitleStyle.Render("worktree workspaces")
+	return lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox, footer)
 }
 
 // renderNew builds the top "new" repo finder. In create mode it becomes a
@@ -195,8 +267,8 @@ func (m Model) renderFooter() string {
 	} else {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
-			keyhint("a", "claude"), keyhint("t", "term"), keyhint("d", "archive"),
-			keyhint("x", "remove"), keyhint("tab", "new"), keyhint("q", "quit"),
+			keyhint("d", "stop"), keyhint("x", "remove"),
+			keyhint("tab", "new"), keyhint("q", "quit"),
 		}
 	}
 	help := strings.Join(hints, helpStyle.Render("  ·  "))

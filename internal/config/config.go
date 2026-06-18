@@ -26,6 +26,17 @@ type Config struct {
 	WorktreePath string `toml:"worktree_path"`
 	// BranchName is the branch-name template for new worktrees. Supports {name}.
 	BranchName string `toml:"branch_name"`
+	// Keys configures the reserved navigation keystrokes.
+	Keys Keys `toml:"keys"`
+}
+
+// Keys are the reserved keystrokes ct handles instead of forwarding to an
+// embedded session.
+type Keys struct {
+	// Cycle moves one session view to the right (nvim → claude → term → nvim).
+	Cycle string `toml:"cycle"`
+	// Picker returns to the CT picker.
+	Picker string `toml:"picker"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -41,6 +52,7 @@ func Default() Config {
 		Backend:      "zellij",
 		WorktreePath: ".worktrees/{name}",
 		BranchName:   "{name}",
+		Keys:         Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
 	}
 }
 
