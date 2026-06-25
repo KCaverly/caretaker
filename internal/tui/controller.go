@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/KCaverly/caretaker/internal/config"
@@ -16,6 +18,10 @@ import (
 // Controller exposes ct's worktree operations and session specs to the TUI.
 type Controller struct {
 	cfg config.Config
+	// projectsDir overrides where ct looks for claude's stored transcripts when
+	// deciding whether a persisted agent can be resumed. Empty means the default
+	// ~/.claude/projects; tests point it at a temp dir.
+	projectsDir string
 }
 
 // NewController builds a Controller from config.
@@ -113,12 +119,52 @@ func agentTitle(label string) string {
 // picker), and teammate split-pane mode is pinned off so any agent team renders
 // in-process inside the pane ct controls.
 func (c *Controller) NewAgentSpec(label string) session.Spec {
-	id := newSessionID()
+	return c.freshAgentSpec(newSessionID(), label)
+}
+
+// freshAgentSpec builds the spec for a brand-new claude session running under
+// the given id (shared by NewAgentSpec and the resume-fallback path).
+func (c *Controller) freshAgentSpec(id, label string) session.Spec {
 	argv := []string{c.cfg.Agent, "--session-id", id, "--teammate-mode", "in-process"}
 	if label != "" {
 		argv = append(argv, "-n", label)
 	}
 	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+}
+
+// AgentSpec returns the spec to (re)launch a persisted agent. It resumes the
+// saved conversation when claude still has a transcript for id, and otherwise
+// starts a fresh session under the same id. That way a transcript claude has
+// since dropped — the 30-day retention sweep, a session that never persisted
+// (spawned but never used), or a moved/recreated worktree — comes back as a
+// working empty agent instead of a "no conversation found" error in the pane.
+// Reusing the id keeps ct's persisted pool stable and lets the revived session
+// resume normally on the next open.
+func (c *Controller) AgentSpec(id, label string) session.Spec {
+	if c.transcriptExists(id) {
+		return c.ResumeAgentSpec(id, label)
+	}
+	return c.freshAgentSpec(id, label)
+}
+
+// transcriptExists reports whether claude still has a stored conversation for
+// the session id. Session UUIDs are globally unique, so it globs every project
+// dir rather than reconstructing claude's cwd-derived path key (which is
+// internal and version-dependent).
+func (c *Controller) transcriptExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	dir := c.projectsDir
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		dir = filepath.Join(home, ".claude", "projects")
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*", id+".jsonl"))
+	return len(matches) > 0
 }
 
 // ResumeAgentSpec returns the spec for a Claude agent session that resumes the

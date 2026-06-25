@@ -1,6 +1,10 @@
 package tui
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseAgentStatuses(t *testing.T) {
 	data := []byte(`[
@@ -85,6 +89,39 @@ func TestResumeAgentSpec(t *testing.T) {
 	// An empty label falls back to the default "claude" display title.
 	if got := c.ResumeAgentSpec(id, "").Title; got != "claude" {
 		t.Errorf("empty-label title = %q, want claude", got)
+	}
+}
+
+func TestAgentSpecResumeOrFallback(t *testing.T) {
+	projects := t.TempDir()
+	c := &Controller{projectsDir: projects}
+	c.cfg.Agent = "claude"
+
+	id := "11111111-2222-4333-8444-555555555555"
+
+	// No transcript on disk: AgentSpec falls back to a fresh session under the
+	// same id, so the pane comes up working instead of erroring on --resume.
+	fresh := c.AgentSpec(id, "refactor auth")
+	wantFresh := []string{"claude", "--session-id", id, "--teammate-mode", "in-process", "-n", "refactor auth"}
+	if got := fresh.Argv; !equalStrings(got, wantFresh) {
+		t.Errorf("missing-transcript argv = %v, want %v", got, wantFresh)
+	}
+	if fresh.SessionID != id {
+		t.Errorf("fallback kept session id = %q, want %q", fresh.SessionID, id)
+	}
+
+	// Transcript present (under any project dir, matched by unique id): resume.
+	proj := filepath.Join(projects, "-some-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resumed := c.AgentSpec(id, "refactor auth")
+	wantResume := []string{"claude", "--resume", id, "--teammate-mode", "in-process"}
+	if got := resumed.Argv; !equalStrings(got, wantResume) {
+		t.Errorf("present-transcript argv = %v, want %v", got, wantResume)
 	}
 }
 

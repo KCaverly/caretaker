@@ -376,7 +376,7 @@ func (m Model) workspaceSpecs(key string) []session.Spec {
 		specs = append(specs, m.ctrl.NewAgentSpec(""))
 	} else {
 		for _, a := range saved {
-			specs = append(specs, m.ctrl.ResumeAgentSpec(a.SessionID, a.Label))
+			specs = append(specs, m.ctrl.AgentSpec(a.SessionID, a.Label))
 		}
 	}
 	return append(specs, m.ctrl.TermSpec())
