@@ -72,6 +72,35 @@ func TestSelectionBarFillsWidth(t *testing.T) {
 	}
 }
 
+func TestBarAgentBadge(t *testing.T) {
+	m := sampleModel()
+	m.current = &workspaceRef{
+		repo: "r", worktree: "w", path: "/r/w",
+		ws: &session.Workspace{Agents: []*session.Session{{}, {}}},
+	}
+	m.screen = screenAgent
+	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: "/r/w"}}
+
+	bar := m.renderBar()
+	if !strings.Contains(bar, "2") {
+		t.Errorf("bar should show the agent count 2:\n%s", bar)
+	}
+	if !strings.Contains(bar, "●") {
+		t.Errorf("bar should show a needs-input dot:\n%s", bar)
+	}
+}
+
+func TestPaletteRender(t *testing.T) {
+	m := modelWithAgents(2)
+	m = m.openPalette().(Model)
+	out := m.renderPalette(m.height - barHeight)
+	for _, want := range []string{"claude", "new agent", "focus"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("palette missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestCreateModeInlineInput(t *testing.T) {
 	m := sampleModel()
 	// Simulate having chosen the first repo to create in.

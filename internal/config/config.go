@@ -37,6 +37,13 @@ type Keys struct {
 	Cycle string `toml:"cycle"`
 	// Picker returns to the CT picker.
 	Picker string `toml:"picker"`
+	// Palette opens the agent switcher for the current worktree.
+	Palette string `toml:"palette"`
+	// NextAgent / PrevAgent cycle the focused agent within the worktree.
+	NextAgent string `toml:"next_agent"`
+	PrevAgent string `toml:"prev_agent"`
+	// Help toggles the key/legend overlay (works in the deck and in sessions).
+	Help string `toml:"help"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -52,7 +59,11 @@ func Default() Config {
 		Backend:      "zellij",
 		WorktreePath: ".worktrees/{name}",
 		BranchName:   "{name}",
-		Keys:         Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: Keys{
+			Cycle: "ctrl+o", Picker: "ctrl+g",
+			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
+			Help: "f1",
+		},
 	}
 }
 

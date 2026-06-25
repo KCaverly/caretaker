@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -30,6 +31,10 @@ const (
 type Session struct {
 	Kind  Kind
 	Title string
+	// SessionID is the claude session UUID an Agent session runs under (set by
+	// the Manager from the Spec). It lets ct resume the same conversation across
+	// runs; empty for non-agent sessions.
+	SessionID string
 
 	cmd *exec.Cmd
 	pty *os.File
@@ -55,6 +60,12 @@ func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func()) 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	if kind == Agent {
+		// Claude's agent-teams feature auto-detects tmux/iTerm2 from these and
+		// would then spawn split-pane teammates outside ct's emulator. Drop them
+		// so teams render in-process inside the pane ct controls.
+		cmd.Env = dropEnv(cmd.Env, "TMUX", "TERM_PROGRAM")
+	}
 
 	w, h = max(w, 1), max(h, 1)
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
@@ -133,6 +144,33 @@ func (s *Session) Resize(w, h int) {
 
 // Alive reports whether the program is still running.
 func (s *Session) Alive() bool { return !s.closed.Load() }
+
+// Pid returns the program's process id, or 0 if it isn't running. ct uses it to
+// match the session against `claude agents --json` entries.
+func (s *Session) Pid() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
+// dropEnv returns env with any "KEY=..." entries for the given keys removed.
+func dropEnv(env []string, keys ...string) []string {
+	out := env[:0:0]
+	for _, e := range env {
+		drop := false
+		for _, k := range keys {
+			if strings.HasPrefix(e, k+"=") {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, e)
+		}
+	}
+	return out
+}
 
 // Close terminates the program and releases its resources.
 func (s *Session) Close() {

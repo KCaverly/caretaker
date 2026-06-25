@@ -8,6 +8,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+
+	"github.com/KCaverly/caretaker/internal/session"
 )
 
 // Palette (gruvbox dark, medium contrast).
@@ -53,12 +55,19 @@ func (m Model) View() tea.View {
 	chrome := m.renderBar()
 	var body string
 	var cursor *tea.Cursor
-	if m.screen == screenPicker {
+	switch {
+	case m.helpOpen:
+		body = m.renderHelp(h - barHeight)
+	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
-	} else if s := m.activeSession(); s != nil {
-		body = s.Render()
-		if x, y, visible := s.Cursor(); visible {
-			cursor = tea.NewCursor(x, y+barHeight)
+	case m.paletteOpen:
+		body = m.renderPalette(h - barHeight)
+	default:
+		if s := m.activeSession(); s != nil {
+			body = s.Render()
+			if x, y, visible := s.Cursor(); visible {
+				cursor = tea.NewCursor(x, y+barHeight)
+			}
 		}
 	}
 
@@ -88,33 +97,13 @@ const (
 func (m Model) renderBar() string {
 	has := m.current != nil
 
-	// All glyphs are bold (heaviest weight a cell allows); active gets its accent
-	// colour, idle is dim, and disabled is faint until a workspace exists.
-	glyph := func(g string, accent color.Color, active, enabled bool) string {
-		st := lipgloss.NewStyle().Bold(true)
-		switch {
-		case active:
-			return st.Foreground(accent).Render(g)
-		case enabled:
-			return st.Foreground(cDim).Render(g)
-		default:
-			return st.Foreground(cFaint).Render(g)
+	left := "  "
+	for i, z := range m.barZones() {
+		if i > 0 {
+			left += "   " // equidistant gap between icons
 		}
+		left += z.glyph
 	}
-
-	// Caretaker: smiley (tending the deck) vs skull (away in a session).
-	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
-	if m.screen != screenPicker {
-		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
-	}
-
-	// All four left icons share the same gap so they're equidistant.
-	left := "  " + strings.Join([]string{
-		ct,
-		glyph(iconEditor, cGreen, m.screen == screenEditor, has),
-		glyph(iconAgent, cPurple, m.screen == screenAgent, has),
-		glyph(iconTerm, cAccent, m.screen == screenTerminal, has),
-	}, "   ")
 
 	// Repo / worktree, de-emphasised (terminals can't shrink a run of text, so
 	// we reduce its weight and colour instead).
@@ -130,43 +119,160 @@ func (m Model) renderBar() string {
 	return bar + "\n" + sep
 }
 
+// barZone is one clickable status-bar icon: its fully-rendered glyph (with any
+// count/notification badge) and the screen it selects.
+type barZone struct {
+	s     screen
+	glyph string
+}
+
+// barZones builds the ordered left-hand icons shared by renderBar (for drawing)
+// and tabAt (for hit-testing), so their layouts can never drift apart.
+func (m Model) barZones() []barZone {
+	has := m.current != nil
+
+	// All glyphs are bold (heaviest weight a cell allows); active gets its accent
+	// colour, idle is dim, and disabled is faint until a workspace exists.
+	glyph := func(g string, accent color.Color, active, enabled bool) string {
+		st := lipgloss.NewStyle().Bold(true)
+		switch {
+		case active:
+			return st.Foreground(accent).Render(g)
+		case enabled:
+			return st.Foreground(cDim).Render(g)
+		default:
+			return st.Foreground(cFaint).Render(g)
+		}
+	}
+
+	// Caretaker: smiley (tending the deck) vs skull (away in a session), badged
+	// with a dot when some *other* worktree is waiting on input.
+	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
+	if m.screen != screenPicker {
+		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
+	}
+	if dot := levelDot(m.otherWorktreesLevel()); dot != "" {
+		ct += dot
+	}
+
+	// Agent icon: badged with the pool size (when >1) and the current worktree's
+	// worst status dot.
+	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
+	if has && m.current.ws != nil {
+		if n := len(m.current.ws.Agents); n > 1 {
+			agent += " " + countStyle.Render(strconv.Itoa(n))
+		}
+		if dot := levelDot(m.worktreeLevel(m.current.path)); dot != "" {
+			agent += dot
+		}
+	}
+
+	return []barZone{
+		{screenPicker, ct},
+		{screenEditor, glyph(iconEditor, cGreen, m.screen == screenEditor, has)},
+		{screenAgent, agent},
+		{screenTerminal, glyph(iconTerm, cAccent, m.screen == screenTerminal, has)},
+	}
+}
+
 // tabAt maps bar coordinates to the tab/screen under them, if a click landed on
-// one of the four left icons. It mirrors renderBar's layout exactly: a 2-column
-// lead-in, each icon, and a 3-column gap between them; each icon's hit target
-// includes one column of slack on each side. Only the bar row (y == 0) counts.
+// one of the left icons. It walks the same barZones renderBar draws: a 2-column
+// lead-in, each (possibly badged) icon, and a 3-column gap between them; each
+// icon's hit target includes one column of slack on each side. Only the bar row
+// (y == 0) counts.
 func (m Model) tabAt(x, y int) (screen, bool) {
 	if y != 0 {
 		return 0, false
 	}
-	caretaker := iconDeck
-	if m.screen != screenPicker {
-		caretaker = iconAway
-	}
-	zones := []struct {
-		glyph string
-		s     screen
-	}{
-		{caretaker, screenPicker},
-		{iconEditor, screenEditor},
-		{iconAgent, screenAgent},
-		{iconTerm, screenTerminal},
-	}
 	col := 2 // leading "  " in renderBar
-	for _, z := range zones {
+	for _, z := range m.barZones() {
 		w := lipgloss.Width(z.glyph)
 		if x >= col-1 && x < col+w+1 {
 			return z.s, true
 		}
-		col += w + 3 // glyph + the 3-space Join separator
+		col += w + 3 // glyph + the 3-space gap
 	}
 	return 0, false
 }
 
-// renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
-func (m Model) renderDeck(h int) string {
-	w := m.width
-	footer := m.renderFooter()
-	bodyH := h - lipgloss.Height(footer)
+// agentLevel ranks an agent/worktree status for badge precedence.
+type agentLevel int
+
+const (
+	levelNone    agentLevel = iota // busy / unknown — no badge
+	levelIdle                      // idle (turn done) — dim dot
+	levelWaiting                   // waiting (blocked) — yellow dot
+)
+
+func statusLevel(status string) agentLevel {
+	switch status {
+	case "waiting":
+		return levelWaiting
+	case "idle":
+		return levelIdle
+	default:
+		return levelNone
+	}
+}
+
+// levelDot renders a notification dot for a level, or "" for levelNone.
+func levelDot(l agentLevel) string {
+	switch l {
+	case levelWaiting:
+		return lipgloss.NewStyle().Foreground(cYellow).Render("●")
+	case levelIdle:
+		return dimStyle.Render("●")
+	default:
+		return ""
+	}
+}
+
+// worktreeLevel is the worst status among the claude sessions running in path.
+func (m Model) worktreeLevel(path string) agentLevel {
+	lvl := levelNone
+	for _, st := range m.agentStatus {
+		if st.Cwd != path {
+			continue
+		}
+		if l := statusLevel(st.Status); l > lvl {
+			lvl = l
+		}
+	}
+	return lvl
+}
+
+// otherWorktreesLevel is the worst status across every worktree except the one
+// currently focused — what the caretaker icon badges.
+func (m Model) otherWorktreesLevel() agentLevel {
+	cur := ""
+	if m.current != nil {
+		cur = m.current.path
+	}
+	lvl := levelNone
+	for _, it := range m.active {
+		if it.view.WT.Path == cur {
+			continue
+		}
+		if l := m.worktreeLevel(it.view.WT.Path); l > lvl {
+			lvl = l
+		}
+	}
+	return lvl
+}
+
+// deckLayout captures the deck's vertical geometry, shared by renderDeck (to
+// draw) and deckClick (to hit-test) so the two can never drift apart. bodyH is
+// the row count beneath the bar (m.height - barHeight).
+type deckLayout struct {
+	newOuterH      int // rows in the NEW box, border included
+	newContentH    int // inner rows of the NEW box
+	newRows        int // repo-list rows inside the NEW box
+	activeContentH int // inner rows of the ACTIVE box
+	activeRows     int // worktree rows inside the ACTIVE box
+}
+
+func (m Model) deckLayout(bodyH int) deckLayout {
+	bodyH -= lipgloss.Height(m.renderFooter())
 
 	// Size the NEW box to its content (header, blank, input, blank, then repos),
 	// capped at half the body so ACTIVE always keeps room.
@@ -178,16 +284,23 @@ func (m Model) renderDeck(h int) string {
 	}
 	newOuterH := clamp(newContent+2, 7, max(7, bodyH/2))
 	activeOuterH := bodyH - newOuterH
-	innerW := w - 4 // border (2) + horizontal padding (2)
+	return deckLayout{
+		newOuterH:      newOuterH,
+		newContentH:    newOuterH - 2,
+		newRows:        max(0, (newOuterH-2)-4), // header + blank + input + blank
+		activeContentH: activeOuterH - 2,
+		activeRows:     max(0, (activeOuterH-2)-2), // header + blank
+	}
+}
 
-	newContentH := newOuterH - 2
-	activeContentH := activeOuterH - 2
+// renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
+func (m Model) renderDeck(h int) string {
+	innerW := m.width - 4 // border (2) + horizontal padding (2)
+	footer := m.renderFooter()
+	L := m.deckLayout(h)
 
-	newRows := max(0, newContentH-4)       // header + blank + input + blank
-	activeRows := max(0, activeContentH-2) // header + blank
-
-	newBox := box(m.renderNew(innerW, newRows), innerW, newContentH, m.focus == focusNew)
-	activeBox := box(m.renderActive(innerW, activeRows), innerW, activeContentH, m.focus == focusActive)
+	newBox := box(m.renderNew(innerW, L.newRows), innerW, L.newContentH, m.focus == focusNew)
+	activeBox := box(m.renderActive(innerW, L.activeRows), innerW, L.activeContentH, m.focus == focusActive)
 
 	return lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox, footer)
 }
@@ -233,6 +346,37 @@ func (m Model) renderCreateForm() []string {
 	}
 }
 
+// activeDisplay builds the ACTIVE section's display lines (a repo header before
+// each repo's first worktree, then one row per worktree) alongside a parallel
+// slice mapping each display line back to its m.active index (-1 for header
+// lines). Shared by renderActive and the click hit-test so their row layout
+// stays identical.
+func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
+	lastRepo := ""
+	for i, it := range m.active {
+		if it.repo.Name != lastRepo {
+			lines = append(lines, repoHdrStyle.Render(it.repo.Name))
+			rowItem = append(rowItem, -1)
+			lastRepo = it.repo.Name
+		}
+		lines = append(lines, m.activeRow(it, i == m.activeCursor && m.focus == focusActive, innerW))
+		rowItem = append(rowItem, i)
+	}
+	return
+}
+
+// activeWindowStart returns the first display index shown for a window of `rows`
+// rows, keeping the cursor's worktree visible.
+func activeWindowStart(rowItem []int, cursor, rows int) (start, end int) {
+	cursorAt := 0
+	for di, it := range rowItem {
+		if it == cursor {
+			cursorAt = di
+		}
+	}
+	return windowBounds(len(rowItem), cursorAt, rows)
+}
+
 // renderActive builds the bottom navigator: worktrees grouped under their repo.
 func (m Model) renderActive(innerW, rows int) []string {
 	lines := []string{header("active", len(m.active)), ""}
@@ -241,28 +385,17 @@ func (m Model) renderActive(innerW, rows int) []string {
 		return append(lines, dimStyle.Render("no workspaces yet — pick a repo above to create one"))
 	}
 
-	// Build display lines (repo headers + indented worktree rows), tracking the
-	// display index of the cursor so the window keeps it visible.
-	var display []string
-	cursorAt, lastRepo := 0, ""
-	for i, it := range m.active {
-		if it.repo.Name != lastRepo {
-			display = append(display, repoHdrStyle.Render(it.repo.Name))
-			lastRepo = it.repo.Name
-		}
-		if i == m.activeCursor {
-			cursorAt = len(display)
-		}
-		display = append(display, m.activeRow(it, i == m.activeCursor && m.focus == focusActive, innerW))
-	}
-
-	start, end := windowBounds(len(display), cursorAt, rows)
+	display, rowItem := m.activeDisplay(innerW)
+	start, end := activeWindowStart(rowItem, m.activeCursor, rows)
 	return append(lines, display[start:end]...)
 }
 
 func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
+	// A single status circle: yellow when an agent is waiting on input, green
+	// when the worktree is live, a hollow ring when inactive.
+	waiting := m.worktreeLevel(it.view.WT.Path) == levelWaiting
 	dotChar := "○"
-	if it.view.Live {
+	if waiting || it.view.Live {
 		dotChar = "●"
 	}
 	dirtyChar := " "
@@ -286,15 +419,166 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	if rank > 0 {
 		rankCol = recentStyle.Render(rankCh)
 	}
-	dot := dimStyle.Render(dotChar)
-	if it.view.Live {
-		dot = liveStyle.Render(dotChar)
+	dotStyle := dimStyle
+	switch {
+	case waiting:
+		dotStyle = lipgloss.NewStyle().Foreground(cYellow)
+	case it.view.Live:
+		dotStyle = liveStyle
 	}
 	dirty := " "
 	if it.view.Dirty {
 		dirty = dirtyStyle.Render(dirtyChar)
 	}
-	return "  " + rankCol + "   " + dot + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+	return "  " + rankCol + "   " + dotStyle.Render(dotChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+}
+
+// renderHelp draws the key + legend overlay, centered in the body area. The
+// session bindings are read from the model so the overlay can never drift from
+// the real (configurable) keys.
+func (m Model) renderHelp(h int) string {
+	innerW := clamp(m.width-8, 28, 72)
+
+	row := func(key, desc string) string {
+		return "  " + helpKeyStyle.Render(padLine(key, 12)) + helpStyle.Render(desc)
+	}
+
+	rows := []string{header("help", -1), ""}
+	rows = append(rows,
+		repoHdrStyle.Render("  Deck"),
+		row("↑↓ / j k", "move"),
+		row("tab", "switch section"),
+		row("enter", "open / create"),
+		row("d", "stop worktree"),
+		row("x", "remove worktree"),
+		row("r", "refresh"),
+		row("ctrl+c", "quit"),
+		"",
+		repoHdrStyle.Render("  Session"),
+		row(m.keyCycle, "cycle view (nvim → claude → term)"),
+		row(m.keyPicker, "back to the deck"),
+		row(m.keyPalette, "agent switcher"),
+		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
+		"",
+		repoHdrStyle.Render("  Legend"),
+		"  "+statusLegend(),
+		"  "+markLegend(),
+		"",
+		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keyHelp)+
+			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
+			helpStyle.Render(" in the deck) · any key closes"),
+	)
+
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// statusLegend / markLegend explain the deck's status glyphs, split across two
+// lines so they stay within the overlay's width.
+func statusLegend() string {
+	yellow := lipgloss.NewStyle().Foreground(cYellow)
+	return strings.Join([]string{
+		liveStyle.Render("●") + helpStyle.Render(" live"),
+		yellow.Render("●") + helpStyle.Render(" waiting"),
+		dimStyle.Render("○") + helpStyle.Render(" idle/stopped"),
+	}, helpStyle.Render("   "))
+}
+
+func markLegend() string {
+	return strings.Join([]string{
+		dirtyStyle.Render("✷") + helpStyle.Render(" uncommitted"),
+		recentStyle.Render("1 2 3") + helpStyle.Render(" recently opened"),
+	}, helpStyle.Render("   "))
+}
+
+// renderPalette draws the agent switcher overlay, centered in the body area.
+func (m Model) renderPalette(h int) string {
+	ws := m.current.ws
+	innerW := clamp(m.width-8, 24, 64)
+
+	rows := []string{
+		header("claude", -1) + "  " + dimStyle.Render(m.current.repo+" / "+m.current.worktree),
+		"",
+	}
+	for i, a := range ws.Agents {
+		rows = append(rows, m.paletteRow(i, a, innerW))
+	}
+	// Trailing "+ new agent" row.
+	if m.paletteCursor == len(ws.Agents) && !m.naming {
+		rows = append(rows, selBar("  + new agent", innerW))
+	} else {
+		rows = append(rows, dimStyle.Render("  + new agent"))
+	}
+	if m.naming {
+		rows = append(rows, "", "  "+m.agentName.View())
+	}
+	rows = append(rows, "", "  "+m.paletteHints())
+
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// paletteRow renders one agent line with its name and live status.
+func (m Model) paletteRow(i int, a *session.Session, innerW int) string {
+	name := a.Title
+	if name == "" {
+		name = "claude"
+	}
+	dot, label := statusText(m.agentStatus[a.Pid()])
+
+	if i == m.paletteCursor && !m.naming {
+		return selBar(fmt.Sprintf("  %d ▸ %s  %s", i+1, name, label), innerW)
+	}
+	return fmt.Sprintf("  %s   %s %s  %s",
+		dimStyle.Render(strconv.Itoa(i+1)), dot, nameStyle.Render(name), dimStyle.Render(label))
+}
+
+// statusText maps a live status to a dot glyph and a human label.
+func statusText(st AgentStatus) (dot, label string) {
+	switch st.Status {
+	case "busy":
+		return liveStyle.Render("●"), "working"
+	case "waiting":
+		l := "waiting"
+		if st.WaitingFor != "" {
+			l += ": " + st.WaitingFor
+		}
+		yellow := lipgloss.NewStyle().Foreground(cYellow)
+		return yellow.Render("●"), yellow.Render(l)
+	case "idle":
+		return dimStyle.Render("●"), "idle"
+	default:
+		return dimStyle.Render("○"), "—"
+	}
+}
+
+func (m Model) paletteHints() string {
+	return strings.Join([]string{
+		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
+		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
+	}, helpStyle.Render("  ·  "))
+}
+
+// centerBlock centers a rendered block within w×h by padding above and to the
+// left (lines wider/taller than the area are left as-is).
+func centerBlock(block string, w, h int) string {
+	lines := strings.Split(block, "\n")
+	bw := 0
+	for _, ln := range lines {
+		if lw := lipgloss.Width(ln); lw > bw {
+			bw = lw
+		}
+	}
+	prefix := strings.Repeat(" ", max(0, (w-bw)/2))
+
+	var out []string
+	for i := 0; i < max(0, (h-len(lines))/2); i++ {
+		out = append(out, "")
+	}
+	for _, ln := range lines {
+		out = append(out, prefix+ln)
+	}
+	return strings.Join(out, "\n")
 }
 
 func (m Model) renderFooter() string {
@@ -315,13 +599,14 @@ func (m Model) footerContent() string {
 	if m.focus == focusNew {
 		hints = []string{
 			keyhint("type", "filter"), keyhint("↑↓", "select"),
-			keyhint("enter", "create"), keyhint("tab", "active"), keyhint("ctrl+c", "quit"),
+			keyhint("enter", "create"), keyhint("tab", "active"),
+			keyhint("?", "help"), keyhint("ctrl+c", "quit"),
 		}
 	} else {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
 			keyhint("d", "stop"), keyhint("x", "remove"),
-			keyhint("tab", "new"), keyhint("ctrl+c", "quit"),
+			keyhint("tab", "new"), keyhint("?", "help"), keyhint("ctrl+c", "quit"),
 		}
 	}
 	help := strings.Join(hints, helpStyle.Render("  ·  "))

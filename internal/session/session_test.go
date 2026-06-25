@@ -69,15 +69,15 @@ func TestManagerActivateReuses(t *testing.T) {
 	defer m.CloseAll()
 
 	specs := []Spec{{Kind: Terminal, Title: "term", Argv: []string{"sh", "-c", "sleep 5"}}}
-	ss1, err := m.Activate("repo/wt", t.TempDir(), specs, 80, 24)
+	ws1, err := m.Activate("repo/wt", t.TempDir(), specs, 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss2, err := m.Activate("repo/wt", t.TempDir(), specs, 80, 24)
+	ws2, err := m.Activate("repo/wt", t.TempDir(), specs, 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if &ss1[0] == nil || ss1[0] != ss2[0] {
+	if ws1.Term == nil || ws1.Term != ws2.Term {
 		t.Fatal("Activate should reuse existing sessions, not relaunch")
 	}
 	if !m.Has("repo/wt") {
@@ -87,5 +87,52 @@ func TestManagerActivateReuses(t *testing.T) {
 	m.Close("repo/wt")
 	if m.Has("repo/wt") {
 		t.Fatal("workspace should be gone after Close")
+	}
+}
+
+func TestManagerSpawnAndCloseAgent(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	sleep := []string{"sh", "-c", "sleep 5"}
+	specs := []Spec{
+		{Kind: Editor, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+		{Kind: Terminal, Argv: sleep},
+	}
+	ws, err := m.Activate("r/w", t.TempDir(), specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Editor == nil || ws.Term == nil || len(ws.Agents) != 1 {
+		t.Fatalf("activate should assign editor/term and one agent, got %+v", ws)
+	}
+
+	// Spawning a second and third agent focuses the newest.
+	if _, err := m.SpawnAgent("r/w", t.TempDir(), Spec{Kind: Agent, Argv: sleep}, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SpawnAgent("r/w", t.TempDir(), Spec{Kind: Agent, Argv: sleep}, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.Agents) != 3 || ws.ActiveAgent != 2 {
+		t.Fatalf("expected 3 agents with active=2, got %d active=%d", len(ws.Agents), ws.ActiveAgent)
+	}
+
+	// Closing the focused (last) agent clamps the active index.
+	m.CloseAgent("r/w", 2)
+	if len(ws.Agents) != 2 || ws.ActiveAgent != 1 {
+		t.Fatalf("after close: %d agents active=%d, want 2 active=1", len(ws.Agents), ws.ActiveAgent)
+	}
+
+	// Closing the first agent shifts the slice; active clamps within range.
+	m.CloseAgent("r/w", 0)
+	if len(ws.Agents) != 1 || ws.ActiveAgent != 0 {
+		t.Fatalf("after close: %d agents active=%d, want 1 active=0", len(ws.Agents), ws.ActiveAgent)
+	}
+
+	// Spawning into a non-existent workspace errors.
+	if _, err := m.SpawnAgent("nope", t.TempDir(), Spec{Kind: Agent, Argv: sleep}, 80, 24); err == nil {
+		t.Error("expected error spawning into an inactive workspace")
 	}
 }

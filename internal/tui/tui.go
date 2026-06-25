@@ -2,9 +2,11 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
@@ -22,8 +24,12 @@ const barHeight = 2
 
 // Default reserved keys (not forwarded to embedded sessions); overridable via config.
 const (
-	defaultKeyCycle  = "ctrl+o" // cycle to the next session view
-	defaultKeyPicker = "ctrl+g" // return to the CT picker
+	defaultKeyCycle     = "ctrl+o" // cycle to the next session view
+	defaultKeyPicker    = "ctrl+g" // return to the CT picker
+	defaultKeyPalette   = "ctrl+a" // open the agent switcher
+	defaultKeyNextAgent = "f4"     // focus the next agent in the pool
+	defaultKeyPrevAgent = "f3"     // focus the previous agent in the pool
+	defaultKeyHelp      = "f1"     // toggle the help overlay
 )
 
 // screen is the active view: the picker or one of the session views.
@@ -48,24 +54,10 @@ func (s screen) next() screen {
 	}
 }
 
-// sessionIndex maps a session screen to its index in a workspace's sessions.
-func sessionIndex(s screen) int {
-	switch s {
-	case screenEditor:
-		return 0
-	case screenAgent:
-		return 1
-	case screenTerminal:
-		return 2
-	default:
-		return -1
-	}
-}
-
 // workspaceRef is the currently-activated workspace and its live sessions.
 type workspaceRef struct {
-	repo, worktree, key string
-	sessions            []*session.Session
+	repo, worktree, key, path string
+	ws                        *session.Workspace
 }
 
 type focus int
@@ -96,10 +88,13 @@ type Model struct {
 	mgr   *session.Manager
 	state *state.State
 
-	keyCycle, keyPicker string
+	keyCycle, keyPicker                    string
+	keyPalette, keyNextAgent, keyPrevAgent string
+	keyHelp                                string
 
-	screen  screen
-	current *workspaceRef
+	screen   screen
+	current  *workspaceRef
+	helpOpen bool
 
 	groups []Group
 
@@ -120,9 +115,23 @@ type Model struct {
 	activeCursor int
 	recentRank   map[string]int // worktree key -> recency rank (1..3); absent = none
 
+	// agent switcher overlay
+	paletteOpen   bool
+	paletteCursor int
+	naming        bool // entering a label for a new agent
+	agentName     textinput.Model
+
+	// live agent statuses from `claude agents --json`, keyed by pid
+	agentStatus map[int]AgentStatus
+
 	status        string
+	statusAt      time.Time // when a transient status was set (for auto-expiry)
 	width, height int
 }
+
+// transientStatusTTL is how long a non-error status message lingers before the
+// status poll clears it.
+const transientStatusTTL = 4 * time.Second
 
 // New builds the model.
 func New(ctrl *Controller, mgr *session.Manager) Model {
@@ -135,6 +144,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	name.Placeholder = "branch-name"
 	name.Prompt = "› "
 
+	agentName := textinput.New()
+	agentName.Placeholder = "task label (optional)"
+	agentName.Prompt = "› "
+
 	cycle, picker := ctrl.Keys()
 	if cycle == "" {
 		cycle = defaultKeyCycle
@@ -142,11 +155,27 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if picker == "" {
 		picker = defaultKeyPicker
 	}
+	palette, next, prev := ctrl.AgentKeys()
+	if palette == "" {
+		palette = defaultKeyPalette
+	}
+	if next == "" {
+		next = defaultKeyNextAgent
+	}
+	if prev == "" {
+		prev = defaultKeyPrevAgent
+	}
+	help := ctrl.HelpKey()
+	if help == "" {
+		help = defaultKeyHelp
+	}
 
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyPicker: picker,
-		filter: filter, nameInput: name, focus: focusNew,
+		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
+		keyHelp: help,
+		filter:  filter, nameInput: name, agentName: agentName, focus: focusNew,
 	}
 }
 
@@ -166,9 +195,42 @@ type actionDoneMsg struct{ err error }
 
 type dirtyMsg struct{}
 
+// statusTickMsg fires on the status-poll timer; statusMsg carries the result of
+// one `claude agents --json` poll.
+type statusTickMsg struct{}
+
+type statusMsg struct {
+	byPid map[int]AgentStatus
+	err   error
+}
+
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd())
+	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd(), m.pollStatusCmd())
+}
+
+// pollStatusCmd runs one `claude agents --json` poll off the UI goroutine.
+func (m Model) pollStatusCmd() tea.Cmd {
+	ctrl := m.ctrl
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		st, err := ctrl.AgentStatuses(ctx)
+		return statusMsg{byPid: st, err: err}
+	}
+}
+
+// scheduleStatusTick re-arms the poll timer, polling faster while any agent is
+// active (busy/waiting) and backing off when everything is idle.
+func (m Model) scheduleStatusTick() tea.Cmd {
+	interval := 5 * time.Second
+	for _, st := range m.agentStatus {
+		if st.Status == "busy" || st.Status == "waiting" {
+			interval = 2 * time.Second
+			break
+		}
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg { return statusTickMsg{} })
 }
 
 func (m Model) loadCmd() tea.Cmd {
@@ -192,14 +254,19 @@ func (m Model) sessionSize() (int, int) {
 }
 
 func (m Model) activeSession() *session.Session {
-	if m.current == nil {
+	if m.current == nil || m.current.ws == nil {
 		return nil
 	}
-	i := sessionIndex(m.screen)
-	if i < 0 || i >= len(m.current.sessions) {
+	switch m.screen {
+	case screenEditor:
+		return m.current.ws.Editor
+	case screenTerminal:
+		return m.current.ws.Term
+	case screenAgent:
+		return m.current.ws.ActiveAgentSession()
+	default:
 		return nil
 	}
-	return m.current.sessions[i]
 }
 
 // Update implements tea.Model.
@@ -241,6 +308,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dirtyMsg:
 		return m, m.repaintCmd()
 
+	case statusTickMsg:
+		m.maybeExpireStatus()
+		return m, m.pollStatusCmd()
+
+	case statusMsg:
+		if msg.err == nil {
+			m.agentStatus = msg.byPid
+		}
+		m.maybeExpireStatus()
+		return m, m.scheduleStatusTick()
+
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
 	case tea.MouseReleaseMsg:
@@ -261,28 +339,102 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // activate ensures the workspace's sessions are running and switches to the
-// editor view.
+// editor view. A brand-new worktree starts one fresh claude session; reopening a
+// worktree resumes the agent pool persisted from its previous run.
 func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	key := repoName + "/" + wtName
 	w, h := m.sessionSize()
-	ss, err := m.mgr.Activate(key, dir, m.ctrl.Specs(), w, h)
+	ws, err := m.mgr.Activate(key, dir, m.workspaceSpecs(key), w, h)
 	if err != nil {
 		m.status = "open error: " + err.Error()
 		return m, m.loadCmd()
 	}
-	m.current = &workspaceRef{repo: repoName, worktree: wtName, key: key, sessions: ss}
+	if saved := m.savedActiveAgent(key); saved < len(ws.Agents) {
+		ws.ActiveAgent = saved
+	}
+	m.current = &workspaceRef{repo: repoName, worktree: wtName, key: key, path: dir, ws: ws}
 	m.screen = screenEditor
 	m.status = ""
 	if m.state != nil {
 		m.state.Touch(key)
+		m.persistAgents(key)
 		_ = m.state.Save()
 	}
 	return m, m.loadCmd()
 }
 
+// workspaceSpecs builds the session set for activating key: nvim and a shell
+// always, plus either the resumed agent pool persisted from key's last run or, if
+// none, a single fresh claude session.
+func (m Model) workspaceSpecs(key string) []session.Spec {
+	specs := []session.Spec{m.ctrl.EditorSpec()}
+	var saved []state.AgentState
+	if m.state != nil {
+		saved, _ = m.state.Agents(key)
+	}
+	if len(saved) == 0 {
+		specs = append(specs, m.ctrl.NewAgentSpec(""))
+	} else {
+		for _, a := range saved {
+			specs = append(specs, m.ctrl.ResumeAgentSpec(a.SessionID, a.Label))
+		}
+	}
+	return append(specs, m.ctrl.TermSpec())
+}
+
+// savedActiveAgent returns the focused-agent index persisted for key, or 0.
+func (m Model) savedActiveAgent(key string) int {
+	if m.state == nil {
+		return 0
+	}
+	_, active := m.state.Agents(key)
+	return active
+}
+
+// persistAgents snapshots a live workspace's agent pool (resume ids, labels, and
+// focused index) into ct's state so the next open can rebuild it. The caller is
+// responsible for Save(); this only updates the in-memory state.
+func (m *Model) persistAgents(key string) {
+	if m.state == nil {
+		return
+	}
+	ws, ok := m.mgr.Workspace(key)
+	if !ok {
+		return
+	}
+	agents := make([]state.AgentState, 0, len(ws.Agents))
+	for _, s := range ws.Agents {
+		if s.SessionID == "" {
+			continue // not a ct-managed claude session; nothing to resume
+		}
+		agents = append(agents, state.AgentState{SessionID: s.SessionID, Label: s.Title})
+	}
+	m.state.SetAgents(key, agents, ws.ActiveAgent)
+}
+
+// saveAgents snapshots the agent pool for key and flushes state to disk. Call it
+// after any change to the pool (spawn, close) or the focused agent.
+func (m *Model) saveAgents(key string) {
+	if m.state == nil {
+		return
+	}
+	m.persistAgents(key)
+	_ = m.state.Save()
+}
+
 // --- key handling ---
 
 func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Help is modal and reachable from anywhere (including inside a session). Any
+	// key dismisses it; the help key itself toggles it.
+	if m.helpOpen {
+		m.helpOpen = false
+		return m, nil
+	}
+	if msg.String() == m.keyHelp {
+		m.helpOpen = true
+		return m, nil
+	}
 	if m.screen != screenPicker {
 		return m.handleSessionKey(msg)
 	}
@@ -290,6 +442,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.paletteOpen {
+		return m.handlePalette(msg)
+	}
 	switch msg.String() {
 	case m.keyCycle:
 		m.screen = m.screen.next()
@@ -297,11 +452,132 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case m.keyPicker:
 		m.screen = screenPicker
 		return m, nil
+	case m.keyPalette:
+		return m.openPalette(), nil
+	case m.keyNextAgent:
+		return m.rotateAgent(+1), nil
+	case m.keyPrevAgent:
+		return m.rotateAgent(-1), nil
 	}
 	if s := m.activeSession(); s != nil {
 		s.SendKey(toUVKey(msg))
 	}
 	return m, nil
+}
+
+// openPalette shows the agent switcher for the current workspace.
+func (m Model) openPalette() tea.Model {
+	if m.current == nil || m.current.ws == nil {
+		return m
+	}
+	m.paletteOpen = true
+	m.naming = false
+	m.paletteCursor = m.current.ws.ActiveAgent
+	return m
+}
+
+// rotateAgent moves the focused agent by delta (wrapping) and switches to the
+// agent view. It's a no-op without at least two agents.
+func (m Model) rotateAgent(delta int) tea.Model {
+	if m.current == nil || m.current.ws == nil {
+		return m
+	}
+	n := len(m.current.ws.Agents)
+	if n == 0 {
+		return m
+	}
+	m.current.ws.ActiveAgent = ((m.current.ws.ActiveAgent+delta)%n + n) % n
+	m.screen = screenAgent
+	m.saveAgents(m.current.key)
+	return m
+}
+
+// handlePalette routes keys while the agent switcher is open. The list has one
+// row per agent plus a trailing "new agent" row.
+func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	ws := m.current.ws
+	if m.naming {
+		return m.handleAgentName(msg)
+	}
+	newRow := len(ws.Agents) // index of the "+ new agent" row
+	switch msg.String() {
+	case "esc", m.keyPalette:
+		m.paletteOpen = false
+		return m, nil
+	case "up", "k", "ctrl+p":
+		if m.paletteCursor > 0 {
+			m.paletteCursor--
+		}
+		return m, nil
+	case "down", "j", "ctrl+n":
+		if m.paletteCursor < newRow {
+			m.paletteCursor++
+		}
+		return m, nil
+	case "n":
+		return m.beginNaming(), nil
+	case "d":
+		if m.paletteCursor < newRow {
+			m.mgr.CloseAgent(m.current.key, m.paletteCursor)
+			m.paletteCursor = clamp(m.paletteCursor, 0, max(0, len(ws.Agents)-1))
+			m.saveAgents(m.current.key)
+		}
+		return m, nil
+	case "enter":
+		if m.paletteCursor == newRow {
+			return m.beginNaming(), nil
+		}
+		ws.ActiveAgent = m.paletteCursor
+		m.screen = screenAgent
+		m.paletteOpen = false
+		m.saveAgents(m.current.key)
+		return m, nil
+	}
+	// A digit jumps straight to that agent (matching the 1..n labels shown).
+	if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+		if idx := int(s[0] - '1'); idx < len(ws.Agents) {
+			ws.ActiveAgent = idx
+			m.screen = screenAgent
+			m.paletteOpen = false
+			m.saveAgents(m.current.key)
+		}
+	}
+	return m, nil
+}
+
+// beginNaming switches the palette into its new-agent label sub-state.
+func (m Model) beginNaming() tea.Model {
+	m.naming = true
+	m.agentName.SetValue("")
+	m.agentName.Focus()
+	return m
+}
+
+// handleAgentName drives the label field for spawning a new agent.
+func (m Model) handleAgentName(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.naming = false
+		m.agentName.Blur()
+		return m, nil
+	case "enter":
+		label := strings.TrimSpace(m.agentName.Value())
+		m.naming = false
+		m.agentName.Blur()
+		w, h := m.sessionSize()
+		if _, err := m.mgr.SpawnAgent(m.current.key, m.current.path, m.ctrl.NewAgentSpec(label), w, h); err != nil {
+			m.status = "spawn error: " + err.Error()
+			return m, nil
+		}
+		m.saveAgents(m.current.key)
+		m.paletteCursor = m.current.ws.ActiveAgent
+		m.screen = screenAgent
+		m.paletteOpen = false
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.agentName, cmd = m.agentName.Update(msg)
+	return m, cmd
 }
 
 // handleMouseClick switches tabs when a left-click lands on a bar icon, and
@@ -312,9 +588,88 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		if s, ok := m.tabAt(mo.X, mo.Y); ok {
 			return m.selectTab(s), nil
 		}
+		if m.screen == screenPicker && !m.helpOpen {
+			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
+				return mm, cmd
+			}
+		}
 	}
 	m.forwardMouse(msg)
 	return m, nil
+}
+
+// deckClick maps a left-click in the deck to the NEW repo row or ACTIVE worktree
+// row under it. A click selects (and focuses) the row; clicking the
+// already-selected row activates it — opening a worktree or starting the create
+// flow, mirroring enter. handled is false when the click misses every row.
+func (m Model) deckClick(x, y int) (tea.Model, tea.Cmd, bool) {
+	by := y - barHeight // body-relative row (bar + separator sit above)
+	if by < 0 {
+		return m, nil, false
+	}
+	L := m.deckLayout(m.height - barHeight)
+
+	// NEW box: content rows are body [1, 1+newContentH); the repo list begins at
+	// content line 4 (header, blank, input, blank).
+	if by >= 1 && by < 1+L.newContentH {
+		if m.mode == modeCreateName {
+			return m, nil, false
+		}
+		cl := by - 1
+		if cl < 4 {
+			return m, nil, false
+		}
+		start, end := windowBounds(len(m.repoMatches), m.newCursor, L.newRows)
+		idx := start + (cl - 4)
+		if idx < start || idx >= end || idx >= len(m.repoMatches) {
+			return m, nil, false
+		}
+		reselect := m.focus == focusNew && m.newCursor == idx
+		m.newCursor = idx
+		if reselect {
+			mm, cmd := m.beginCreate()
+			return mm, cmd, true
+		}
+		var cmd tea.Cmd
+		if m.focus != focusNew {
+			m.focus = focusNew
+			cmd = m.filter.Focus()
+		}
+		return m, cmd, true
+	}
+
+	// ACTIVE box: content rows are body [newOuterH+1, …); worktree rows begin at
+	// content line 2 (header, blank).
+	top := L.newOuterH
+	if by >= top+1 && by < top+1+L.activeContentH {
+		cl := by - (top + 1)
+		if cl < 2 {
+			return m, nil, false
+		}
+		display, rowItem := m.activeDisplay(m.width - 4)
+		start, end := activeWindowStart(rowItem, m.activeCursor, L.activeRows)
+		di := start + (cl - 2)
+		if di < start || di >= end || di >= len(display) {
+			return m, nil, false
+		}
+		item := rowItem[di]
+		if item < 0 {
+			return m, nil, false // a repo header row
+		}
+		reselect := m.focus == focusActive && m.activeCursor == item
+		m.focus = focusActive
+		m.activeCursor = item
+		m.filter.Blur()
+		if reselect {
+			if it, ok := m.selectedActive(); ok {
+				mm, cmd := m.activate(it.repo.Name, it.view.WT.Name, it.view.WT.Path)
+				return mm, cmd, true
+			}
+		}
+		return m, nil, true
+	}
+
+	return m, nil, false
 }
 
 // selectTab activates a clicked bar tab: the picker is always reachable; the
@@ -361,6 +716,12 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
 	}
+	// "?" is a convenient deck-only alias for the help key; the picker owns its
+	// input, so intercepting it before the filter is safe.
+	if msg.String() == "?" {
+		m.helpOpen = true
+		return m, nil
+	}
 	// The picker key jumps straight to the most recently activated worktree, so
 	// it toggles: session -> picker -> back to the most recent work.
 	if msg.String() == m.keyPicker {
@@ -401,15 +762,7 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		if m.newCursor >= 0 && m.newCursor < len(m.repoMatches) {
-			m.pendingRepo = m.repoMatches[m.newCursor]
-			m.mode = modeCreateName
-			m.filter.Blur()
-			m.nameInput.SetValue("")
-			m.status = "new worktree in " + m.pendingRepo.Name
-			return m, m.nameInput.Focus()
-		}
-		return m, nil
+		return m.beginCreate()
 	case "esc":
 		m.filter.SetValue("")
 		m.recomputeMatches()
@@ -420,6 +773,19 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.filter, cmd = m.filter.Update(msg)
 	m.recomputeMatches()
 	return m, cmd
+}
+
+// beginCreate enters the new-worktree naming form for the repo under newCursor.
+func (m Model) beginCreate() (tea.Model, tea.Cmd) {
+	if m.newCursor < 0 || m.newCursor >= len(m.repoMatches) {
+		return m, nil
+	}
+	m.pendingRepo = m.repoMatches[m.newCursor]
+	m.mode = modeCreateName
+	m.filter.Blur()
+	m.nameInput.SetValue("")
+	m.status = "new worktree in " + m.pendingRepo.Name
+	return m, m.nameInput.Focus()
 }
 
 func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -442,7 +808,7 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		if it, ok := m.selectedActive(); ok {
 			m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
-			m.status = "stopped " + it.view.WT.Name
+			m.flash("stopped " + it.view.WT.Name)
 			return m, m.loadCmd()
 		}
 	case "x":
@@ -471,7 +837,7 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			return m, focusCmd
 		}
-		m.status = "creating " + name + "…"
+		m.flash("creating " + name + "…")
 		return m, tea.Batch(focusCmd, func() tea.Msg {
 			wt, err := m.ctrl.Create(r, name, "")
 			return createdMsg{wt: wt, err: err}
@@ -491,7 +857,7 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		r, wt := it.repo, it.view.WT
-		m.status = "removing " + wt.Name + "…"
+		m.flash("removing " + wt.Name + "…")
 		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt)} }
 	}
 	m.mode = modeNormal
@@ -510,6 +876,29 @@ func (m *Model) stopWorkspace(key string) {
 }
 
 func wsKey(repoName, wtName string) string { return repoName + "/" + wtName }
+
+// flash sets a transient status message that the status poll auto-clears after
+// transientStatusTTL. Error statuses are set on m.status directly so they stick.
+func (m *Model) flash(s string) {
+	m.status = s
+	m.statusAt = time.Now()
+}
+
+// maybeExpireStatus clears a transient (non-error) status once it has been shown
+// for transientStatusTTL. It's driven by the status poll, which always
+// reschedules itself, so the clear lands within a poll interval.
+func (m *Model) maybeExpireStatus() {
+	if m.status == "" || m.mode != modeNormal || m.statusAt.IsZero() {
+		return
+	}
+	if strings.Contains(m.status, "error") {
+		return
+	}
+	if time.Since(m.statusAt) > transientStatusTTL {
+		m.status = ""
+		m.statusAt = time.Time{}
+	}
+}
 
 // toUVKey converts a Bubble Tea key event into the ultraviolet key event the
 // emulator expects (the field layouts are identical).

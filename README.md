@@ -32,6 +32,7 @@ branch_name   = "{name}"
 [keys]
 cycle  = "ctrl+o"   # move one session view to the right
 picker = "ctrl+g"   # return to the CT picker
+help   = "f1"       # toggle the key/legend overlay (also "?" in the deck)
 ```
 
 ## Run
@@ -59,7 +60,8 @@ otherwise (faint until a workspace exists). The active repo / worktree shows on 
   `$XDG_STATE_HOME/ct/state.json` (default `~/.local/state/ct/state.json`).
 - Pressing **enter** on a worktree **activates** it: ct starts nvim + claude + a terminal in
   that worktree and drops you into the nvim view. The session segments light up and the active
-  repo / worktree shows on the right.
+  repo / worktree shows on the right. You can also **click** a deck row to select it and click it
+  again to open it (or, in `NEW`, to start naming a worktree).
 - **`ctrl+o`** cycles the session views (nvim → claude → terminal → nvim); **`ctrl+g`** returns
   to the picker — and from the picker, **`ctrl+g`** jumps straight to your most recently opened
   worktree, so it toggles you between the deck and your latest work. You can also **click** any
@@ -67,7 +69,10 @@ otherwise (faint until a workspace exists). The active repo / worktree shows on 
   workspace is active). Sessions keep running — switching never relaunches them, and they
   persist for ct's lifetime.
 
-Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `ctrl+c` quit.
+Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `?` help · `ctrl+c` quit.
+
+Press **`?`** (in the deck) or **`f1`** (anywhere, including inside a session) for a key + legend
+overlay; any key closes it.
 
 ## Layout
 
