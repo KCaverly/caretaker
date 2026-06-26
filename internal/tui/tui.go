@@ -372,6 +372,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for pid, st := range msg.byPid {
 				prev := m.agentPrevStatus[pid]
 				if prev == "busy" && (st.Status == "idle" || st.Status == "waiting") {
+					// Skip notification if the user is already watching this agent.
+					if m.screen == screenAgent && m.current != nil &&
+						m.current.ws != nil && m.current.ws.ActiveAgentSession() != nil &&
+						m.current.ws.ActiveAgentSession().Pid() == pid {
+						continue
+					}
 					if key, ok := m.pathToKey(st.Cwd); ok {
 						level := notifDone
 						if st.Status == "waiting" {
