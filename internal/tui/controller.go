@@ -29,6 +29,11 @@ func NewController(cfg config.Config) *Controller {
 	return &Controller{cfg: cfg}
 }
 
+// SetRoot updates the repos root after first-run setup.
+func (c *Controller) SetRoot(root string) {
+	c.cfg.Root = root
+}
+
 // WorktreeView is a worktree plus its current status.
 type WorktreeView struct {
 	WT         repo.Worktree

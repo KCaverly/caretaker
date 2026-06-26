@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -20,15 +21,28 @@ func main() {
 
 func run() error {
 	cfg, err := config.Load()
+	configPath := ""
+	needsSetup := false
 	if err != nil {
-		return err
+		var noConfig *config.ErrNoConfig
+		if errors.As(err, &noConfig) {
+			cfg = config.Default()
+			configPath = noConfig.Path
+			needsSetup = true
+		} else {
+			return err
+		}
 	}
 
 	mgr := session.NewManager()
 	defer mgr.CloseAll() // reap all ptys on exit
 
 	ctrl := tui.NewController(cfg)
-	p := tea.NewProgram(tui.New(ctrl, mgr))
+	m := tui.New(ctrl, mgr)
+	if needsSetup {
+		m = m.EnterSetup(configPath)
+	}
+	p := tea.NewProgram(m)
 	_, err = p.Run()
 	return err
 }

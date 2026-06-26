@@ -67,13 +67,26 @@ func Default() Config {
 	}
 }
 
-// Path returns the config file path (honoring XDG_CONFIG_HOME).
+// Path returns the config file path. Checks CT_CONFIG env var first, then
+// defaults to ~/.caretaker/config.toml.
 func Path() (string, error) {
-	dir, err := os.UserConfigDir()
+	if p := os.Getenv("CT_CONFIG"); p != "" {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "ct", "config.toml"), nil
+	return filepath.Join(home, ".caretaker", "config.toml"), nil
+}
+
+// ErrNoConfig is returned by Load when the config file does not exist.
+type ErrNoConfig struct {
+	Path string
+}
+
+func (e *ErrNoConfig) Error() string {
+	return fmt.Sprintf("no config file at %s", e.Path)
 }
 
 // Load reads the config file, applying defaults for any unset fields. Root must
@@ -89,7 +102,7 @@ func Load() (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return cfg, fmt.Errorf("no config file at %s: set `root` there to your repos directory", path)
+			return cfg, &ErrNoConfig{Path: path}
 		}
 		return cfg, fmt.Errorf("reading %s: %w", path, err)
 	}
@@ -105,24 +118,44 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// Save writes a minimal config containing just the root path, creating the
+// config directory if needed.
+func Save(path, root string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+	content := fmt.Sprintf("root = %q\n", root)
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// ResolveRoot expands ~ and makes root absolute, returning an error if it
+// doesn't point to an existing directory.
+func ResolveRoot(root string) (string, error) {
+	expanded, err := expandTilde(root)
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(expanded)
+	if err != nil {
+		return "", fmt.Errorf("resolving %q: %w", root, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%q is not a directory", abs)
+	}
+	return abs, nil
+}
+
 func (c *Config) validate() error {
 	if c.Root == "" {
 		return fmt.Errorf("config `root` is required (the directory containing your repos)")
 	}
-	expanded, err := expandTilde(c.Root)
+	abs, err := ResolveRoot(c.Root)
 	if err != nil {
 		return err
-	}
-	abs, err := filepath.Abs(expanded)
-	if err != nil {
-		return fmt.Errorf("resolving root %q: %w", c.Root, err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return fmt.Errorf("root %q: %w", abs, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("root %q is not a directory", abs)
 	}
 	c.Root = abs
 	return nil

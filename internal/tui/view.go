@@ -56,6 +56,8 @@ func (m Model) View() tea.View {
 	var body string
 	var cursor *tea.Cursor
 	switch {
+	case m.screen == screenSetup:
+		body = m.renderSetup(h - barHeight)
 	case m.helpOpen:
 		body = m.renderHelp(h - barHeight)
 	case m.screen == screenPicker:
@@ -489,6 +491,32 @@ func markLegend() string {
 		dirtyStyle.Render("✷") + helpStyle.Render(" uncommitted"),
 		recentStyle.Render("1 2 3") + helpStyle.Render(" recently opened"),
 	}, helpStyle.Render("   "))
+}
+
+// renderSetup draws the first-run setup overlay centered in the body area.
+func (m Model) renderSetup(h int) string {
+	innerW := clamp(m.width-8, 32, 60)
+
+	rows := []string{
+		header("setup", -1),
+		"",
+		dimStyle.Render("  no config found — let's get started"),
+		"",
+		dimStyle.Render("  config will be saved to:"),
+		"  " + helpKeyStyle.Render(m.configPath),
+		"",
+		dimStyle.Render("  directory containing your git repos"),
+		"",
+		"  " + m.rootInput.View(),
+		"",
+	}
+	if m.status != "" {
+		rows = append(rows, "  "+errStyle.Render(m.status), "")
+	}
+	rows = append(rows, "  "+keyhint("enter", "confirm")+"   "+keyhint("esc", "quit"))
+
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
 }
 
 // renderPalette draws the agent switcher overlay, centered in the body area.

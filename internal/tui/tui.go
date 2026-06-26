@@ -13,6 +13,7 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/sahilm/fuzzy"
 
+	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/state"
@@ -32,7 +33,7 @@ const (
 	defaultKeyHelp      = "f1"     // toggle the help overlay
 )
 
-// screen is the active view: the picker or one of the session views.
+// screen is the active view: the picker, one of the session views, or setup.
 type screen int
 
 const (
@@ -40,6 +41,7 @@ const (
 	screenEditor
 	screenAgent
 	screenTerminal
+	screenSetup
 )
 
 // next cycles among the session views (editor → agent → terminal → editor).
@@ -115,11 +117,15 @@ type Model struct {
 	activeCursor int
 	recentRank   map[string]int // worktree key -> recency rank (1..3); absent = none
 
+	// first-run setup
+	configPath string
+
 	// agent switcher overlay
 	paletteOpen   bool
 	paletteCursor int
 	naming        bool // entering a label for a new agent
 	agentName     textinput.Model
+	rootInput     textinput.Model
 
 	// live agent statuses from `claude agents --json`, keyed by pid
 	agentStatus map[int]AgentStatus
@@ -148,6 +154,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	agentName.Placeholder = "task label (optional)"
 	agentName.Prompt = "› "
 
+	rootInput := textinput.New()
+	rootInput.Placeholder = "~/repos"
+	rootInput.Prompt = "› "
+
 	cycle, picker := ctrl.Keys()
 	if cycle == "" {
 		cycle = defaultKeyCycle
@@ -175,8 +185,18 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help,
-		filter:  filter, nameInput: name, agentName: agentName, focus: focusNew,
+		filter: filter, nameInput: name, agentName: agentName, rootInput: rootInput,
+		focus: focusNew,
 	}
+}
+
+// EnterSetup switches the model into first-run setup mode, prompting the user
+// to choose a repos root before caretaker starts normally.
+func (m Model) EnterSetup(configPath string) Model {
+	m.screen = screenSetup
+	m.configPath = configPath
+	m.rootInput.Focus()
+	return m
 }
 
 // --- messages ---
@@ -206,6 +226,9 @@ type statusMsg struct {
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
+	if m.screen == screenSetup {
+		return tea.Batch(textinput.Blink, m.repaintCmd())
+	}
 	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd(), m.pollStatusCmd())
 }
 
@@ -277,6 +300,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		inputW := max(10, m.width-12)
 		m.filter.SetWidth(inputW)
 		m.nameInput.SetWidth(inputW)
+		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
 		w, h := m.sessionSize()
 		m.mgr.Resize(w, h)
 		return m, nil
@@ -425,6 +449,9 @@ func (m *Model) saveAgents(key string) {
 // --- key handling ---
 
 func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.screen == screenSetup {
+		return m.handleSetupKey(msg)
+	}
 	// Help is modal and reachable from anywhere (including inside a session). Any
 	// key dismisses it; the help key itself toggles it.
 	if m.helpOpen {
@@ -439,6 +466,35 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleSessionKey(msg)
 	}
 	return m.handlePicker(msg)
+}
+
+func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "esc":
+		return m, tea.Quit
+	case "enter":
+		root := strings.TrimSpace(m.rootInput.Value())
+		if root == "" {
+			return m, nil
+		}
+		abs, err := config.ResolveRoot(root)
+		if err != nil {
+			m.status = err.Error()
+			return m, nil
+		}
+		if err := config.Save(m.configPath, abs); err != nil {
+			m.status = "save error: " + err.Error()
+			return m, nil
+		}
+		m.ctrl.SetRoot(abs)
+		m.screen = screenPicker
+		m.flash("config saved — welcome to caretaker!")
+		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd())
+	}
+	var cmd tea.Cmd
+	m.rootInput, cmd = m.rootInput.Update(msg)
+	m.status = ""
+	return m, cmd
 }
 
 func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {

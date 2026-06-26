@@ -6,6 +6,36 @@ import (
 	"testing"
 )
 
+func TestPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("CT_CONFIG", "")
+		got, err := Path()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(home, ".caretaker", "config.toml")
+		if got != want {
+			t.Fatalf("Path() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv("CT_CONFIG", "/custom/path/config.toml")
+		got, err := Path()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "/custom/path/config.toml" {
+			t.Fatalf("Path() = %q, want /custom/path/config.toml", got)
+		}
+	})
+}
+
 func TestDefault(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	d := Default()
