@@ -48,6 +48,12 @@ type Keys struct {
 	GlobalConfig string `toml:"global_config"`
 	// Notif opens the notification overlay.
 	Notif string `toml:"notif"`
+	// Terminal pane management (only intercepted on the terminal screen).
+	TermSplitV string `toml:"term_split_v"` // new pane to the right
+	TermSplitH string `toml:"term_split_h"` // new pane below
+	TermCycle  string `toml:"term_cycle"`   // cycle pane focus
+	TermZoom   string `toml:"term_zoom"`    // toggle full-size
+	TermClose  string `toml:"term_close"`   // close active pane
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -67,6 +73,8 @@ func Default() Config {
 			Cycle: "ctrl+o", Picker: "ctrl+g",
 			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
 			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n",
+			TermSplitV: "ctrl+\\", TermSplitH: "ctrl+-",
+			TermCycle: "ctrl+w", TermZoom: "ctrl+f", TermClose: "ctrl+x",
 		},
 	}
 }

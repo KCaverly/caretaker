@@ -77,7 +77,7 @@ func TestManagerActivateReuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ws1.Term == nil || ws1.Term != ws2.Term {
+	if len(ws1.Terms) == 0 || len(ws2.Terms) == 0 || ws1.Terms[0] != ws2.Terms[0] {
 		t.Fatal("Activate should reuse existing sessions, not relaunch")
 	}
 	if !m.Has("repo/wt") {
@@ -104,7 +104,7 @@ func TestManagerSpawnAndCloseAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ws.Editor == nil || ws.Term == nil || len(ws.Agents) != 1 {
+	if ws.Editor == nil || len(ws.Terms) == 0 || len(ws.Agents) != 1 {
 		t.Fatalf("activate should assign editor/term and one agent, got %+v", ws)
 	}
 

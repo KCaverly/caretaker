@@ -66,6 +66,8 @@ func (m Model) View() tea.View {
 		body = m.renderDeck(h - barHeight)
 	case m.paletteOpen:
 		body = m.renderPalette(h - barHeight)
+	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
+		body, cursor = m.renderTermPanes(w, h-barHeight)
 	default:
 		if s := m.activeSession(); s != nil {
 			body = s.Render()
@@ -495,6 +497,13 @@ func (m Model) renderHelp(h int) string {
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
 		row(m.keyNotif, "notification overlay"),
 		"",
+		repoHdrStyle.Render("  Terminal panes"),
+		row(m.keyTermSplitV, "vertical split"),
+		row(m.keyTermSplitH, "horizontal split"),
+		row(m.keyTermCycle, "cycle pane focus"),
+		row(m.keyTermZoom, "zoom / restore pane"),
+		row(m.keyTermClose, "close pane"),
+		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
@@ -710,6 +719,149 @@ func (m Model) centerFooter(content string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// --- terminal pane rendering ---
+
+// renderTermPanes renders the terminal screen: either a single full-size pane,
+// a zoomed pane, or a split layout assembled from the pane tree.
+func (m Model) renderTermPanes(w, h int) (string, *tea.Cursor) {
+	ws := m.current.ws
+	if len(ws.Terms) == 0 {
+		return "", nil
+	}
+	if ws.TermZoomed || len(ws.Terms) == 1 || ws.TermLayout == nil {
+		s := ws.Terms[ws.ActiveTerm]
+		body := s.Render()
+		var cursor *tea.Cursor
+		if x, y, visible := s.Cursor(); visible {
+			cursor = tea.NewCursor(x, y+barHeight)
+		}
+		return body, cursor
+	}
+	return m.renderPaneNode(ws.TermLayout, 0, 0, w, h, ws)
+}
+
+// renderPaneNode recursively renders a split subtree into (x, y, w, h) of the
+// body, inserting styled dividers between panes.
+func (m Model) renderPaneNode(node *session.PaneNode, x, y, w, h int, ws *session.Workspace) (string, *tea.Cursor) {
+	if node == nil || w < 1 || h < 1 {
+		return strings.Repeat(" ", w)+strings.Repeat("\n"+strings.Repeat(" ", w), h-1), nil
+	}
+	if node.Dir == session.SplitNone {
+		if node.Idx >= len(ws.Terms) {
+			return "", nil
+		}
+		s := ws.Terms[node.Idx]
+		body := s.Render()
+		var cursor *tea.Cursor
+		if node.Idx == ws.ActiveTerm {
+			if cx, cy, visible := s.Cursor(); visible {
+				cursor = tea.NewCursor(x+cx, y+barHeight+cy)
+			}
+		}
+		return body, cursor
+	}
+
+	if node.Dir == session.SplitV {
+		if w < 3 {
+			return m.renderPaneNode(node.A, x, y, w, h, ws)
+		}
+		aW := max(1, int(node.Ratio*float64(w-1)))
+		bW := w - aW - 1
+		if bW < 1 {
+			bW, aW = 1, w-2
+		}
+		aBody, aCur := m.renderPaneNode(node.A, x, y, aW, h, ws)
+		bBody, bCur := m.renderPaneNode(node.B, x+aW+1, y, bW, h, ws)
+		divColor := m.paneAdjacentColor(node, ws.ActiveTerm)
+		body := joinVerticalSplit(aBody, bBody, divColor, h, aW)
+		if aCur != nil {
+			return body, aCur
+		}
+		return body, bCur
+	}
+
+	// SplitH
+	if h < 3 {
+		return m.renderPaneNode(node.A, x, y, w, h, ws)
+	}
+	aH := max(1, int(node.Ratio*float64(h-1)))
+	bH := h - aH - 1
+	if bH < 1 {
+		bH, aH = 1, h-2
+	}
+	aBody, aCur := m.renderPaneNode(node.A, x, y, w, aH, ws)
+	bBody, bCur := m.renderPaneNode(node.B, x, y+aH+1, w, bH, ws)
+	divColor := m.paneAdjacentColor(node, ws.ActiveTerm)
+	body := joinHorizontalSplit(aBody, bBody, divColor, w, aH)
+	if aCur != nil {
+		return body, aCur
+	}
+	return body, bCur
+}
+
+// paneAdjacentColor returns cAccent if the active pane is a direct child of
+// this split node (i.e., the divider directly borders the focused pane), or
+// cFaint otherwise.
+func (m Model) paneAdjacentColor(node *session.PaneNode, activeTerm int) color.Color {
+	if (node.A.Dir == session.SplitNone && node.A.Idx == activeTerm) ||
+		(node.B.Dir == session.SplitNone && node.B.Idx == activeTerm) {
+		return cAccent
+	}
+	return cFaint
+}
+
+// joinVerticalSplit interleaves lines from left and right pane bodies with a
+// single-column divider. leftWidth is the pane's column count — every left
+// line is padded to that exact display width so the divider lands on a
+// consistent column regardless of how much content the vt emulator rendered.
+func joinVerticalSplit(left, right string, divColor color.Color, h, leftWidth int) string {
+	leftLines := splitLines(left)
+	rightLines := splitLines(right)
+	div := lipgloss.NewStyle().Foreground(divColor).Render("│")
+	rows := make([]string, h)
+	for i := range rows {
+		l, r := "", ""
+		if i < len(leftLines) {
+			l = leftLines[i]
+		}
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		// Pad left line to leftWidth so the divider is always at the same column.
+		if lw := lipgloss.Width(l); lw < leftWidth {
+			l += strings.Repeat(" ", leftWidth-lw)
+		}
+		rows[i] = l + div + r
+	}
+	return strings.Join(rows, "\n")
+}
+
+// joinHorizontalSplit stacks top and bottom pane bodies with a single-row
+// divider. topHeight is the expected row count for the top pane — the block
+// is padded to that many rows so the divider always starts at the right row.
+func joinHorizontalSplit(top, bottom string, divColor color.Color, w, topHeight int) string {
+	topLines := splitLines(top)
+	rows := make([]string, topHeight)
+	for i := range rows {
+		if i < len(topLines) {
+			rows[i] = topLines[i]
+		}
+	}
+	div := lipgloss.NewStyle().Foreground(divColor).Render(strings.Repeat("─", max(1, w)))
+	return strings.Join(rows, "\n") + "\n" + div + "\n" + bottom
+}
+
+// splitLines splits a vt-emulator output string into lines, normalising \r\n
+// and stripping any trailing \r so callers get clean line strings.
+func splitLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimRight(ln, "\r")
+	}
+	return lines
 }
 
 // --- helpers ---

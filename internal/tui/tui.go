@@ -35,6 +35,13 @@ const (
 	defaultKeyHelp         = "f1"     // toggle the help overlay
 	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
 	defaultKeyNotif        = "ctrl+n" // open notification overlay
+
+	// Terminal pane management — only intercepted when the terminal screen is active.
+	defaultKeyTermSplitV = "ctrl+\\" // new pane to the right
+	defaultKeyTermSplitH = "ctrl+-"  // new pane below
+	defaultKeyTermCycle  = "ctrl+w"  // cycle pane focus
+	defaultKeyTermZoom   = "ctrl+f"  // toggle full-size
+	defaultKeyTermClose  = "ctrl+x"  // close active pane
 )
 
 // screen is the active view: the picker, one of the session views, or setup.
@@ -122,6 +129,9 @@ type Model struct {
 	keyCycle, keyPicker                    string
 	keyPalette, keyNextAgent, keyPrevAgent string
 	keyHelp, keyGlobalConfig, keyNotif     string
+
+	keyTermSplitV, keyTermSplitH string
+	keyTermCycle, keyTermZoom, keyTermClose string
 
 	screen   screen
 	current  *workspaceRef
@@ -226,12 +236,30 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if notif == "" {
 		notif = defaultKeyNotif
 	}
+	termSplitV, termSplitH, termCycle, termZoom, termClose := ctrl.TermPaneKeys()
+	if termSplitV == "" {
+		termSplitV = defaultKeyTermSplitV
+	}
+	if termSplitH == "" {
+		termSplitH = defaultKeyTermSplitH
+	}
+	if termCycle == "" {
+		termCycle = defaultKeyTermCycle
+	}
+	if termZoom == "" {
+		termZoom = defaultKeyTermZoom
+	}
+	if termClose == "" {
+		termClose = defaultKeyTermClose
+	}
 
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
+		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
+		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
 		filter:  filter, nameInput: name, agentName: agentName, rootInput: rootInput,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
@@ -334,7 +362,7 @@ func (m Model) activeSession() *session.Session {
 	case screenEditor:
 		return m.current.ws.Editor
 	case screenTerminal:
-		return m.current.ws.Term
+		return m.current.ws.ActiveTermSession()
 	case screenAgent:
 		return m.current.ws.ActiveAgentSession()
 	default:
@@ -357,6 +385,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
 		w, h := m.sessionSize()
 		m.mgr.Resize(w, h)
+		if m.current != nil {
+			m.mgr.ResizeTermPanes(m.current.key, w, h)
+		}
 		return m, nil
 
 	case loadedMsg:
@@ -803,6 +834,32 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case m.keyPrevAgent:
 		return m.rotateAgent(-1), nil
 	}
+	if m.screen == screenTerminal && m.current != nil {
+		key := m.current.key
+		w, h := m.sessionSize()
+		switch msg.String() {
+		case m.keyTermSplitV:
+			_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitV, w, h)
+			m.mgr.ResizeTermPanes(key, w, h)
+			return m, nil
+		case m.keyTermSplitH:
+			_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitH, w, h)
+			m.mgr.ResizeTermPanes(key, w, h)
+			return m, nil
+		case m.keyTermCycle:
+			m.mgr.CycleTermPane(key)
+			return m, nil
+		case m.keyTermZoom:
+			m.mgr.ZoomTermPane(key)
+			m.mgr.ResizeTermPanes(key, w, h)
+			return m, nil
+		case m.keyTermClose:
+			_ = m.mgr.CloseTermPane(key)
+			m.mgr.ResizeTermPanes(key, w, h)
+			return m, nil
+		}
+	}
+
 	if s := m.activeSession(); s != nil {
 		s.SendKey(toUVKey(msg))
 	}

@@ -105,6 +105,13 @@ func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
 // NotifKey returns the key that opens the notification overlay.
 func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
 
+// TermPaneKeys returns the reserved keys for terminal pane management. These
+// are only intercepted when the terminal screen is active.
+func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {
+	k := c.cfg.Keys
+	return k.TermSplitV, k.TermSplitH, k.TermCycle, k.TermZoom, k.TermClose
+}
+
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 

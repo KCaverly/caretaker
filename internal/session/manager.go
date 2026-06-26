@@ -19,12 +19,15 @@ type Spec struct {
 	SessionID string
 }
 
-// Workspace holds the live sessions for one activated worktree: a single editor
-// and terminal, plus a pool of agents (Claude sessions) with one focused.
+// Workspace holds the live sessions for one activated worktree: a single editor,
+// a pool of terminal panes arranged in a split tree, and a pool of agents.
 type Workspace struct {
-	Editor *Session
-	Term   *Session
-	Agents []*Session
+	Editor     *Session
+	Terms      []*Session // terminal panes; the tree below describes their layout
+	TermLayout *PaneNode  // nil when Terms is empty
+	ActiveTerm int        // index of the focused pane in Terms
+	TermZoomed bool       // when true, only the focused pane is shown full-size
+	Agents      []*Session
 	// ActiveAgent indexes the focused agent in Agents (clamped to a valid index
 	// while any agent exists).
 	ActiveAgent int
@@ -38,15 +41,21 @@ func (w *Workspace) ActiveAgentSession() *Session {
 	return w.Agents[w.ActiveAgent]
 }
 
+// ActiveTermSession returns the focused terminal pane, or nil if none exist.
+func (w *Workspace) ActiveTermSession() *Session {
+	if w.ActiveTerm < 0 || w.ActiveTerm >= len(w.Terms) {
+		return nil
+	}
+	return w.Terms[w.ActiveTerm]
+}
+
 // all returns every live session in the workspace.
 func (w *Workspace) all() []*Session {
-	ss := make([]*Session, 0, len(w.Agents)+2)
+	ss := make([]*Session, 0, len(w.Agents)+1+len(w.Terms))
 	if w.Editor != nil {
 		ss = append(ss, w.Editor)
 	}
-	if w.Term != nil {
-		ss = append(ss, w.Term)
-	}
+	ss = append(ss, w.Terms...)
 	return append(ss, w.Agents...)
 }
 
@@ -118,8 +127,12 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 		switch {
 		case sp.Kind == Editor && ws.Editor == nil:
 			ws.Editor = s
-		case sp.Kind == Terminal && ws.Term == nil:
-			ws.Term = s
+		case sp.Kind == Terminal:
+			idx := len(ws.Terms)
+			ws.Terms = append(ws.Terms, s)
+			if ws.TermLayout == nil {
+				ws.TermLayout = &PaneNode{Dir: SplitNone, Idx: idx}
+			}
 		default:
 			ws.Agents = append(ws.Agents, s)
 		}
@@ -166,15 +179,121 @@ func (m *Manager) CloseAgent(key string, idx int) {
 	s.Close()
 }
 
-// Resize resizes every live session.
+// Resize resizes every non-terminal session (editor and agents). Terminal
+// panes are resized separately by ResizeTermPanes because each pane has its
+// own dimensions determined by the split tree.
 func (m *Manager) Resize(w, h int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, ws := range m.spaces {
-		for _, s := range ws.all() {
-			s.Resize(w, h)
+		if ws.Editor != nil {
+			ws.Editor.Resize(w, h)
+		}
+		for _, a := range ws.Agents {
+			a.Resize(w, h)
 		}
 	}
+}
+
+// ResizeTermPanes recomputes pane bounds from the split tree and resizes each
+// terminal session to its assigned rectangle. w and h are the body dimensions
+// (terminal height minus the status-bar chrome).
+func (m *Manager) ResizeTermPanes(key string, w, h int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok || ws.TermLayout == nil {
+		return
+	}
+	for _, b := range ComputePaneBounds(ws.TermLayout, 0, 0, w, h) {
+		if b.Idx < len(ws.Terms) && ws.Terms[b.Idx] != nil {
+			ws.Terms[b.Idx].Resize(b.W, b.H)
+		}
+	}
+}
+
+// SplitTermPane spawns a new terminal session and inserts it into the pane
+// tree as a sibling of the currently focused pane (split in direction sd).
+// The new pane becomes the focused pane. The caller should call
+// ResizeTermPanes afterwards to correct the pane dimensions.
+func (m *Manager) SplitTermPane(key, dir string, spec Spec, sd SplitDir, w, h int) (*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok {
+		return nil, errNoWorkspace
+	}
+	if w < 4 || h < 3 {
+		return nil, nil // too small to split; silently ignore
+	}
+	newIdx := len(ws.Terms)
+	s, err := Start(spec.Kind, spec.Title, dir, spec.Argv, w/2, h, m.signalDirty)
+	if err != nil {
+		return nil, err
+	}
+	ws.Terms = append(ws.Terms, s)
+	ws.TermLayout = SplitPaneNode(ws.TermLayout, ws.ActiveTerm, newIdx, sd)
+	ws.ActiveTerm = newIdx
+	return s, nil
+}
+
+// CloseTermPane closes the currently focused terminal pane, heals the split
+// tree, and compacts the Terms slice. The caller should call ResizeTermPanes
+// afterwards to fill the vacated space.
+func (m *Manager) CloseTermPane(key string) error {
+	m.mu.Lock()
+	ws, ok := m.spaces[key]
+	if !ok || len(ws.Terms) == 0 {
+		m.mu.Unlock()
+		return errNoWorkspace
+	}
+	closeIdx := ws.ActiveTerm
+	s := ws.Terms[closeIdx]
+	n := len(ws.Terms)
+
+	ws.Terms = append(ws.Terms[:closeIdx], ws.Terms[closeIdx+1:]...)
+	ws.TermLayout = ClosePaneNode(ws.TermLayout, closeIdx)
+
+	if ws.TermLayout != nil && closeIdx < n-1 {
+		mapping := make(map[int]int, n-1-closeIdx)
+		for i := closeIdx + 1; i < n; i++ {
+			mapping[i] = i - 1
+		}
+		RemapPaneIndices(ws.TermLayout, mapping)
+	}
+
+	if len(ws.Terms) == 0 {
+		ws.ActiveTerm = 0
+	} else {
+		ws.ActiveTerm = min(closeIdx, len(ws.Terms)-1)
+	}
+	m.mu.Unlock()
+	s.Close()
+	return nil
+}
+
+// CycleTermPane advances the focused terminal pane to the next leaf in the
+// in-order traversal of the split tree.
+func (m *Manager) CycleTermPane(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok || ws.TermLayout == nil {
+		return
+	}
+	ws.ActiveTerm = NextPaneIdx(ws.TermLayout, ws.ActiveTerm)
+}
+
+// ZoomTermPane toggles the focused terminal pane between its normal split
+// position and a full-size view.
+func (m *Manager) ZoomTermPane(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok {
+		return
+	}
+	ws.TermZoomed = !ws.TermZoomed
 }
 
 // Close terminates and forgets a workspace's sessions.

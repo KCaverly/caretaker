@@ -30,7 +30,7 @@ func TestActiveSessionByScreen(t *testing.T) {
 	ag0 := &session.Session{}
 	ag1 := &session.Session{}
 	tm := &session.Session{}
-	ws := &session.Workspace{Editor: ed, Term: tm, Agents: []*session.Session{ag0, ag1}, ActiveAgent: 1}
+	ws := &session.Workspace{Editor: ed, Terms: []*session.Session{tm}, TermLayout: &session.PaneNode{Idx: 0}, Agents: []*session.Session{ag0, ag1}, ActiveAgent: 1}
 
 	m := sampleModel()
 	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", ws: ws}
@@ -632,7 +632,7 @@ func TestActivateFlow(t *testing.T) {
 	if m.current == nil || m.current.ws == nil {
 		t.Fatalf("expected an active workspace, got %+v", m.current)
 	}
-	if m.current.ws.Editor == nil || m.current.ws.Term == nil || len(m.current.ws.Agents) != 1 {
+	if m.current.ws.Editor == nil || len(m.current.ws.Terms) == 0 || len(m.current.ws.Agents) != 1 {
 		t.Fatalf("expected editor+term+1 agent, got %+v", m.current.ws)
 	}
 	if !mgr.Has("repo/wt") {
