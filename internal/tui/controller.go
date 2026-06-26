@@ -99,6 +99,12 @@ func (c *Controller) AgentKeys() (palette, next, prev string) {
 // HelpKey returns the reserved key that toggles the help overlay.
 func (c *Controller) HelpKey() string { return c.cfg.Keys.Help }
 
+// GlobalConfigKey returns the key that opens the home-directory workspace.
+func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
+
+// GlobalConfigDir returns the home directory path for the global config workspace.
+func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
+
 // EditorSpec returns the spec for a workspace's nvim session.
 func (c *Controller) EditorSpec() session.Spec {
 	return session.Spec{Kind: session.Editor, Title: "nvim", Argv: []string{c.cfg.Editor}}
