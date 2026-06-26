@@ -107,18 +107,48 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Repo / worktree, de-emphasised (terminals can't shrink a run of text, so
-	// we reduce its weight and colour instead).
+	// Right side: notification zone (! N  * N) then repo / worktree.
 	right := ""
+	if notif := m.renderNotifZone(); notif != "" {
+		right += notif + "   "
+	}
 	if has {
-		right = lipgloss.NewStyle().Foreground(cDim).
-			Render(m.current.repo+" / "+m.current.worktree) + "  "
+		right += lipgloss.NewStyle().Foreground(cDim).
+			Render(m.current.repo + " / " + m.current.worktree)
+	}
+	if right != "" {
+		right += "  "
 	}
 
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
 	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
 	return bar + "\n" + sep
+}
+
+// renderNotifZone builds the right-side notification summary: "! N" (red) for
+// worktrees where an agent is waiting on input, "* N" (green) for unread
+// completions. Returns "" when nothing is pending.
+func (m Model) renderNotifZone() string {
+	var waiting, done int
+	for _, lvl := range m.unread {
+		switch lvl {
+		case notifWaiting:
+			waiting++
+		case notifDone:
+			done++
+		}
+	}
+	var parts []string
+	if waiting > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")+
+			" "+countStyle.Render(strconv.Itoa(waiting)))
+	}
+	if done > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")+
+			" "+countStyle.Render(strconv.Itoa(done)))
+	}
+	return strings.Join(parts, "  ")
 }
 
 // barZone is one clickable status-bar icon: its fully-rendered glyph (with any
@@ -147,27 +177,13 @@ func (m Model) barZones() []barZone {
 		}
 	}
 
-	// Caretaker: smiley (tending the deck) vs skull (away in a session), badged
-	// with a dot when some *other* worktree is waiting on input.
+	// Caretaker: smiley (tending the deck) vs skull (away in a session).
 	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
 	if m.screen != screenPicker {
 		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
 	}
-	if dot := levelDot(m.otherWorktreesLevel()); dot != "" {
-		ct += dot
-	}
 
-	// Agent icon: badged with the pool size (when >1) and the current worktree's
-	// worst status dot.
 	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
-	if has && m.current.ws != nil {
-		if n := len(m.current.ws.Agents); n > 1 {
-			agent += " " + countStyle.Render(strconv.Itoa(n))
-		}
-		if dot := levelDot(m.worktreeLevel(m.current.path)); dot != "" {
-			agent += dot
-		}
-	}
 
 	return []barZone{
 		{screenPicker, ct},
@@ -197,70 +213,6 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 	return 0, false
 }
 
-// agentLevel ranks an agent/worktree status for badge precedence.
-type agentLevel int
-
-const (
-	levelNone    agentLevel = iota // busy / unknown — no badge
-	levelIdle                      // idle (turn done) — dim dot
-	levelWaiting                   // waiting (blocked) — yellow dot
-)
-
-func statusLevel(status string) agentLevel {
-	switch status {
-	case "waiting":
-		return levelWaiting
-	case "idle":
-		return levelIdle
-	default:
-		return levelNone
-	}
-}
-
-// levelDot renders a notification dot for a level, or "" for levelNone.
-func levelDot(l agentLevel) string {
-	switch l {
-	case levelWaiting:
-		return lipgloss.NewStyle().Foreground(cYellow).Render("●")
-	case levelIdle:
-		return dimStyle.Render("●")
-	default:
-		return ""
-	}
-}
-
-// worktreeLevel is the worst status among the claude sessions running in path.
-func (m Model) worktreeLevel(path string) agentLevel {
-	lvl := levelNone
-	for _, st := range m.agentStatus {
-		if st.Cwd != path {
-			continue
-		}
-		if l := statusLevel(st.Status); l > lvl {
-			lvl = l
-		}
-	}
-	return lvl
-}
-
-// otherWorktreesLevel is the worst status across every worktree except the one
-// currently focused — what the caretaker icon badges.
-func (m Model) otherWorktreesLevel() agentLevel {
-	cur := ""
-	if m.current != nil {
-		cur = m.current.path
-	}
-	lvl := levelNone
-	for _, it := range m.active {
-		if it.view.WT.Path == cur {
-			continue
-		}
-		if l := m.worktreeLevel(it.view.WT.Path); l > lvl {
-			lvl = l
-		}
-	}
-	return lvl
-}
 
 // deckLayout captures the deck's vertical geometry, shared by renderDeck (to
 // draw) and deckClick (to hit-test) so the two can never drift apart. bodyH is
@@ -393,46 +345,55 @@ func (m Model) renderActive(innerW, rows int) []string {
 }
 
 func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
-	// A single status circle: yellow when an agent is waiting on input, green
-	// when the worktree is live, a hollow ring when inactive.
-	waiting := m.worktreeLevel(it.view.WT.Path) == levelWaiting
-	dotChar := "○"
-	if waiting || it.view.Live {
-		dotChar = "●"
+	key := wsKey(it.repo.Name, it.view.WT.Name)
+
+	// Live/dead indicator: filled circle when sessions are running, hollow otherwise.
+	liveChar := "○"
+	liveSt := dimStyle
+	if it.view.Live {
+		liveChar = "●"
+		liveSt = liveStyle
 	}
+
+	// Notification indicator: matches the right-bar glyphs so the user can
+	// scan the list for the same symbol they saw in the bar.
+	notifChar := " "
+	notifSt := dimStyle
+	switch m.unread[key] {
+	case notifWaiting:
+		notifChar = "!"
+		notifSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	case notifDone:
+		notifChar = "*"
+		notifSt = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+	}
+
 	dirtyChar := " "
 	if it.view.Dirty {
 		dirtyChar = "✷"
 	}
 
 	// Leading rank column (1..3) for the worktrees most recently opened in ct,
-	// blank otherwise. A 6-column gutter keeps selected/unselected rows aligned.
-	rank := m.recentRank[wsKey(it.repo.Name, it.view.WT.Name)]
+	// blank otherwise. A fixed-width gutter keeps selected/unselected rows aligned.
+	rank := m.recentRank[key]
 	rankCh := " "
 	if rank > 0 {
 		rankCh = strconv.Itoa(rank)
 	}
 
 	if highlight {
-		return selBar(fmt.Sprintf("  %s ▸ %s %s %s", rankCh, dotChar, dirtyChar, it.view.WT.Name), innerW)
+		return selBar(fmt.Sprintf("  %s ▸ %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, it.view.WT.Name), innerW)
 	}
 
 	rankCol := " "
 	if rank > 0 {
 		rankCol = recentStyle.Render(rankCh)
 	}
-	dotStyle := dimStyle
-	switch {
-	case waiting:
-		dotStyle = lipgloss.NewStyle().Foreground(cYellow)
-	case it.view.Live:
-		dotStyle = liveStyle
-	}
 	dirty := " "
 	if it.view.Dirty {
 		dirty = dirtyStyle.Render(dirtyChar)
 	}
-	return "  " + rankCol + "   " + dotStyle.Render(dotChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+	return "  " + rankCol + "   " + liveSt.Render(liveChar) + " " + notifSt.Render(notifChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
 }
 
 // renderHelp draws the key + legend overlay, centered in the body area. The
@@ -479,11 +440,11 @@ func (m Model) renderHelp(h int) string {
 // statusLegend / markLegend explain the deck's status glyphs, split across two
 // lines so they stay within the overlay's width.
 func statusLegend() string {
-	yellow := lipgloss.NewStyle().Foreground(cYellow)
 	return strings.Join([]string{
 		liveStyle.Render("●") + helpStyle.Render(" live"),
-		yellow.Render("●") + helpStyle.Render(" waiting"),
-		dimStyle.Render("○") + helpStyle.Render(" idle/stopped"),
+		dimStyle.Render("○") + helpStyle.Render(" stopped"),
+		lipgloss.NewStyle().Foreground(cRed).Render("!") + helpStyle.Render(" waiting"),
+		lipgloss.NewStyle().Foreground(cGreen).Render("*") + helpStyle.Render(" done"),
 	}, helpStyle.Render("   "))
 }
 
@@ -526,7 +487,7 @@ func (m Model) renderPalette(h int) string {
 	innerW := clamp(m.width-8, 24, 64)
 
 	rows := []string{
-		header("claude", -1) + "  " + dimStyle.Render(m.current.repo+" / "+m.current.worktree),
+		header("claude", len(ws.Agents)) + "  " + dimStyle.Render(m.current.repo+" / "+m.current.worktree),
 		"",
 	}
 	for i, a := range ws.Agents {
@@ -547,37 +508,49 @@ func (m Model) renderPalette(h int) string {
 	return centerBlock(boxStr, m.width, h)
 }
 
-// paletteRow renders one agent line with its name and live status.
+// paletteRow renders one agent line. Content is identical whether or not the row
+// is selected — selection is indicated purely by the background highlight applied
+// via selBar. Layout: "  N [!|*| ] name  (status)"
 func (m Model) paletteRow(i int, a *session.Session, innerW int) string {
 	name := a.Title
 	if name == "" {
 		name = "claude"
 	}
-	dot, label := statusText(m.agentStatus[a.Pid()])
+	st := m.agentStatus[a.Pid()]
+
+	// Notification column: ! (live-waiting), * (unread done), space (nothing).
+	notifCol := " "
+	if st.Status == "waiting" {
+		notifCol = lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")
+	} else if pid := a.Pid(); pid != 0 && m.agentUnread[pid] == notifDone {
+		notifCol = lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")
+	}
+
+	label := paletteStatusLabel(st)
+	content := fmt.Sprintf("  %s %s %s  %s",
+		dimStyle.Render(strconv.Itoa(i+1)), notifCol, nameStyle.Render(name), dimStyle.Render(label))
 
 	if i == m.paletteCursor && !m.naming {
-		return selBar(fmt.Sprintf("  %d ▸ %s  %s", i+1, name, label), innerW)
+		return selBar(content, innerW)
 	}
-	return fmt.Sprintf("  %s   %s %s  %s",
-		dimStyle.Render(strconv.Itoa(i+1)), dot, nameStyle.Render(name), dimStyle.Render(label))
+	return content
 }
 
-// statusText maps a live status to a dot glyph and a human label.
-func statusText(st AgentStatus) (dot, label string) {
+// paletteStatusLabel returns the status in parentheses for palette rows.
+func paletteStatusLabel(st AgentStatus) string {
 	switch st.Status {
 	case "busy":
-		return liveStyle.Render("●"), "working"
+		return "(working)"
 	case "waiting":
 		l := "waiting"
 		if st.WaitingFor != "" {
 			l += ": " + st.WaitingFor
 		}
-		yellow := lipgloss.NewStyle().Foreground(cYellow)
-		return yellow.Render("●"), yellow.Render(l)
+		return "(" + l + ")"
 	case "idle":
-		return dimStyle.Render("●"), "idle"
+		return "(idle)"
 	default:
-		return dimStyle.Render("○"), "—"
+		return ""
 	}
 }
 

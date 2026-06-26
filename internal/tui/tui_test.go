@@ -494,32 +494,103 @@ func TestPaletteEnterNewRowStartsNaming(t *testing.T) {
 	}
 }
 
-func TestWorktreeStatusRollup(t *testing.T) {
+func TestNotifTransitionDetection(t *testing.T) {
 	m := sampleModel()
-	m.agentStatus = map[int]AgentStatus{
-		1: {Status: "busy", Cwd: "/r/a"},
-		2: {Status: "idle", Cwd: "/r/a"},
-		3: {Status: "waiting", Cwd: "/r/b"},
-	}
-
-	if got := m.worktreeLevel("/r/a"); got != levelIdle {
-		t.Errorf("/r/a should roll up to idle (worst of busy+idle), got %v", got)
-	}
-	if got := m.worktreeLevel("/r/b"); got != levelWaiting {
-		t.Errorf("/r/b should roll up to waiting, got %v", got)
-	}
-	if got := m.worktreeLevel("/r/none"); got != levelNone {
-		t.Errorf("unknown worktree should be levelNone, got %v", got)
-	}
-
-	// otherWorktreesLevel takes the worst across worktrees != current.
 	m.active = []activeItem{
-		{view: WorktreeView{WT: repo.Worktree{Path: "/r/a"}}},
-		{view: WorktreeView{WT: repo.Worktree{Path: "/r/b"}}},
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "b", Path: "/r/b"}}},
 	}
-	m.current = &workspaceRef{path: "/r/a"}
-	if got := m.otherWorktreesLevel(); got != levelWaiting {
-		t.Errorf("other worktrees should surface /r/b waiting, got %v", got)
+	m.agentPrevStatus = map[int]string{1: "busy", 2: "busy"}
+
+	// pid 1 finishes (busy → idle), pid 2 gets blocked (busy → waiting)
+	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "idle", Cwd: "/r/a"},
+		2: {Status: "waiting", Cwd: "/r/b"},
+	}})
+	m2 := result.(Model)
+
+	if m2.unread[wsKey("r", "a")] != notifDone {
+		t.Errorf("r/a: want notifDone after busy→idle, got %v", m2.unread[wsKey("r", "a")])
+	}
+	if m2.unread[wsKey("r", "b")] != notifWaiting {
+		t.Errorf("r/b: want notifWaiting after busy→waiting, got %v", m2.unread[wsKey("r", "b")])
+	}
+
+	// A pid that was idle (not busy) going idle again should not fire.
+	m3 := sampleModel()
+	m3.active = m.active
+	m3.agentPrevStatus = map[int]string{1: "idle"}
+	result3, _ := m3.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "idle", Cwd: "/r/a"},
+	}})
+	m4 := result3.(Model)
+	if m4.unread[wsKey("r", "a")] != notifNone {
+		t.Errorf("idle→idle should not produce a notification, got %v", m4.unread[wsKey("r", "a")])
+	}
+}
+
+func TestNotifLevelPrecedence(t *testing.T) {
+	m := sampleModel()
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
+	}
+	// Already has a waiting notification; a done transition should not downgrade it.
+	m.unread = map[string]notifLevel{wsKey("r", "a"): notifWaiting}
+	m.agentPrevStatus = map[int]string{1: "busy"}
+	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "idle", Cwd: "/r/a"},
+	}})
+	m2 := result.(Model)
+	if m2.unread[wsKey("r", "a")] != notifWaiting {
+		t.Errorf("notifWaiting should not be downgraded by notifDone, got %v", m2.unread[wsKey("r", "a")])
+	}
+}
+
+func TestNotifClearedOnAgentView(t *testing.T) {
+	m := sampleModel()
+	m.unread = map[string]notifLevel{
+		"r/a": notifDone,
+		"r/b": notifWaiting,
+	}
+	ws := &session.Workspace{Agents: []*session.Session{{}, {}}}
+	m.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
+	m.screen = screenEditor // start on editor, cycle to agent
+
+	// Cycling to the agent screen (keyCycle) clears unread for the current workspace.
+	result, _ := m.update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	m2 := result.(Model)
+
+	if m2.screen != screenAgent {
+		t.Fatalf("expected screenAgent after cycle, got %v", m2.screen)
+	}
+	if m2.unread["r/a"] != notifNone {
+		t.Errorf("r/a unread should clear when cycling to agent screen, got %v", m2.unread["r/a"])
+	}
+	if m2.unread["r/b"] != notifWaiting {
+		t.Errorf("r/b unread should be unaffected, got %v", m2.unread["r/b"])
+	}
+
+	// selectTab(screenAgent) also clears.
+	m3 := sampleModel()
+	m3.unread = map[string]notifLevel{"r/a": notifDone, "r/b": notifWaiting}
+	m3.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
+	m4 := m3.selectTab(screenAgent).(Model)
+	if m4.unread["r/a"] != notifNone {
+		t.Errorf("r/a unread should clear on selectTab(agent), got %v", m4.unread["r/a"])
+	}
+	if m4.unread["r/b"] != notifWaiting {
+		t.Errorf("r/b unread should be unaffected after selectTab, got %v", m4.unread["r/b"])
+	}
+
+	// Being on screenAgent during an unrelated message does NOT clear.
+	m5 := sampleModel()
+	m5.unread = map[string]notifLevel{"r/a": notifDone}
+	m5.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
+	m5.screen = screenAgent
+	result5, _ := m5.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m6 := result5.(Model)
+	if m6.unread["r/a"] != notifDone {
+		t.Errorf("unrelated message on agent screen should NOT clear unread, got %v", m6.unread["r/a"])
 	}
 }
 

@@ -72,21 +72,39 @@ func TestSelectionBarFillsWidth(t *testing.T) {
 	}
 }
 
-func TestBarAgentBadge(t *testing.T) {
+func TestBarNotifZone(t *testing.T) {
 	m := sampleModel()
 	m.current = &workspaceRef{
-		repo: "r", worktree: "w", path: "/r/w",
+		repo: "r", worktree: "w", key: "r/w", path: "/r/w",
 		ws: &session.Workspace{Agents: []*session.Session{{}, {}}},
 	}
 	m.screen = screenAgent
-	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: "/r/w"}}
 
+	// No unread: right side shows only the worktree label, no notif zone.
 	bar := m.renderBar()
-	if !strings.Contains(bar, "2") {
-		t.Errorf("bar should show the agent count 2:\n%s", bar)
+	if !strings.Contains(bar, "r / w") {
+		t.Errorf("bar should show worktree label:\n%s", bar)
 	}
-	if !strings.Contains(bar, "●") {
-		t.Errorf("bar should show a needs-input dot:\n%s", bar)
+	if strings.Contains(bar, "!") || strings.Contains(bar, "*") {
+		t.Errorf("bar should not show notif glyphs when nothing is unread:\n%s", bar)
+	}
+
+	// Waiting unread: "!" should appear in the bar, count in palette (not bar).
+	m.unread = map[string]notifLevel{"r/w": notifWaiting, "other/wt": notifDone}
+	bar = m.renderBar()
+	if !strings.Contains(bar, "!") {
+		t.Errorf("bar should show ! for waiting notif:\n%s", bar)
+	}
+	if !strings.Contains(bar, "*") {
+		t.Errorf("bar should show * for done notif:\n%s", bar)
+	}
+
+	// Palette header should show agent count when open.
+	m.paletteOpen = true
+	m.paletteCursor = 0
+	palette := m.renderPalette(m.height - barHeight)
+	if !strings.Contains(palette, "2") {
+		t.Errorf("palette header should show pool count 2:\n%s", palette)
 	}
 }
 

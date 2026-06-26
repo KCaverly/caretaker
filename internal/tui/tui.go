@@ -4,6 +4,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -78,6 +80,16 @@ const (
 	modeConfirmRemove
 )
 
+// notifLevel ranks an unread notification for a worktree.
+// Higher values take priority: waiting (needs action) beats done (informational).
+type notifLevel int
+
+const (
+	notifNone    notifLevel = iota // nothing pending
+	notifDone                     // busy → idle while unviewed
+	notifWaiting                  // busy → waiting (needs input/permission)
+)
+
 // activeItem is a worktree shown in the "active" section, with its owning repo.
 type activeItem struct {
 	repo repo.Repo
@@ -132,7 +144,10 @@ type Model struct {
 	rootInput     textinput.Model
 
 	// live agent statuses from `claude agents --json`, keyed by pid
-	agentStatus map[int]AgentStatus
+	agentStatus     map[int]AgentStatus
+	agentPrevStatus map[int]string        // pid → status from previous poll, for transition detection
+	unread          map[string]notifLevel // worktree key → highest unread notification level
+	agentUnread     map[int]notifLevel    // pid → highest unread notification level (for palette)
 
 	status        string
 	statusAt      time.Time // when a transient status was set (for auto-expiry)
@@ -194,7 +209,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig,
 		filter:  filter, nameInput: name, agentName: agentName, rootInput: rootInput,
-		focus: focusNew,
+		focus:           focusNew,
+		agentPrevStatus: map[int]string{},
+		unread:          map[string]notifLevel{},
+		agentUnread:     map[int]notifLevel{},
 	}
 }
 
@@ -302,6 +320,10 @@ func (m Model) activeSession() *session.Session {
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	return m.update(msg)
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -346,6 +368,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		if msg.err == nil {
+			bell := false
+			for pid, st := range msg.byPid {
+				prev := m.agentPrevStatus[pid]
+				if prev == "busy" && (st.Status == "idle" || st.Status == "waiting") {
+					if key, ok := m.pathToKey(st.Cwd); ok {
+						level := notifDone
+						if st.Status == "waiting" {
+							level = notifWaiting
+						}
+						if level > m.unread[key] {
+							m.unread[key] = level
+							bell = true
+						}
+						if level > m.agentUnread[pid] {
+							m.agentUnread[pid] = level
+						}
+					}
+				}
+			}
+			if bell {
+				fmt.Fprint(os.Stderr, "\a")
+			}
+			m.agentPrevStatus = make(map[int]string, len(msg.byPid))
+			for pid, st := range msg.byPid {
+				m.agentPrevStatus[pid] = st.Status
+			}
 			m.agentStatus = msg.byPid
 		}
 		m.maybeExpireStatus()
@@ -368,6 +416,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// clearWorkspaceUnread deletes the workspace-level unread entry and clears the
+// per-agent unread entries for every agent currently in the workspace. Both maps
+// share the same lifecycle so callers always use this instead of bare deletes.
+func (m Model) clearWorkspaceUnread() {
+	if m.current == nil {
+		return
+	}
+	delete(m.unread, m.current.key)
+	if m.current.ws != nil {
+		for _, a := range m.current.ws.Agents {
+			if pid := a.Pid(); pid != 0 {
+				delete(m.agentUnread, pid)
+			}
+		}
+	}
 }
 
 // activateGlobalConfig opens the home-directory workspace (synthetic key "~/config"),
@@ -406,6 +471,9 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 		m.screen = s
 	} else {
 		m.screen = screenEditor
+	}
+	if m.screen == screenAgent {
+		m.clearWorkspaceUnread()
 	}
 	m.status = ""
 	if m.state != nil {
@@ -536,6 +604,9 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case m.keyCycle:
 		m.screen = m.screen.next()
+		if m.screen == screenAgent && m.current != nil {
+			m.clearWorkspaceUnread()
+		}
 		return m, nil
 	case m.keyPicker:
 		if m.current != nil {
@@ -585,6 +656,7 @@ func (m Model) rotateAgent(delta int) tea.Model {
 	}
 	m.current.ws.ActiveAgent = ((m.current.ws.ActiveAgent+delta)%n + n) % n
 	m.screen = screenAgent
+	m.clearWorkspaceUnread()
 	m.saveAgents(m.current.key)
 	return m
 }
@@ -627,6 +699,7 @@ func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		ws.ActiveAgent = m.paletteCursor
 		m.screen = screenAgent
 		m.paletteOpen = false
+		m.clearWorkspaceUnread()
 		m.saveAgents(m.current.key)
 		return m, nil
 	}
@@ -636,6 +709,7 @@ func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			ws.ActiveAgent = idx
 			m.screen = screenAgent
 			m.paletteOpen = false
+			m.clearWorkspaceUnread()
 			m.saveAgents(m.current.key)
 		}
 	}
@@ -670,6 +744,7 @@ func (m Model) handleAgentName(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.paletteCursor = m.current.ws.ActiveAgent
 		m.screen = screenAgent
 		m.paletteOpen = false
+		m.clearWorkspaceUnread()
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -774,6 +849,9 @@ func (m Model) deckClick(x, y int) (tea.Model, tea.Cmd, bool) {
 func (m Model) selectTab(s screen) tea.Model {
 	if s == screenPicker || m.current != nil {
 		m.screen = s
+		if s == screenAgent && m.current != nil {
+			m.clearWorkspaceUnread()
+		}
 	}
 	return m
 }
@@ -1138,6 +1216,23 @@ func (m *Model) sortByRecency(repoName string, views []WorktreeView) {
 		}
 		return views[i].WT.Name < views[j].WT.Name
 	})
+}
+
+// pathToKey maps a session's working directory to its workspace key. Checks the
+// currently active workspace first (covering synthetic workspaces like ~/config
+// that don't appear in m.active), then walks the active list. Paths are cleaned
+// before comparison to absorb trailing slashes and minor OS-level variation.
+func (m Model) pathToKey(path string) (string, bool) {
+	path = filepath.Clean(path)
+	if m.current != nil && filepath.Clean(m.current.path) == path {
+		return m.current.key, true
+	}
+	for _, it := range m.active {
+		if filepath.Clean(it.view.WT.Path) == path {
+			return wsKey(it.repo.Name, it.view.WT.Name), true
+		}
+	}
+	return "", false
 }
 
 func (m Model) selectedActive() (activeItem, bool) {
