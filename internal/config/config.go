@@ -66,7 +66,7 @@ func Default() Config {
 		Keys: Keys{
 			Cycle: "ctrl+o", Picker: "ctrl+g",
 			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "f2", Notif: "ctrl+n",
+			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n",
 		},
 	}
 }
