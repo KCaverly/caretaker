@@ -60,6 +60,8 @@ func (m Model) View() tea.View {
 		body = m.renderSetup(h - barHeight)
 	case m.helpOpen:
 		body = m.renderHelp(h - barHeight)
+	case m.notifOpen:
+		body = m.renderNotifOverlay(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.paletteOpen:
@@ -214,6 +216,74 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 }
 
 
+// notifZoneAt reports whether bar coordinates (x, y) land on the notification
+// zone. It mirrors renderBar's right-side layout to locate the zone's x bounds.
+func (m Model) notifZoneAt(x, y int) bool {
+	if y != 0 {
+		return false
+	}
+	notif := m.renderNotifZone()
+	if notif == "" {
+		return false
+	}
+	right := notif + "   "
+	if m.current != nil {
+		right += lipgloss.NewStyle().Foreground(cDim).Render(m.current.repo + " / " + m.current.worktree)
+	}
+	right += "  "
+	start := m.width - lipgloss.Width(right)
+	end := start + lipgloss.Width(notif)
+	return x >= start && x < end
+}
+
+// renderNotifOverlay draws the notification overlay: a bordered, navigable list
+// of unread agents grouped under non-navigable worktree header rows.
+func (m Model) renderNotifOverlay(h int) string {
+	agentItems, displayRows := m.buildNotifItems()
+	innerW := clamp(m.width-8, 28, 52)
+
+	rows := []string{header("notifications", -1), ""}
+
+	if len(agentItems) == 0 {
+		rows = append(rows, dimStyle.Render("  no pending agents"))
+	} else {
+		for _, item := range displayRows {
+			if !item.isAgent {
+				rows = append(rows, dimStyle.Render("  "+item.key))
+				continue
+			}
+			selected := m.notifCursor < len(agentItems) && agentItems[m.notifCursor].pid == item.pid
+			iconSt := lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+			icon := "*"
+			if item.level == notifWaiting {
+				iconSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+				icon = "!"
+			}
+			detail := "done"
+			if item.waitFor != "" {
+				detail = item.waitFor
+			}
+			left := "      " + iconSt.Render(icon) + " " + nameStyle.Render(item.label)
+			right := dimStyle.Render(detail)
+			gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+			content := left + strings.Repeat(" ", gap) + right
+			if selected {
+				rows = append(rows, selBar(content, innerW))
+			} else {
+				rows = append(rows, content)
+			}
+		}
+	}
+
+	rows = append(rows, "", "  "+
+		keyhint("↑↓", "move")+"  "+
+		keyhint("enter", "jump")+"  "+
+		keyhint("esc", "close"))
+
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
 // deckLayout captures the deck's vertical geometry, shared by renderDeck (to
 // draw) and deckClick (to hit-test) so the two can never drift apart. bodyH is
 // the row count beneath the bar (m.height - barHeight).
@@ -277,7 +347,7 @@ func (m Model) renderNew(innerW, rows int) []string {
 	for i := start; i < end; i++ {
 		name := m.repoMatches[i].Name
 		if i == m.newCursor && m.focus == focusNew {
-			lines = append(lines, selBar(" ▸ "+name, innerW))
+			lines = append(lines, selBar("   "+name, innerW))
 		} else {
 			lines = append(lines, repoStyle.Render("   "+name))
 		}
@@ -382,7 +452,7 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	}
 
 	if highlight {
-		return selBar(fmt.Sprintf("  %s ▸ %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, it.view.WT.Name), innerW)
+		return selBar(fmt.Sprintf("  %s   %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, it.view.WT.Name), innerW)
 	}
 
 	rankCol := " "
@@ -423,6 +493,7 @@ func (m Model) renderHelp(h int) string {
 		row(m.keyGlobalConfig, "open home workspace (~)"),
 		row(m.keyPalette, "agent switcher"),
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
+		row(m.keyNotif, "notification overlay"),
 		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
@@ -487,7 +558,7 @@ func (m Model) renderPalette(h int) string {
 	innerW := clamp(m.width-8, 24, 64)
 
 	rows := []string{
-		header("claude", len(ws.Agents)) + "  " + dimStyle.Render(m.current.repo+" / "+m.current.worktree),
+		header("claude", -1),
 		"",
 	}
 	for i, a := range ws.Agents {

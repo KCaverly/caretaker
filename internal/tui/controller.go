@@ -102,6 +102,9 @@ func (c *Controller) HelpKey() string { return c.cfg.Keys.Help }
 // GlobalConfigKey returns the key that opens the home-directory workspace.
 func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
 
+// NotifKey returns the key that opens the notification overlay.
+func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
+
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 

@@ -46,6 +46,8 @@ type Keys struct {
 	Help string `toml:"help"`
 	// GlobalConfig opens the home-directory workspace for editing global config.
 	GlobalConfig string `toml:"global_config"`
+	// Notif opens the notification overlay.
+	Notif string `toml:"notif"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -64,7 +66,7 @@ func Default() Config {
 		Keys: Keys{
 			Cycle: "ctrl+o", Picker: "ctrl+g",
 			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "f2",
+			Help: "f1", GlobalConfig: "f2", Notif: "ctrl+n",
 		},
 	}
 }

@@ -32,8 +32,9 @@ const (
 	defaultKeyPalette   = "ctrl+a" // open the agent switcher
 	defaultKeyNextAgent = "f4"     // focus the next agent in the pool
 	defaultKeyPrevAgent = "f3"     // focus the previous agent in the pool
-	defaultKeyHelp         = "f1" // toggle the help overlay
+	defaultKeyHelp         = "f1"     // toggle the help overlay
 	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
+	defaultKeyNotif        = "ctrl+n" // open notification overlay
 )
 
 // screen is the active view: the picker, one of the session views, or setup.
@@ -90,6 +91,21 @@ const (
 	notifWaiting                  // busy → waiting (needs input/permission)
 )
 
+// notifItem is one row in the notification overlay. isAgent == false marks a
+// non-navigable worktree header; isAgent == true is a selectable agent row.
+type notifItem struct {
+	key      string     // workspace key ("repo/branch")
+	level    notifLevel
+	isAgent  bool
+	pid      int    // agent PID for cursor matching in the renderer
+	agentIdx int    // index in ws.Agents for direct activation
+	label    string // display name
+	waitFor  string // AgentStatus.WaitingFor when status is waiting
+	repo     string // for activate()
+	worktree string
+	path     string
+}
+
 // activeItem is a worktree shown in the "active" section, with its owning repo.
 type activeItem struct {
 	repo repo.Repo
@@ -105,7 +121,7 @@ type Model struct {
 
 	keyCycle, keyPicker                    string
 	keyPalette, keyNextAgent, keyPrevAgent string
-	keyHelp, keyGlobalConfig               string
+	keyHelp, keyGlobalConfig, keyNotif     string
 
 	screen   screen
 	current  *workspaceRef
@@ -148,6 +164,10 @@ type Model struct {
 	agentPrevStatus map[int]string        // pid → status from previous poll, for transition detection
 	unread          map[string]notifLevel // worktree key → highest unread notification level
 	agentUnread     map[int]notifLevel    // pid → highest unread notification level (for palette)
+
+	// notification overlay
+	notifOpen   bool
+	notifCursor int
 
 	status        string
 	statusAt      time.Time // when a transient status was set (for auto-expiry)
@@ -202,12 +222,16 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if globalConfig == "" {
 		globalConfig = defaultKeyGlobalConfig
 	}
+	notif := ctrl.NotifKey()
+	if notif == "" {
+		notif = defaultKeyNotif
+	}
 
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
-		keyHelp: help, keyGlobalConfig: globalConfig,
+		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
 		filter:  filter, nameInput: name, agentName: agentName, rootInput: rootInput,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
@@ -441,6 +465,146 @@ func (m Model) clearWorkspaceUnread() {
 	}
 }
 
+// buildNotifItems constructs the notification overlay's item lists from the
+// current unread maps. agentItems contains only navigable agent rows (used for
+// cursor tracking). displayRows interleaves non-navigable worktree header rows
+// for visual grouping. Worktrees with no live workspace or no unread agents are
+// omitted entirely.
+func (m Model) buildNotifItems() (agentItems, displayRows []notifItem) {
+	type wtEntry struct {
+		key   string
+		level notifLevel
+	}
+	var wts []wtEntry
+	for key, lvl := range m.unread {
+		wts = append(wts, wtEntry{key, lvl})
+	}
+	sort.Slice(wts, func(i, j int) bool {
+		if wts[i].level != wts[j].level {
+			return wts[i].level > wts[j].level // waiting before done
+		}
+		return wts[i].key < wts[j].key
+	})
+
+	activeByKey := make(map[string]activeItem, len(m.active))
+	for _, it := range m.active {
+		activeByKey[wsKey(it.repo.Name, it.view.WT.Name)] = it
+	}
+
+	for _, wt := range wts {
+		it, ok := activeByKey[wt.key]
+		if !ok {
+			continue
+		}
+		ws, ok := m.mgr.Workspace(wt.key)
+		if !ok {
+			continue
+		}
+		var agentRows []notifItem
+		for i, a := range ws.Agents {
+			pid := a.Pid()
+			if pid == 0 {
+				continue
+			}
+			lvl := m.agentUnread[pid]
+			if lvl == notifNone {
+				continue
+			}
+			st := m.agentStatus[pid]
+			agentRows = append(agentRows, notifItem{
+				key:      wt.key,
+				level:    lvl,
+				isAgent:  true,
+				pid:      pid,
+				agentIdx: i,
+				label:    agentTitle(a.Title),
+				waitFor:  st.WaitingFor,
+				repo:     it.repo.Name,
+				worktree: it.view.WT.Name,
+				path:     it.view.WT.Path,
+			})
+		}
+		if len(agentRows) == 0 {
+			continue
+		}
+		sort.Slice(agentRows, func(i, j int) bool {
+			return agentRows[i].level > agentRows[j].level
+		})
+		displayRows = append(displayRows, notifItem{
+			key:      wt.key,
+			level:    wt.level,
+			isAgent:  false,
+			repo:     it.repo.Name,
+			worktree: it.view.WT.Name,
+			path:     it.view.WT.Path,
+		})
+		for _, row := range agentRows {
+			displayRows = append(displayRows, row)
+			agentItems = append(agentItems, row)
+		}
+	}
+	return agentItems, displayRows
+}
+
+// openNotif toggles the notification overlay open. It's a no-op (with a flash)
+// when there are no navigable agent rows. Opening closes the palette.
+func (m Model) openNotif() (tea.Model, tea.Cmd) {
+	if m.notifOpen {
+		m.notifOpen = false
+		return m, nil
+	}
+	agentItems, _ := m.buildNotifItems()
+	if len(agentItems) == 0 {
+		m.flash("no pending agents")
+		return m, nil
+	}
+	m.notifOpen = true
+	m.notifCursor = 0
+	m.paletteOpen = false
+	return m, nil
+}
+
+// handleNotif routes key events while the notification overlay is open.
+func (m Model) handleNotif(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	agentItems, _ := m.buildNotifItems()
+	switch msg.String() {
+	case "esc", "q":
+		m.notifOpen = false
+		return m, nil
+	case "up", "k", "ctrl+p":
+		if m.notifCursor > 0 {
+			m.notifCursor--
+		}
+		return m, nil
+	case "down", "j", "ctrl+n":
+		if m.notifCursor < len(agentItems)-1 {
+			m.notifCursor++
+		}
+		return m, nil
+	case "enter":
+		if m.notifCursor < len(agentItems) {
+			return m.activateNotifItem(agentItems[m.notifCursor])
+		}
+	}
+	return m, nil
+}
+
+// activateNotifItem navigates directly to the specified agent pane, closing
+// the notification overlay and clearing the workspace's unread state.
+func (m Model) activateNotifItem(item notifItem) (tea.Model, tea.Cmd) {
+	mm, cmd := m.activate(item.repo, item.worktree, item.path)
+	model := mm.(Model)
+	model.notifOpen = false
+	if model.current != nil && model.current.key == item.key {
+		model.screen = screenAgent
+		if model.current.ws != nil {
+			model.current.ws.ActiveAgent = item.agentIdx
+		}
+		model.clearWorkspaceUnread()
+	}
+	return model, cmd
+}
+
 // activateGlobalConfig opens the home-directory workspace (synthetic key "~/config"),
 // starting it fresh on first use and resuming its agent pool on subsequent presses.
 func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
@@ -565,6 +729,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.helpOpen = true
 		return m, nil
 	}
+	if m.notifOpen {
+		return m.handleNotif(msg)
+	}
+	if msg.String() == m.keyNotif {
+		return m.openNotif()
+	}
 	if msg.String() == m.keyGlobalConfig {
 		return m.activateGlobalConfig()
 	}
@@ -684,7 +854,7 @@ func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.paletteCursor--
 		}
 		return m, nil
-	case "down", "j", "ctrl+n":
+	case "down", "j":
 		if m.paletteCursor < newRow {
 			m.paletteCursor++
 		}
@@ -765,6 +935,9 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	if mo.Button == tea.MouseLeft {
 		if s, ok := m.tabAt(mo.X, mo.Y); ok {
 			return m.selectTab(s), nil
+		}
+		if m.notifZoneAt(mo.X, mo.Y) {
+			return m.openNotif()
 		}
 		if m.screen == screenPicker && !m.helpOpen {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
@@ -937,7 +1110,7 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.newCursor--
 		}
 		return m, nil
-	case "down", "ctrl+n":
+	case "down":
 		if m.newCursor < len(m.repoMatches)-1 {
 			m.newCursor++
 		}
