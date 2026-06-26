@@ -528,6 +528,14 @@ func TestToUVKey(t *testing.T) {
 	if uvk.Code != 'a' || uvk.Text != "a" {
 		t.Fatalf("toUVKey mapped wrong: %+v", uvk)
 	}
+
+	// Kitty-protocol terminals report shift+a as Code='a', ShiftedCode='A',
+	// Mod=ModShift. The vt emulator's SendKey only writes Code when Mod==0, so
+	// we must collapse the pair into Code='A', Mod=0 before forwarding.
+	uvk = toUVKey(tea.KeyPressMsg{Code: 'a', ShiftedCode: 'A', Mod: tea.ModShift, Text: "A"})
+	if uvk.Code != 'A' || uvk.Mod != 0 || uvk.Text != "A" {
+		t.Fatalf("toUVKey should collapse shift+letter to uppercase: %+v", uvk)
+	}
 }
 
 // TestActivateFlow drives activate → cycle → return → re-activate with cheap

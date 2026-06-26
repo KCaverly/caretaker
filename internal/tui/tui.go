@@ -959,10 +959,20 @@ func (m *Model) maybeExpireStatus() {
 // toUVKey converts a Bubble Tea key event into the ultraviolet key event the
 // emulator expects (the field layouts are identical).
 func toUVKey(k tea.KeyPressMsg) uv.KeyPressEvent {
+	code := k.Code
+	mod := uv.KeyMod(k.Mod)
+	// The vt SendKey default branch only encodes key.Code when Mod==0, so it
+	// silently drops shift+letter pairs from kitty-protocol terminals. Collapse
+	// them: if shift is the only modifier and there is a known shifted rune,
+	// use it directly and clear the shift bit.
+	if mod == uv.ModShift && k.ShiftedCode != 0 {
+		code = k.ShiftedCode
+		mod = 0
+	}
 	return uv.KeyPressEvent{
 		Text:        k.Text,
-		Mod:         uv.KeyMod(k.Mod),
-		Code:        k.Code,
+		Mod:         mod,
+		Code:        code,
 		ShiftedCode: k.ShiftedCode,
 		BaseCode:    k.BaseCode,
 	}
