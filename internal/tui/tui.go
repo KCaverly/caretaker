@@ -30,7 +30,8 @@ const (
 	defaultKeyPalette   = "ctrl+a" // open the agent switcher
 	defaultKeyNextAgent = "f4"     // focus the next agent in the pool
 	defaultKeyPrevAgent = "f3"     // focus the previous agent in the pool
-	defaultKeyHelp      = "f1"     // toggle the help overlay
+	defaultKeyHelp         = "f1" // toggle the help overlay
+	defaultKeyGlobalConfig = "f2" // open home-directory workspace
 )
 
 // screen is the active view: the picker, one of the session views, or setup.
@@ -92,7 +93,7 @@ type Model struct {
 
 	keyCycle, keyPicker                    string
 	keyPalette, keyNextAgent, keyPrevAgent string
-	keyHelp                                string
+	keyHelp, keyGlobalConfig               string
 
 	screen   screen
 	current  *workspaceRef
@@ -179,13 +180,17 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if help == "" {
 		help = defaultKeyHelp
 	}
+	globalConfig := ctrl.GlobalConfigKey()
+	if globalConfig == "" {
+		globalConfig = defaultKeyGlobalConfig
+	}
 
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
-		keyHelp: help,
-		filter: filter, nameInput: name, agentName: agentName, rootInput: rootInput,
+		keyHelp: help, keyGlobalConfig: globalConfig,
+		filter:  filter, nameInput: name, agentName: agentName, rootInput: rootInput,
 		focus: focusNew,
 	}
 }
@@ -362,6 +367,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// activateGlobalConfig opens the home-directory workspace (synthetic key "~/config"),
+// starting it fresh on first use and resuming its agent pool on subsequent presses.
+func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
+	home, err := m.ctrl.GlobalConfigDir()
+	if err != nil {
+		m.status = "home dir error: " + err.Error()
+		return m, nil
+	}
+	return m.activate("~", "config", home)
+}
+
 // activate ensures the workspace's sessions are running and switches to the
 // editor view. A brand-new worktree starts one fresh claude session; reopening a
 // worktree resumes the agent pool persisted from its previous run.
@@ -461,6 +477,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == m.keyHelp {
 		m.helpOpen = true
 		return m, nil
+	}
+	if msg.String() == m.keyGlobalConfig {
+		return m.activateGlobalConfig()
 	}
 	if m.screen != screenPicker {
 		return m.handleSessionKey(msg)

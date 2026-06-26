@@ -459,6 +459,7 @@ func (m Model) renderHelp(h int) string {
 		repoHdrStyle.Render("  Session"),
 		row(m.keyCycle, "cycle view (nvim → claude → term)"),
 		row(m.keyPicker, "back to the deck"),
+		row(m.keyGlobalConfig, "open home workspace (~)"),
 		row(m.keyPalette, "agent switcher"),
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
 		"",
