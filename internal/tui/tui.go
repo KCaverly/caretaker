@@ -31,7 +31,7 @@ const (
 	defaultKeyNextAgent = "f4"     // focus the next agent in the pool
 	defaultKeyPrevAgent = "f3"     // focus the previous agent in the pool
 	defaultKeyHelp         = "f1" // toggle the help overlay
-	defaultKeyGlobalConfig = "f2" // open home-directory workspace
+	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
 )
 
 // screen is the active view: the picker, one of the session views, or setup.
@@ -120,6 +120,9 @@ type Model struct {
 
 	// first-run setup
 	configPath string
+
+	// last screen visited per worktree key, so switching back lands where you left
+	lastScreens map[string]screen
 
 	// agent switcher overlay
 	paletteOpen   bool
@@ -379,8 +382,8 @@ func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
 }
 
 // activate ensures the workspace's sessions are running and switches to the
-// editor view. A brand-new worktree starts one fresh claude session; reopening a
-// worktree resumes the agent pool persisted from its previous run.
+// last screen used in that worktree (editor on first open). A brand-new worktree
+// starts one fresh claude session; reopening resumes the agent pool.
 func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	key := repoName + "/" + wtName
 	w, h := m.sessionSize()
@@ -392,8 +395,18 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	if saved := m.savedActiveAgent(key); saved < len(ws.Agents) {
 		ws.ActiveAgent = saved
 	}
+	if m.current != nil && m.screen != screenPicker {
+		if m.lastScreens == nil {
+			m.lastScreens = map[string]screen{}
+		}
+		m.lastScreens[m.current.key] = m.screen
+	}
 	m.current = &workspaceRef{repo: repoName, worktree: wtName, key: key, path: dir, ws: ws}
-	m.screen = screenEditor
+	if s, ok := m.lastScreens[key]; ok {
+		m.screen = s
+	} else {
+		m.screen = screenEditor
+	}
 	m.status = ""
 	if m.state != nil {
 		m.state.Touch(key)
@@ -525,7 +538,16 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.screen = m.screen.next()
 		return m, nil
 	case m.keyPicker:
+		if m.current != nil {
+			if m.lastScreens == nil {
+				m.lastScreens = map[string]screen{}
+			}
+			m.lastScreens[m.current.key] = m.screen
+		}
 		m.screen = screenPicker
+		if len(m.active) > 0 {
+			m.focus = focusActive
+		}
 		return m, nil
 	case m.keyPalette:
 		return m.openPalette(), nil
