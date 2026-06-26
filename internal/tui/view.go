@@ -526,9 +526,11 @@ func (m Model) paletteRow(i int, a *session.Session, innerW int) string {
 		notifCol = lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")
 	}
 
-	label := paletteStatusLabel(st)
-	content := fmt.Sprintf("  %s %s %s  %s",
-		dimStyle.Render(strconv.Itoa(i+1)), notifCol, nameStyle.Render(name), dimStyle.Render(label))
+	left := fmt.Sprintf("  %s %s %s",
+		dimStyle.Render(strconv.Itoa(i+1)), notifCol, nameStyle.Render(name))
+	right := dimStyle.Render(paletteStatusLabel(st))
+	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+	content := left + strings.Repeat(" ", gap) + right
 
 	if i == m.paletteCursor && !m.naming {
 		return selBar(content, innerW)
