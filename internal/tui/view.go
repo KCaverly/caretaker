@@ -60,12 +60,10 @@ func (m Model) View() tea.View {
 		body = m.renderSetup(h - barHeight)
 	case m.helpOpen:
 		body = m.renderHelp(h - barHeight)
-	case m.notifOpen:
-		body = m.renderNotifOverlay(h - barHeight)
+	case m.boardOpen:
+		body = m.renderBoard(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
-	case m.paletteOpen:
-		body = m.renderPalette(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
 		body, cursor = m.renderTermPanes(w, h-barHeight)
 	default:
@@ -130,19 +128,12 @@ func (m Model) renderBar() string {
 	return bar + "\n" + sep
 }
 
-// renderNotifZone builds the right-side notification summary: "! N" (red) for
-// worktrees where an agent is waiting on input, "* N" (green) for unread
-// completions. Returns "" when nothing is pending.
+// renderNotifZone builds the right-side attention summary: "! N" (red) for
+// worktrees where an agent is waiting on input, "* N" (green) for worktrees
+// with unread completions, "@ N" (blue) for unread background-agent messages.
+// Returns "" when nothing is pending. Clicking it opens the agent board.
 func (m Model) renderNotifZone() string {
-	var waiting, done int
-	for _, lvl := range m.unread {
-		switch lvl {
-		case notifWaiting:
-			waiting++
-		case notifDone:
-			done++
-		}
-	}
+	waiting, done, msgs := m.attnSummary()
 	var parts []string
 	if waiting > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")+
@@ -151,6 +142,10 @@ func (m Model) renderNotifZone() string {
 	if done > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")+
 			" "+countStyle.Render(strconv.Itoa(done)))
+	}
+	if msgs > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("@")+
+			" "+countStyle.Render(strconv.Itoa(msgs)))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -217,7 +212,6 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 	return 0, false
 }
 
-
 // notifZoneAt reports whether bar coordinates (x, y) land on the notification
 // zone. It mirrors renderBar's right-side layout to locate the zone's x bounds.
 func (m Model) notifZoneAt(x, y int) bool {
@@ -238,52 +232,149 @@ func (m Model) notifZoneAt(x, y int) bool {
 	return x >= start && x < end
 }
 
-// renderNotifOverlay draws the notification overlay: a bordered, navigable list
-// of unread agents grouped under non-navigable worktree header rows.
-func (m Model) renderNotifOverlay(h int) string {
-	agentItems, displayRows := m.buildNotifItems()
-	innerW := clamp(m.width-8, 28, 52)
+// renderBoard draws the agent board overlay: every open workspace's agents
+// grouped under worktree header rows, attention sorted to the top, plus the
+// trailing "+ new agent" row. Delegates to renderBoardForm in form state.
+func (m Model) renderBoard(h int) string {
+	innerW := clamp(m.width-8, 32, 64)
+	if m.formOpen {
+		return m.renderBoardForm(h, innerW)
+	}
 
-	rows := []string{header("notifications", -1), ""}
-
-	if len(agentItems) == 0 {
-		rows = append(rows, dimStyle.Render("  no pending agents"))
-	} else {
-		for _, item := range displayRows {
-			if !item.isAgent {
-				rows = append(rows, dimStyle.Render("  "+item.key))
-				continue
-			}
-			selected := m.notifCursor < len(agentItems) && agentItems[m.notifCursor].pid == item.pid
-			iconSt := lipgloss.NewStyle().Foreground(cGreen).Bold(true)
-			icon := "*"
-			if item.level == notifWaiting {
-				iconSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
-				icon = "!"
-			}
-			detail := "done"
-			if item.waitFor != "" {
-				detail = item.waitFor
-			}
-			left := "      " + iconSt.Render(icon) + " " + nameStyle.Render(item.label)
-			right := dimStyle.Render(detail)
-			gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
-			content := left + strings.Repeat(" ", gap) + right
-			if selected {
-				rows = append(rows, selBar(content, innerW))
-			} else {
-				rows = append(rows, content)
-			}
+	rows, nav := m.buildBoard()
+	selRow := -1
+	if m.boardCursor >= 0 && m.boardCursor < len(nav) {
+		selRow = nav[m.boardCursor]
+	}
+	agentCount := 0
+	for _, r := range rows {
+		if r.isAgent {
+			agentCount++
 		}
 	}
 
-	rows = append(rows, "", "  "+
-		keyhint("↑↓", "move")+"  "+
-		keyhint("enter", "jump")+"  "+
-		keyhint("esc", "close"))
+	lines := []string{header("agents", agentCount), ""}
+	for i, r := range rows {
+		switch {
+		case r.isNew:
+			if agentCount > 0 {
+				lines = append(lines, "")
+			}
+			if i == selRow {
+				lines = append(lines, selBar("  + new agent…", innerW))
+			} else {
+				lines = append(lines, dimStyle.Render("  + new agent…"))
+			}
+		case r.isAgent:
+			content := m.boardAgentLine(r, innerW)
+			if i == selRow {
+				lines = append(lines, selBar(content, innerW))
+			} else {
+				lines = append(lines, content)
+			}
+		default: // worktree group header
+			if i > 0 {
+				lines = append(lines, "")
+			}
+			left := dimStyle.Render("  " + r.key)
+			if m.current != nil && r.key == m.current.key {
+				right := helpKeyStyle.Render("current")
+				gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+				left += strings.Repeat(" ", gap) + right
+			}
+			lines = append(lines, left)
+		}
+	}
 
+	lines = append(lines, "", "  "+strings.Join([]string{
+		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
+		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
+	}, helpStyle.Render("  ·  ")))
+
+	boxStr := box(lines, innerW, len(lines), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// boardAgentLine renders one agent row: quick-jump number, attention glyph,
+// label, and the right-aligned (truncated) status/preview column.
+func (m Model) boardAgentLine(r boardRow, innerW int) string {
+	numCol := " "
+	if r.num > 0 {
+		numCol = strconv.Itoa(r.num)
+	}
+	glyph, glyphSt := " ", dimStyle
+	switch r.attn {
+	case attnWaiting:
+		glyph, glyphSt = "!", lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	case attnMessage:
+		glyph, glyphSt = "@", lipgloss.NewStyle().Foreground(cAccent).Bold(true)
+	case attnDone:
+		glyph, glyphSt = "*", lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+	}
+	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + nameStyle.Render(r.label)
+	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
+	right := dimStyle.Render(status)
+	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// renderBoardForm draws the new-agent form: label and prompt inputs plus the
+// where/mode toggles, with the focused field's name highlighted.
+func (m Model) renderBoardForm(h, innerW int) string {
+	fieldName := func(f int, name string) string {
+		st := dimStyle
+		if m.formFocus == f {
+			st = helpKeyStyle
+		}
+		return st.Render(padLine(name, 8))
+	}
+	toggle := func(options [2]string, sel int) string {
+		var parts [2]string
+		for i, o := range options {
+			if i == sel {
+				parts[i] = lipgloss.NewStyle().Bold(true).Foreground(cFg).Render("[" + o + "]")
+			} else {
+				parts[i] = dimStyle.Render(" " + o + " ")
+			}
+		}
+		return parts[0] + " " + parts[1]
+	}
+	bgIdx := 0
+	if m.formBackground {
+		bgIdx = 1
+	}
+	rows := []string{
+		header("new agent", -1),
+		"",
+		"  " + fieldName(formFieldLabel, "label") + m.agentName.View(),
+		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
+		"",
+		"  " + fieldName(formFieldWhere, "where") + toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
+		"  " + fieldName(formFieldMode, "mode") + toggle([2]string{"foreground", "background"}, bgIdx),
+		"",
+		"  " + strings.Join([]string{
+			keyhint("enter", "launch"), keyhint("tab", "field"),
+			keyhint("space", "toggle"), keyhint("esc", "back"),
+		}, helpStyle.Render("  ·  ")),
+	}
 	boxStr := box(rows, innerW, len(rows), true)
 	return centerBlock(boxStr, m.width, h)
+}
+
+// truncateTo shortens s to at most w display columns, appending "…" when it
+// had to cut.
+func truncateTo(s string, w int) string {
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w <= 1 {
+		return ""
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > w {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
 }
 
 // deckLayout captures the deck's vertical geometry, shared by renderDeck (to
@@ -427,15 +518,18 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 		liveSt = liveStyle
 	}
 
-	// Notification indicator: matches the right-bar glyphs so the user can
+	// Attention indicator: matches the right-bar glyphs so the user can
 	// scan the list for the same symbol they saw in the bar.
 	notifChar := " "
 	notifSt := dimStyle
-	switch m.unread[key] {
-	case notifWaiting:
+	switch m.worktreeAttn(key) {
+	case attnWaiting:
 		notifChar = "!"
 		notifSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
-	case notifDone:
+	case attnMessage:
+		notifChar = "@"
+		notifSt = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
+	case attnDone:
 		notifChar = "*"
 		notifSt = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 	}
@@ -493,9 +587,10 @@ func (m Model) renderHelp(h int) string {
 		row(m.keyCycle, "cycle view (nvim → claude → term)"),
 		row(m.keyPicker, "back to the deck"),
 		row(m.keyGlobalConfig, "open home workspace (~)"),
-		row(m.keyPalette, "agent switcher"),
+		row(m.keyPrompt, "quick background agent (home)"),
+		row(m.keyPalette, "agent board"),
+		row(m.keyNotif, "agent board (alias)"),
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
-		row(m.keyNotif, "notification overlay"),
 		"",
 		repoHdrStyle.Render("  Terminal panes"),
 		row(m.keyTermSplitV, "vertical split"),
@@ -525,6 +620,7 @@ func statusLegend() string {
 		dimStyle.Render("○") + helpStyle.Render(" stopped"),
 		lipgloss.NewStyle().Foreground(cRed).Render("!") + helpStyle.Render(" waiting"),
 		lipgloss.NewStyle().Foreground(cGreen).Render("*") + helpStyle.Render(" done"),
+		lipgloss.NewStyle().Foreground(cAccent).Render("@") + helpStyle.Render(" message"),
 	}, helpStyle.Render("   "))
 }
 
@@ -559,88 +655,6 @@ func (m Model) renderSetup(h int) string {
 
 	boxStr := box(rows, innerW, len(rows), true)
 	return centerBlock(boxStr, m.width, h)
-}
-
-// renderPalette draws the agent switcher overlay, centered in the body area.
-func (m Model) renderPalette(h int) string {
-	ws := m.current.ws
-	innerW := clamp(m.width-8, 24, 64)
-
-	rows := []string{
-		header("claude", -1),
-		"",
-	}
-	for i, a := range ws.Agents {
-		rows = append(rows, m.paletteRow(i, a, innerW))
-	}
-	// Trailing "+ new agent" row.
-	if m.paletteCursor == len(ws.Agents) && !m.naming {
-		rows = append(rows, selBar("  + new agent", innerW))
-	} else {
-		rows = append(rows, dimStyle.Render("  + new agent"))
-	}
-	if m.naming {
-		rows = append(rows, "", "  "+m.agentName.View())
-	}
-	rows = append(rows, "", "  "+m.paletteHints())
-
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
-}
-
-// paletteRow renders one agent line. Content is identical whether or not the row
-// is selected — selection is indicated purely by the background highlight applied
-// via selBar. Layout: "  N [!|*| ] name  (status)"
-func (m Model) paletteRow(i int, a *session.Session, innerW int) string {
-	name := a.Title
-	if name == "" {
-		name = "claude"
-	}
-	st := m.agentStatus[a.Pid()]
-
-	// Notification column: ! (live-waiting), * (unread done), space (nothing).
-	notifCol := " "
-	if st.Status == "waiting" {
-		notifCol = lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")
-	} else if pid := a.Pid(); pid != 0 && m.agentUnread[pid] == notifDone {
-		notifCol = lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")
-	}
-
-	left := fmt.Sprintf("  %s %s %s",
-		dimStyle.Render(strconv.Itoa(i+1)), notifCol, nameStyle.Render(name))
-	right := dimStyle.Render(paletteStatusLabel(st))
-	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
-	content := left + strings.Repeat(" ", gap) + right
-
-	if i == m.paletteCursor && !m.naming {
-		return selBar(content, innerW)
-	}
-	return content
-}
-
-// paletteStatusLabel returns the status in parentheses for palette rows.
-func paletteStatusLabel(st AgentStatus) string {
-	switch st.Status {
-	case "busy":
-		return "(working)"
-	case "waiting":
-		l := "waiting"
-		if st.WaitingFor != "" {
-			l += ": " + st.WaitingFor
-		}
-		return "(" + l + ")"
-	case "idle":
-		return "(idle)"
-	default:
-		return ""
-	}
-}
-
-func (m Model) paletteHints() string {
-	return strings.Join([]string{
-		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
-		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
-	}, helpStyle.Render("  ·  "))
 }
 
 // centerBlock centers a rendered block within w×h by padding above and to the
@@ -746,7 +760,7 @@ func (m Model) renderTermPanes(w, h int) (string, *tea.Cursor) {
 // body, inserting styled dividers between panes.
 func (m Model) renderPaneNode(node *session.PaneNode, x, y, w, h int, ws *session.Workspace) (string, *tea.Cursor) {
 	if node == nil || w < 1 || h < 1 {
-		return strings.Repeat(" ", w)+strings.Repeat("\n"+strings.Repeat(" ", w), h-1), nil
+		return strings.Repeat(" ", w) + strings.Repeat("\n"+strings.Repeat(" ", w), h-1), nil
 	}
 	if node.Dir == session.SplitNone {
 		if node.Idx >= len(ws.Terms) {

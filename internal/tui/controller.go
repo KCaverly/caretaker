@@ -105,6 +105,9 @@ func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
 // NotifKey returns the key that opens the notification overlay.
 func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
 
+// PromptKey returns the key that opens the quick-prompt overlay.
+func (c *Controller) PromptKey() string { return c.cfg.Keys.Prompt }
+
 // TermPaneKeys returns the reserved keys for terminal pane management. These
 // are only intercepted when the terminal screen is active.
 func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {
@@ -115,27 +118,70 @@ func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) 
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 
-// EnsureHomeDirTrusted writes hasTrustDialogAccepted to Claude's internal
-// project settings for the home directory so that interactive sessions started
-// there (e.g. background agents) don't pause to show the workspace trust dialog.
-// It is idempotent and safe to call before every spawn.
+// EnsureHomeDirTrusted marks the home directory as trusted in Claude's global
+// config (~/.claude.json, under projects[home].hasTrustDialogAccepted) so that
+// interactive sessions started there (e.g. background agents) don't pause to
+// show the workspace trust dialog. It is idempotent and safe to call before
+// every spawn: it only rewrites the file when the flag isn't already true, and
+// preserves every other field byte-for-byte.
 func (c *Controller) EnsureHomeDirTrusted() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
-	// Claude encodes the project path by replacing every path separator with '-'.
-	encoded := strings.ReplaceAll(home, string(filepath.Separator), "-")
-	dir := filepath.Join(home, ".claude", "projects", encoded)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	return ensureProjectTrusted(filepath.Join(home, ".claude.json"), home)
+}
+
+// ensureProjectTrusted sets projects[projectPath].hasTrustDialogAccepted to
+// true inside the Claude config at configPath. It round-trips unrelated
+// fields as raw JSON so it never clobbers data it doesn't understand.
+func ensureProjectTrusted(configPath, projectPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
 		return err
 	}
-	settingsPath := filepath.Join(dir, "settings.json")
-	if _, err := os.Stat(settingsPath); err == nil {
-		return nil // already exists
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
 	}
-	data := []byte(`{"hasTrustDialogAccepted":true}` + "\n")
-	return os.WriteFile(settingsPath, data, 0o644)
+	projects := map[string]json.RawMessage{}
+	if raw, ok := root["projects"]; ok {
+		if err := json.Unmarshal(raw, &projects); err != nil {
+			return err
+		}
+	}
+	proj := map[string]json.RawMessage{}
+	if raw, ok := projects[projectPath]; ok {
+		if err := json.Unmarshal(raw, &proj); err != nil {
+			return err
+		}
+	}
+	if raw, ok := proj["hasTrustDialogAccepted"]; ok {
+		var accepted bool
+		if err := json.Unmarshal(raw, &accepted); err == nil && accepted {
+			return nil // already trusted
+		}
+	}
+	proj["hasTrustDialogAccepted"] = json.RawMessage("true")
+	projBytes, err := json.Marshal(proj)
+	if err != nil {
+		return err
+	}
+	projects[projectPath] = projBytes
+	projectsBytes, err := json.Marshal(projects)
+	if err != nil {
+		return err
+	}
+	root["projects"] = projectsBytes
+	out, err := json.Marshal(root)
+	if err != nil {
+		return err
+	}
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, configPath)
 }
 
 // EditorSpec returns the spec for a workspace's nvim session.
@@ -154,6 +200,17 @@ func agentTitle(label string) string {
 		return "claude"
 	}
 	return label
+}
+
+// PromptAgentSpec returns a spec for a brand-new Claude agent session with
+// --dangerously-skip-permissions set, for autonomous background execution.
+func (c *Controller) PromptAgentSpec(label string) session.Spec {
+	id := newSessionID()
+	argv := []string{c.cfg.Agent, "--session-id", id, "--teammate-mode", "in-process", "--dangerously-skip-permissions"}
+	if label != "" {
+		argv = append(argv, "-n", label)
+	}
+	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
 }
 
 // NewAgentSpec returns the spec for a brand-new Claude agent session, optionally

@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,14 +28,15 @@ const barHeight = 2
 
 // Default reserved keys (not forwarded to embedded sessions); overridable via config.
 const (
-	defaultKeyCycle     = "ctrl+o" // cycle to the next session view
-	defaultKeyPicker    = "ctrl+g" // return to the CT picker
-	defaultKeyPalette   = "ctrl+a" // open the agent switcher
-	defaultKeyNextAgent = "f4"     // focus the next agent in the pool
-	defaultKeyPrevAgent = "f3"     // focus the previous agent in the pool
+	defaultKeyCycle        = "ctrl+o" // cycle to the next session view
+	defaultKeyPicker       = "ctrl+g" // return to the CT picker
+	defaultKeyPalette      = "ctrl+a" // open the agent board
+	defaultKeyNextAgent    = "f4"     // focus the next agent in the pool
+	defaultKeyPrevAgent    = "f3"     // focus the previous agent in the pool
 	defaultKeyHelp         = "f1"     // toggle the help overlay
 	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
-	defaultKeyNotif        = "ctrl+n" // open notification overlay
+	defaultKeyNotif        = "ctrl+n" // agent board alias (was the notification overlay)
+	defaultKeyPrompt       = "ctrl+y" // new-agent form pre-set for a background home agent
 
 	// Terminal pane management — only intercepted when the terminal screen is active.
 	defaultKeyTermSplitV = "ctrl+\\" // new pane to the right
@@ -88,29 +90,61 @@ const (
 	modeConfirmRemove
 )
 
-// notifLevel ranks an unread notification for a worktree.
-// Higher values take priority: waiting (needs action) beats done (informational).
-type notifLevel int
+// attnLevel ranks an agent's attention state, highest first when sorting.
+// attnWaiting is derived live from the polled agent status and never stored;
+// attnDone and attnMessage are unread markers recorded when a transition is
+// observed and cleared when the user views the workspace's agents.
+type attnLevel int
 
 const (
-	notifNone    notifLevel = iota // nothing pending
-	notifDone                     // busy → idle while unviewed
-	notifWaiting                  // busy → waiting (needs input/permission)
+	attnNone    attnLevel = iota // nothing pending
+	attnDone                     // busy → idle while unviewed (*)
+	attnMessage                  // background home agent completed, preview attached (@)
+	attnWaiting                  // live status "waiting" — needs input/permission (!)
 )
 
-// notifItem is one row in the notification overlay. isAgent == false marks a
-// non-navigable worktree header; isAgent == true is a selectable agent row.
-type notifItem struct {
-	key      string     // workspace key ("repo/branch")
-	level    notifLevel
-	isAgent  bool
-	pid      int    // agent PID for cursor matching in the renderer
-	agentIdx int    // index in ws.Agents for direct activation
-	label    string // display name
-	waitFor  string // AgentStatus.WaitingFor when status is waiting
+// attnEntry is one stored unread marker (attnDone or attnMessage) for an agent,
+// keyed by pid in Model.attention.
+type attnEntry struct {
+	level   attnLevel
+	key     string // workspace key the agent belongs to
+	preview string // attnMessage: last meaningful line scraped at completion
+}
+
+// boardRow is one row of the agent board: a non-navigable worktree group
+// header, a selectable agent row, or the trailing "+ new agent" row.
+type boardRow struct {
+	isAgent bool // navigable agent row
+	isNew   bool // navigable "+ new agent" row
+
+	key      string // workspace key ("repo/branch")
 	repo     string // for activate()
 	worktree string
 	path     string
+
+	agentIdx int // index in ws.Agents
+	pid      int
+	label    string    // display name
+	status   string    // right-hand status/preview column
+	attn     attnLevel // includes derived waiting
+	num      int       // 1-based quick-jump number (first 9 agent rows)
+}
+
+// Focus order of the new-agent form's fields.
+const (
+	formFieldLabel = iota
+	formFieldPrompt
+	formFieldWhere
+	formFieldMode
+	formFieldCount
+)
+
+// bgAgentMeta tracks a background home-worktree agent launched via the
+// new-agent form, pending completion.
+type bgAgentMeta struct {
+	label    string
+	homeKey  string
+	homePath string
 }
 
 // activeItem is a worktree shown in the "active" section, with its owning repo.
@@ -129,8 +163,9 @@ type Model struct {
 	keyCycle, keyPicker                    string
 	keyPalette, keyNextAgent, keyPrevAgent string
 	keyHelp, keyGlobalConfig, keyNotif     string
+	keyPrompt                              string
 
-	keyTermSplitV, keyTermSplitH string
+	keyTermSplitV, keyTermSplitH            string
 	keyTermCycle, keyTermZoom, keyTermClose string
 
 	screen   screen
@@ -162,22 +197,35 @@ type Model struct {
 	// last screen visited per worktree key, so switching back lands where you left
 	lastScreens map[string]screen
 
-	// agent switcher overlay
-	paletteOpen   bool
-	paletteCursor int
-	naming        bool // entering a label for a new agent
-	agentName     textinput.Model
-	rootInput     textinput.Model
+	// agent board overlay (unified agent switcher + notifications)
+	boardOpen   bool
+	boardCursor int // index into the board's navigable rows
+	agentName   textinput.Model
+	rootInput   textinput.Model
 
 	// live agent statuses from `claude agents --json`, keyed by pid
 	agentStatus     map[int]AgentStatus
-	agentPrevStatus map[int]string        // pid → status from previous poll, for transition detection
-	unread          map[string]notifLevel // worktree key → highest unread notification level
-	agentUnread     map[int]notifLevel    // pid → highest unread notification level (for palette)
+	agentPrevStatus map[int]string // pid → status from previous poll, for transition detection
 
-	// notification overlay
-	notifOpen   bool
-	notifCursor int
+	// stored unread markers (done/message) keyed by agent pid; waiting badges
+	// are derived live from agentStatus and never stored here
+	attention map[int]attnEntry
+
+	// prompt input for the board's new-agent form
+	promptInput textinput.Model
+
+	// background home-agent tracking
+	bgAgentPIDs map[int]bgAgentMeta // PIDs of home-mode agents pending completion
+
+	// home workspace path/key, cached on first open for pathToKey lookups
+	homeWSPath string
+	homeWSKey  string
+
+	// new-agent form (sub-state of the agent board)
+	formOpen       bool
+	formFocus      int  // formFieldLabel..formFieldMode
+	formLocation   int  // 0 = active worktree, 1 = home worktree
+	formBackground bool // false = foreground (default), true = background
 
 	status        string
 	statusAt      time.Time // when a transient status was set (for auto-expiry)
@@ -206,6 +254,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	rootInput := textinput.New()
 	rootInput.Placeholder = "~/repos"
 	rootInput.Prompt = "› "
+
+	promptInput := textinput.New()
+	promptInput.Placeholder = "What should Claude do?"
+	promptInput.Prompt = "› "
 
 	cycle, picker := ctrl.Keys()
 	if cycle == "" {
@@ -236,6 +288,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if notif == "" {
 		notif = defaultKeyNotif
 	}
+	prompt := ctrl.PromptKey()
+	if prompt == "" {
+		prompt = defaultKeyPrompt
+	}
 	termSplitV, termSplitH, termCycle, termZoom, termClose := ctrl.TermPaneKeys()
 	if termSplitV == "" {
 		termSplitV = defaultKeyTermSplitV
@@ -258,13 +314,15 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
+		keyPrompt:     prompt,
 		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
-		filter:  filter, nameInput: name, agentName: agentName, rootInput: rootInput,
+		filter: filter, nameInput: name, agentName: agentName, rootInput: rootInput,
+		promptInput:     promptInput,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
-		unread:          map[string]notifLevel{},
-		agentUnread:     map[int]notifLevel{},
+		attention:       map[int]attnEntry{},
+		bgAgentPIDs:     make(map[int]bgAgentMeta),
 	}
 }
 
@@ -331,6 +389,9 @@ func (m Model) scheduleStatusTick() tea.Cmd {
 			break
 		}
 	}
+	if len(m.bgAgentPIDs) > 0 {
+		interval = 2 * time.Second
+	}
 	return tea.Tick(interval, func(time.Time) tea.Msg { return statusTickMsg{} })
 }
 
@@ -383,6 +444,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filter.SetWidth(inputW)
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
+		m.promptInput.SetWidth(clamp(m.width-16, 20, 52))
 		w, h := m.sessionSize()
 		m.mgr.Resize(w, h)
 		if m.current != nil {
@@ -425,27 +487,62 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			bell := false
 			for pid, st := range msg.byPid {
+				if _, isBg := m.bgAgentPIDs[pid]; isBg {
+					continue // background completions are handled below
+				}
 				prev := m.agentPrevStatus[pid]
-				if prev == "busy" && (st.Status == "idle" || st.Status == "waiting") {
-					// Skip notification if the user is already watching this agent.
-					if m.screen == screenAgent && m.current != nil &&
-						m.current.ws != nil && m.current.ws.ActiveAgentSession() != nil &&
-						m.current.ws.ActiveAgentSession().Pid() == pid {
-						continue
+				if prev != "busy" || (st.Status != "idle" && st.Status != "waiting") {
+					continue
+				}
+				// Skip the bell/marker if the user is already watching this agent.
+				if m.watchingAgent(pid) {
+					continue
+				}
+				if st.Status == "waiting" {
+					bell = true // the ! badge is derived live from agentStatus
+					continue
+				}
+				if key, ok := m.pathToKey(st.Cwd); ok {
+					m.recordAttention(pid, attnDone, key, "")
+					bell = true
+				}
+			}
+			// Mark non-bg agents that disappeared between polls while busy
+			// (e.g. the process crashed or was killed). Use the last-known Cwd so
+			// we can map the pid to its workspace.
+			for pid, prev := range m.agentPrevStatus {
+				if _, stillTracked := msg.byPid[pid]; stillTracked {
+					continue
+				}
+				if _, isBg := m.bgAgentPIDs[pid]; isBg {
+					continue // handled in the bg loop below
+				}
+				if prev != "busy" {
+					continue
+				}
+				if last, ok := m.agentStatus[pid]; ok {
+					if key, ok := m.pathToKey(last.Cwd); ok {
+						m.recordAttention(pid, attnDone, key, "")
+						bell = true
 					}
-					if key, ok := m.pathToKey(st.Cwd); ok {
-						level := notifDone
-						if st.Status == "waiting" {
-							level = notifWaiting
-						}
-						if level > m.unread[key] {
-							m.unread[key] = level
-							bell = true
-						}
-						if level > m.agentUnread[pid] {
-							m.agentUnread[pid] = level
-						}
-					}
+				}
+			}
+			// Detect background home-agent completions.
+			for pid, meta := range m.bgAgentPIDs {
+				newSt, stillTracked := msg.byPid[pid]
+				prev := m.agentPrevStatus[pid]
+				completed := false
+				if stillTracked && newSt.Status == "idle" && (prev == "busy" || prev == "waiting") {
+					completed = true
+				} else if !stillTracked && (prev == "busy" || prev == "waiting") {
+					// Agent disappeared from claude agents list — treat as completed.
+					completed = true
+				}
+				if completed {
+					preview := m.scrapeBgAgentPreview(pid, meta)
+					m.attention[pid] = attnEntry{level: attnMessage, key: meta.homeKey, preview: preview}
+					delete(m.bgAgentPIDs, pid)
+					bell = true
 				}
 			}
 			if bell {
@@ -479,159 +576,326 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// clearWorkspaceUnread deletes the workspace-level unread entry and clears the
-// per-agent unread entries for every agent currently in the workspace. Both maps
-// share the same lifecycle so callers always use this instead of bare deletes.
-func (m Model) clearWorkspaceUnread() {
+// watchingAgent reports whether the user is on the agent screen with the agent
+// running as pid focused.
+func (m Model) watchingAgent(pid int) bool {
+	return m.screen == screenAgent && m.current != nil && m.current.ws != nil &&
+		m.current.ws.ActiveAgentSession() != nil &&
+		m.current.ws.ActiveAgentSession().Pid() == pid
+}
+
+// recordAttention stores an unread marker for pid unless an equal or higher one
+// is already recorded.
+func (m Model) recordAttention(pid int, level attnLevel, key, preview string) {
+	if cur, ok := m.attention[pid]; ok && cur.level >= level {
+		return
+	}
+	m.attention[pid] = attnEntry{level: level, key: key, preview: preview}
+}
+
+// clearWorkspaceAttention drops the stored unread markers for every agent in
+// the current workspace. Live waiting badges are derived from agentStatus and
+// clear themselves once the agent's polled status changes.
+func (m Model) clearWorkspaceAttention() {
 	if m.current == nil {
 		return
 	}
-	delete(m.unread, m.current.key)
-	if m.current.ws != nil {
-		for _, a := range m.current.ws.Agents {
-			if pid := a.Pid(); pid != 0 {
-				delete(m.agentUnread, pid)
-			}
+	for pid, e := range m.attention {
+		if e.key == m.current.key {
+			delete(m.attention, pid)
 		}
 	}
 }
 
-// buildNotifItems constructs the notification overlay's item lists from the
-// current unread maps. agentItems contains only navigable agent rows (used for
-// cursor tracking). displayRows interleaves non-navigable worktree header rows
-// for visual grouping. Worktrees with no live workspace or no unread agents are
-// omitted entirely.
-func (m Model) buildNotifItems() (agentItems, displayRows []notifItem) {
-	type wtEntry struct {
-		key   string
-		level notifLevel
+// agentAttn returns pid's effective attention level: a live "waiting" status
+// wins, then any stored unread marker.
+func (m Model) agentAttn(pid int) attnLevel {
+	if pid == 0 {
+		return attnNone
 	}
-	var wts []wtEntry
-	for key, lvl := range m.unread {
-		wts = append(wts, wtEntry{key, lvl})
+	if m.agentStatus[pid].Status == "waiting" {
+		return attnWaiting
 	}
-	sort.Slice(wts, func(i, j int) bool {
-		if wts[i].level != wts[j].level {
-			return wts[i].level > wts[j].level // waiting before done
-		}
-		return wts[i].key < wts[j].key
-	})
+	return m.attention[pid].level
+}
 
-	activeByKey := make(map[string]activeItem, len(m.active))
-	for _, it := range m.active {
-		activeByKey[wsKey(it.repo.Name, it.view.WT.Name)] = it
-	}
-
-	for _, wt := range wts {
-		it, ok := activeByKey[wt.key]
-		if !ok {
+// worktreeAttn returns the highest attention level among key's agents, for the
+// deck's per-worktree badge: live-waiting agents mapped to key via their Cwd,
+// then stored unread markers.
+func (m Model) worktreeAttn(key string) attnLevel {
+	level := attnNone
+	for pid, st := range m.agentStatus {
+		if st.Status != "waiting" || m.watchingAgent(pid) {
 			continue
 		}
-		ws, ok := m.mgr.Workspace(wt.key)
-		if !ok {
+		if k, ok := m.pathToKey(st.Cwd); ok && k == key {
+			level = attnWaiting
+		}
+	}
+	for _, e := range m.attention {
+		if e.key == key && e.level > level {
+			level = e.level
+		}
+	}
+	return level
+}
+
+// attnSummary counts, for the bar badge: worktrees with a live-waiting agent,
+// worktrees with unread completions, and unread background messages.
+func (m Model) attnSummary() (waiting, done, msgs int) {
+	waitKeys := map[string]bool{}
+	for pid, st := range m.agentStatus {
+		if st.Status != "waiting" || m.watchingAgent(pid) {
 			continue
 		}
-		var agentRows []notifItem
+		if key, ok := m.pathToKey(st.Cwd); ok {
+			waitKeys[key] = true
+		}
+	}
+	doneKeys := map[string]bool{}
+	for _, e := range m.attention {
+		switch e.level {
+		case attnDone:
+			doneKeys[e.key] = true
+		case attnMessage:
+			msgs++
+		}
+	}
+	return len(waitKeys), len(doneKeys), msgs
+}
+
+// buildBoard constructs the agent board: every agent of every open workspace,
+// grouped under non-navigable worktree header rows, with worktrees (and agents
+// within them) needing attention sorted first and a trailing "+ new agent" row.
+// nav maps cursor positions to indices in rows.
+func (m Model) buildBoard() (rows []boardRow, nav []int) {
+	type group struct {
+		key, repo, worktree, path string
+		agents                    []boardRow
+		attn                      attnLevel
+		opened                    int64
+	}
+
+	seen := map[string]bool{}
+	var groups []group
+	addGroup := func(key, repoName, wtName, path string) {
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		ws, ok := m.mgr.Workspace(key)
+		if !ok {
+			if m.current == nil || m.current.key != key || m.current.ws == nil {
+				return
+			}
+			ws = m.current.ws
+		}
+		g := group{key: key, repo: repoName, worktree: wtName, path: path}
+		if m.state != nil {
+			g.opened = m.state.Opened(key)
+		}
 		for i, a := range ws.Agents {
 			pid := a.Pid()
-			if pid == 0 {
-				continue
-			}
-			lvl := m.agentUnread[pid]
-			if lvl == notifNone {
-				continue
-			}
-			st := m.agentStatus[pid]
-			agentRows = append(agentRows, notifItem{
-				key:      wt.key,
-				level:    lvl,
-				isAgent:  true,
-				pid:      pid,
-				agentIdx: i,
-				label:    agentTitle(a.Title),
-				waitFor:  st.WaitingFor,
-				repo:     it.repo.Name,
-				worktree: it.view.WT.Name,
-				path:     it.view.WT.Path,
+			attn := m.agentAttn(pid)
+			g.agents = append(g.agents, boardRow{
+				isAgent: true, key: key, repo: repoName, worktree: wtName, path: path,
+				agentIdx: i, pid: pid, label: agentTitle(a.Title),
+				status: m.boardStatus(pid, attn), attn: attn,
 			})
+			if attn > g.attn {
+				g.attn = attn
+			}
 		}
-		if len(agentRows) == 0 {
-			continue
+		if len(g.agents) == 0 {
+			return
 		}
-		sort.Slice(agentRows, func(i, j int) bool {
-			return agentRows[i].level > agentRows[j].level
-		})
-		displayRows = append(displayRows, notifItem{
-			key:      wt.key,
-			level:    wt.level,
-			isAgent:  false,
-			repo:     it.repo.Name,
-			worktree: it.view.WT.Name,
-			path:     it.view.WT.Path,
-		})
-		for _, row := range agentRows {
-			displayRows = append(displayRows, row)
-			agentItems = append(agentItems, row)
+		sort.SliceStable(g.agents, func(i, j int) bool { return g.agents[i].attn > g.agents[j].attn })
+		groups = append(groups, g)
+	}
+
+	if m.current != nil {
+		addGroup(m.current.key, m.current.repo, m.current.worktree, m.current.path)
+	}
+	for _, it := range m.active {
+		addGroup(wsKey(it.repo.Name, it.view.WT.Name), it.repo.Name, it.view.WT.Name, it.view.WT.Path)
+	}
+	// The home workspace isn't a git worktree, so it never appears in m.active.
+	if m.homeWSKey != "" {
+		addGroup(m.homeWSKey, "~", "config", m.homeWSPath)
+	}
+
+	isCurrent := func(key string) bool { return m.current != nil && m.current.key == key }
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].attn != groups[j].attn {
+			return groups[i].attn > groups[j].attn // attention floats to the top
+		}
+		if ci, cj := isCurrent(groups[i].key), isCurrent(groups[j].key); ci != cj {
+			return ci
+		}
+		if groups[i].opened != groups[j].opened {
+			return groups[i].opened > groups[j].opened // then most recently opened
+		}
+		return groups[i].key < groups[j].key
+	})
+
+	num := 0
+	for _, g := range groups {
+		rows = append(rows, boardRow{key: g.key, repo: g.repo, worktree: g.worktree, path: g.path, attn: g.attn})
+		for _, r := range g.agents {
+			num++
+			if num <= 9 {
+				r.num = num
+			}
+			nav = append(nav, len(rows))
+			rows = append(rows, r)
 		}
 	}
-	return agentItems, displayRows
+	rows = append(rows, boardRow{isNew: true})
+	nav = append(nav, len(rows)-1)
+	return rows, nav
 }
 
-// openNotif toggles the notification overlay open. It's a no-op (with a flash)
-// when there are no navigable agent rows. Opening closes the palette.
-func (m Model) openNotif() (tea.Model, tea.Cmd) {
-	if m.notifOpen {
-		m.notifOpen = false
+// boardStatus renders the right-hand column for an agent row: the message
+// preview for background completions, otherwise the live polled status.
+func (m Model) boardStatus(pid int, attn attnLevel) string {
+	if attn == attnMessage {
+		if p := m.attention[pid].preview; p != "" {
+			return p
+		}
+		return "done"
+	}
+	st := m.agentStatus[pid]
+	switch st.Status {
+	case "busy":
+		return "working"
+	case "waiting":
+		if st.WaitingFor != "" {
+			return "waiting: " + st.WaitingFor
+		}
+		return "waiting"
+	case "idle":
+		if attn == attnDone {
+			return "done"
+		}
+		return "idle"
+	default:
+		return ""
+	}
+}
+
+// openBoard toggles the agent board. The cursor starts on the first row needing
+// attention, falling back to the current workspace's focused agent.
+func (m Model) openBoard() (tea.Model, tea.Cmd) {
+	if m.boardOpen {
+		m.boardOpen = false
+		m.formOpen = false
 		return m, nil
 	}
-	agentItems, _ := m.buildNotifItems()
-	if len(agentItems) == 0 {
-		m.flash("no pending agents")
-		return m, nil
+	m.boardOpen = true
+	m.formOpen = false
+	m.boardCursor = 0
+	rows, nav := m.buildBoard()
+	for i, ri := range nav {
+		if rows[ri].isAgent && rows[ri].attn > attnNone {
+			m.boardCursor = i
+			return m, nil
+		}
 	}
-	m.notifOpen = true
-	m.notifCursor = 0
-	m.paletteOpen = false
+	for i, ri := range nav {
+		r := rows[ri]
+		if r.isAgent && m.current != nil && r.key == m.current.key &&
+			m.current.ws != nil && r.agentIdx == m.current.ws.ActiveAgent {
+			m.boardCursor = i
+			break
+		}
+	}
 	return m, nil
 }
 
-// handleNotif routes key events while the notification overlay is open.
-func (m Model) handleNotif(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	agentItems, _ := m.buildNotifItems()
+// handleBoard routes key events while the agent board is open.
+func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.formOpen {
+		return m.handleBoardForm(msg)
+	}
+	rows, nav := m.buildBoard()
+	rowAt := func(i int) (boardRow, bool) {
+		if i < 0 || i >= len(nav) {
+			return boardRow{}, false
+		}
+		return rows[nav[i]], true
+	}
 	switch msg.String() {
-	case "esc", "q":
-		m.notifOpen = false
+	case "esc", "q", m.keyPalette, m.keyNotif:
+		m.boardOpen = false
 		return m, nil
+	case m.keyPrompt:
+		return m.openQuickPrompt()
 	case "up", "k", "ctrl+p":
-		if m.notifCursor > 0 {
-			m.notifCursor--
+		if m.boardCursor > 0 {
+			m.boardCursor--
 		}
 		return m, nil
-	case "down", "j", "ctrl+n":
-		if m.notifCursor < len(agentItems)-1 {
-			m.notifCursor++
+	case "down", "j":
+		if m.boardCursor < len(nav)-1 {
+			m.boardCursor++
+		}
+		return m, nil
+	case "n":
+		return m.openNewAgentForm(), nil
+	case "d":
+		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
+			m.mgr.CloseAgent(r.key, r.agentIdx)
+			delete(m.attention, r.pid)
+			m.saveAgents(r.key)
+			_, nav = m.buildBoard()
+			m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
 		}
 		return m, nil
 	case "enter":
-		if m.notifCursor < len(agentItems) {
-			return m.activateNotifItem(agentItems[m.notifCursor])
+		if r, ok := rowAt(m.boardCursor); ok {
+			if r.isNew {
+				return m.openNewAgentForm(), nil
+			}
+			return m.focusBoardAgent(r)
+		}
+		return m, nil
+	}
+	// A digit jumps straight to that agent (matching the numbers shown).
+	if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+		want := int(s[0] - '0')
+		for _, ri := range nav {
+			if rows[ri].isAgent && rows[ri].num == want {
+				return m.focusBoardAgent(rows[ri])
+			}
 		}
 	}
 	return m, nil
 }
 
-// activateNotifItem navigates directly to the specified agent pane, closing
-// the notification overlay and clearing the workspace's unread state.
-func (m Model) activateNotifItem(item notifItem) (tea.Model, tea.Cmd) {
-	mm, cmd := m.activate(item.repo, item.worktree, item.path)
-	model := mm.(Model)
-	model.notifOpen = false
-	if model.current != nil && model.current.key == item.key {
-		model.screen = screenAgent
-		if model.current.ws != nil {
-			model.current.ws.ActiveAgent = item.agentIdx
+// focusBoardAgent navigates directly to an agent's pane: it activates the
+// agent's workspace (when it isn't already current), switches to the agent
+// screen, focuses the agent, and clears the workspace's unread markers.
+func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
+	if m.current != nil && m.current.key == r.key {
+		m.boardOpen = false
+		m.screen = screenAgent
+		if m.current.ws != nil && r.agentIdx >= 0 && r.agentIdx < len(m.current.ws.Agents) {
+			m.current.ws.ActiveAgent = r.agentIdx
 		}
-		model.clearWorkspaceUnread()
+		m.clearWorkspaceAttention()
+		m.saveAgents(r.key)
+		return m, nil
+	}
+	mm, cmd := m.activate(r.repo, r.worktree, r.path)
+	model := mm.(Model)
+	model.boardOpen = false
+	if model.current != nil && model.current.key == r.key {
+		model.screen = screenAgent
+		if model.current.ws != nil && r.agentIdx >= 0 && r.agentIdx < len(model.current.ws.Agents) {
+			model.current.ws.ActiveAgent = r.agentIdx
+		}
+		model.clearWorkspaceAttention()
+		model.saveAgents(r.key)
 	}
 	return model, cmd
 }
@@ -644,7 +908,147 @@ func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
 		m.status = "home dir error: " + err.Error()
 		return m, nil
 	}
+	m.homeWSPath = home
+	m.homeWSKey = "~/config"
 	return m.activate("~", "config", home)
+}
+
+// openNewAgentForm switches the board into the new-agent form with defaults:
+// active worktree (home when no workspace is active), foreground, focus on the
+// label field.
+func (m Model) openNewAgentForm() tea.Model {
+	m.boardOpen = true
+	m.formOpen = true
+	m.formFocus = formFieldLabel
+	m.formLocation = 0
+	if m.current == nil {
+		m.formLocation = 1
+	}
+	m.formBackground = false
+	m.agentName.SetValue("")
+	m.promptInput.SetValue("")
+	m.promptInput.Blur()
+	m.agentName.Focus()
+	return m
+}
+
+// openQuickPrompt opens the new-agent form pre-set for a background home
+// worktree agent with the prompt field focused (the ctrl+y shortcut).
+func (m Model) openQuickPrompt() (tea.Model, tea.Cmd) {
+	mm := m.openNewAgentForm().(Model)
+	mm.formLocation = 1
+	mm.formBackground = true
+	mm.formFocus = formFieldPrompt
+	mm.agentName.Blur()
+	return mm, mm.promptInput.Focus()
+}
+
+// setFormFocus moves the new-agent form's focus to field f (wrapping), keeping
+// the text inputs' focus state in sync.
+func (m Model) setFormFocus(f int) (Model, tea.Cmd) {
+	m.formFocus = ((f % formFieldCount) + formFieldCount) % formFieldCount
+	m.agentName.Blur()
+	m.promptInput.Blur()
+	switch m.formFocus {
+	case formFieldLabel:
+		return m, m.agentName.Focus()
+	case formFieldPrompt:
+		return m, m.promptInput.Focus()
+	}
+	return m, nil
+}
+
+// handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓) move between
+// the label, prompt, where, and mode fields; space or ←/→ flip the focused
+// toggle; enter launches — except on the label field, where it advances to the
+// prompt so the old label→prompt→launch muscle memory still works.
+func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.formOpen = false
+		m.agentName.Blur()
+		m.promptInput.Blur()
+		return m, nil
+	case "tab", "down":
+		return m.setFormFocus(m.formFocus + 1)
+	case "shift+tab", "up":
+		return m.setFormFocus(m.formFocus - 1)
+	case "enter":
+		if m.formFocus == formFieldLabel {
+			return m.setFormFocus(formFieldPrompt)
+		}
+		return m.launchAgent()
+	}
+	switch m.formFocus {
+	case formFieldLabel:
+		var cmd tea.Cmd
+		m.agentName, cmd = m.agentName.Update(msg)
+		return m, cmd
+	case formFieldPrompt:
+		var cmd tea.Cmd
+		m.promptInput, cmd = m.promptInput.Update(msg)
+		return m, cmd
+	}
+	switch msg.String() {
+	case "left", "right", "h", "l", "space":
+		if m.formFocus == formFieldWhere {
+			m.formLocation = 1 - m.formLocation
+		} else {
+			m.formBackground = !m.formBackground
+		}
+	}
+	return m, nil
+}
+
+var promptAdjectives = []string{
+	"amber", "bold", "calm", "deft", "eager", "fast", "grand", "hazy",
+	"idle", "jade", "keen", "lazy", "mild", "nimble", "odd", "proud",
+	"quick", "rare", "shy", "tame", "umber", "vivid", "warm", "young",
+	"zany", "brave", "crisp", "dark", "fleet", "grey",
+}
+
+var promptNouns = []string{
+	"badger", "cedar", "drift", "ember", "falcon", "grove", "haven",
+	"inlet", "jasper", "kelp", "lantern", "moth", "nebula", "otter",
+	"pine", "quartz", "raven", "stone", "tide", "vale", "willow",
+	"fox", "creek", "dune", "fern", "gust", "hawk", "iris", "juniper",
+	"kestrel", "larch",
+}
+
+func randomAgentTitle() string {
+	adj := promptAdjectives[rand.Intn(len(promptAdjectives))]
+	noun := promptNouns[rand.Intn(len(promptNouns))]
+	return adj + "-" + noun
+}
+
+// scrapeBgAgentPreview extracts the last meaningful line(s) from a background
+// agent's terminal screen to use as a notification preview.
+func (m Model) scrapeBgAgentPreview(pid int, meta bgAgentMeta) string {
+	ws, ok := m.mgr.Workspace(meta.homeKey)
+	if !ok {
+		return ""
+	}
+	for _, a := range ws.Agents {
+		if a.Pid() == pid {
+			return lastMeaningfulLines(a.Render())
+		}
+	}
+	return ""
+}
+
+// lastMeaningfulLines walks a rendered terminal screen backwards and returns
+// the last non-empty line, truncated to 120 chars.
+func lastMeaningfulLines(rendered string) string {
+	lines := splitLines(rendered)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if ln := strings.TrimSpace(lines[i]); ln != "" {
+			if len(ln) > 120 {
+				ln = ln[:120] + "…"
+			}
+			return ln
+		}
+	}
+	return ""
 }
 
 // activate ensures the workspace's sessions are running and switches to the
@@ -674,7 +1078,7 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 		m.screen = screenEditor
 	}
 	if m.screen == screenAgent {
-		m.clearWorkspaceUnread()
+		m.clearWorkspaceAttention()
 	}
 	m.status = ""
 	if m.state != nil {
@@ -760,11 +1164,16 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.helpOpen = true
 		return m, nil
 	}
-	if m.notifOpen {
-		return m.handleNotif(msg)
+	if m.boardOpen {
+		return m.handleBoard(msg)
 	}
-	if msg.String() == m.keyNotif {
-		return m.openNotif()
+	// keyNotif is a legacy alias for the board (it replaced the notification
+	// overlay), kept so existing muscle memory and configs work.
+	if msg.String() == m.keyPalette || msg.String() == m.keyNotif {
+		return m.openBoard()
+	}
+	if msg.String() == m.keyPrompt {
+		return m.openQuickPrompt()
 	}
 	if msg.String() == m.keyGlobalConfig {
 		return m.activateGlobalConfig()
@@ -805,14 +1214,11 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if m.paletteOpen {
-		return m.handlePalette(msg)
-	}
 	switch msg.String() {
 	case m.keyCycle:
 		m.screen = m.screen.next()
 		if m.screen == screenAgent && m.current != nil {
-			m.clearWorkspaceUnread()
+			m.clearWorkspaceAttention()
 		}
 		return m, nil
 	case m.keyPicker:
@@ -827,8 +1233,6 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusActive
 		}
 		return m, nil
-	case m.keyPalette:
-		return m.openPalette(), nil
 	case m.keyNextAgent:
 		return m.rotateAgent(+1), nil
 	case m.keyPrevAgent:
@@ -866,17 +1270,6 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// openPalette shows the agent switcher for the current workspace.
-func (m Model) openPalette() tea.Model {
-	if m.current == nil || m.current.ws == nil {
-		return m
-	}
-	m.paletteOpen = true
-	m.naming = false
-	m.paletteCursor = m.current.ws.ActiveAgent
-	return m
-}
-
 // rotateAgent moves the focused agent by delta (wrapping) and switches to the
 // agent view. It's a no-op without at least two agents.
 func (m Model) rotateAgent(delta int) tea.Model {
@@ -889,100 +1282,106 @@ func (m Model) rotateAgent(delta int) tea.Model {
 	}
 	m.current.ws.ActiveAgent = ((m.current.ws.ActiveAgent+delta)%n + n) % n
 	m.screen = screenAgent
-	m.clearWorkspaceUnread()
+	m.clearWorkspaceAttention()
 	m.saveAgents(m.current.key)
 	return m
 }
 
-// handlePalette routes keys while the agent switcher is open. The list has one
-// row per agent plus a trailing "new agent" row.
-func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	ws := m.current.ws
-	if m.naming {
-		return m.handleAgentName(msg)
+// launchAgent spawns a new agent from the board's new-agent form, honouring the
+// selected location (active/home worktree) and mode (foreground/background).
+func (m Model) launchAgent() (tea.Model, tea.Cmd) {
+	prompt := strings.TrimSpace(m.promptInput.Value())
+	label := strings.TrimSpace(m.agentName.Value())
+	if label == "" {
+		label = randomAgentTitle()
 	}
-	newRow := len(ws.Agents) // index of the "+ new agent" row
-	switch msg.String() {
-	case "esc", m.keyPalette:
-		m.paletteOpen = false
-		return m, nil
-	case "up", "k", "ctrl+p":
-		if m.paletteCursor > 0 {
-			m.paletteCursor--
-		}
-		return m, nil
-	case "down", "j":
-		if m.paletteCursor < newRow {
-			m.paletteCursor++
-		}
-		return m, nil
-	case "n":
-		return m.beginNaming(), nil
-	case "d":
-		if m.paletteCursor < newRow {
-			m.mgr.CloseAgent(m.current.key, m.paletteCursor)
-			m.paletteCursor = clamp(m.paletteCursor, 0, max(0, len(ws.Agents)-1))
-			m.saveAgents(m.current.key)
-		}
-		return m, nil
-	case "enter":
-		if m.paletteCursor == newRow {
-			return m.beginNaming(), nil
-		}
-		ws.ActiveAgent = m.paletteCursor
-		m.screen = screenAgent
-		m.paletteOpen = false
-		m.clearWorkspaceUnread()
-		m.saveAgents(m.current.key)
-		return m, nil
-	}
-	// A digit jumps straight to that agent (matching the 1..n labels shown).
-	if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
-		if idx := int(s[0] - '1'); idx < len(ws.Agents) {
-			ws.ActiveAgent = idx
-			m.screen = screenAgent
-			m.paletteOpen = false
-			m.clearWorkspaceUnread()
-			m.saveAgents(m.current.key)
-		}
-	}
-	return m, nil
-}
+	m.formOpen = false
+	m.boardOpen = false
+	m.agentName.Blur()
+	m.promptInput.Blur()
+	w, h := m.sessionSize()
 
-// beginNaming switches the palette into its new-agent label sub-state.
-func (m Model) beginNaming() tea.Model {
-	m.naming = true
-	m.agentName.SetValue("")
-	m.agentName.Focus()
-	return m
-}
-
-// handleAgentName drives the label field for spawning a new agent.
-func (m Model) handleAgentName(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.naming = false
-		m.agentName.Blur()
-		return m, nil
-	case "enter":
-		label := strings.TrimSpace(m.agentName.Value())
-		m.naming = false
-		m.agentName.Blur()
-		w, h := m.sessionSize()
-		if _, err := m.mgr.SpawnAgent(m.current.key, m.current.path, m.ctrl.NewAgentSpec(label), w, h); err != nil {
+	if m.formLocation == 0 {
+		// Active worktree.
+		if m.current == nil {
+			m.flash("no active workspace")
+			return m, nil
+		}
+		spec := m.ctrl.NewAgentSpec(label)
+		sess, err := m.mgr.SpawnAgent(m.current.key, m.current.path, spec, w, h)
+		if err != nil {
 			m.status = "spawn error: " + err.Error()
 			return m, nil
 		}
+		if prompt != "" {
+			_, _ = sess.WriteInput([]byte(prompt + "\n"))
+		}
 		m.saveAgents(m.current.key)
-		m.paletteCursor = m.current.ws.ActiveAgent
+		if m.formBackground {
+			m.flash("agent launched in background")
+			return m, nil
+		}
 		m.screen = screenAgent
-		m.paletteOpen = false
-		m.clearWorkspaceUnread()
+		m.clearWorkspaceAttention()
+		m.flash("agent launched")
 		return m, nil
 	}
-	var cmd tea.Cmd
-	m.agentName, cmd = m.agentName.Update(msg)
-	return m, cmd
+
+	// Home worktree.
+	home, err := m.ctrl.GlobalConfigDir()
+	if err != nil {
+		m.status = "home dir error: " + err.Error()
+		return m, nil
+	}
+	homeKey := "~/config"
+	m.homeWSPath = home
+	m.homeWSKey = homeKey
+	if _, err := m.mgr.Activate(homeKey, home, m.workspaceSpecs(homeKey), w, h); err != nil {
+		m.status = "open error: " + err.Error()
+		return m, nil
+	}
+	if err := m.ctrl.EnsureHomeDirTrusted(); err != nil {
+		m.status = "trust setup error: " + err.Error()
+		return m, nil
+	}
+
+	if m.formBackground {
+		spec := m.ctrl.PromptAgentSpec(label)
+		sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
+		if err != nil {
+			m.status = "spawn error: " + err.Error()
+			return m, nil
+		}
+		if prompt != "" {
+			_, _ = sess.WriteInput([]byte(prompt + "\n"))
+		}
+		m.bgAgentPIDs[sess.Pid()] = bgAgentMeta{label: label, homeKey: homeKey, homePath: home}
+		if m.state != nil {
+			m.state.Touch(homeKey)
+			m.persistAgents(homeKey)
+			_ = m.state.Save()
+		}
+		m.flash("background agent launched")
+		return m, nil
+	}
+
+	// Home + foreground: spawn an interactive agent and navigate there.
+	spec := m.ctrl.NewAgentSpec(label)
+	sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
+	if err != nil {
+		m.status = "spawn error: " + err.Error()
+		return m, nil
+	}
+	if prompt != "" {
+		_, _ = sess.WriteInput([]byte(prompt + "\n"))
+	}
+	// Persist the new active agent before activate() reads saved state.
+	m.persistAgents(homeKey)
+	mm, cmd := m.activate("~", "config", home)
+	model := mm.(Model)
+	model.screen = screenAgent
+	model.flash("agent launched")
+	return model, cmd
 }
 
 // handleMouseClick switches tabs when a left-click lands on a bar icon, and
@@ -994,7 +1393,7 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 			return m.selectTab(s), nil
 		}
 		if m.notifZoneAt(mo.X, mo.Y) {
-			return m.openNotif()
+			return m.openBoard()
 		}
 		if m.screen == screenPicker && !m.helpOpen {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
@@ -1086,7 +1485,7 @@ func (m Model) selectTab(s screen) tea.Model {
 	if s == screenPicker || m.current != nil {
 		m.screen = s
 		if s == screenAgent && m.current != nil {
-			m.clearWorkspaceUnread()
+			m.clearWorkspaceAttention()
 		}
 	}
 	return m
@@ -1276,10 +1675,15 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// stopWorkspace closes a workspace's sessions and, if it was current, returns to
-// the picker.
+// stopWorkspace closes a workspace's sessions (dropping its stale attention
+// markers) and, if it was current, returns to the picker.
 func (m *Model) stopWorkspace(key string) {
 	m.mgr.Close(key)
+	for pid, e := range m.attention {
+		if e.key == key {
+			delete(m.attention, pid)
+		}
+	}
 	if m.current != nil && m.current.key == key {
 		m.current = nil
 		m.screen = screenPicker
@@ -1467,6 +1871,9 @@ func (m Model) pathToKey(path string) (string, bool) {
 		if filepath.Clean(it.view.WT.Path) == path {
 			return wsKey(it.repo.Name, it.view.WT.Name), true
 		}
+	}
+	if m.homeWSPath != "" && filepath.Clean(m.homeWSPath) == path {
+		return m.homeWSKey, true
 	}
 	return "", false
 }

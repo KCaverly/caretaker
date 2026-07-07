@@ -117,6 +117,10 @@ func (s *Session) signal() {
 	}
 }
 
+// WriteInput writes p directly to the pty's stdin, bypassing key encoding.
+// Use this to send raw text (e.g. an initial prompt) immediately after spawning.
+func (s *Session) WriteInput(p []byte) (int, error) { return s.pty.Write(p) }
+
 // SendKey forwards a key event to the program.
 func (s *Session) SendKey(k uv.KeyEvent) { s.emu.SendKey(k) }
 

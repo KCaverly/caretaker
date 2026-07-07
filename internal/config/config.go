@@ -37,7 +37,8 @@ type Keys struct {
 	Cycle string `toml:"cycle"`
 	// Picker returns to the CT picker.
 	Picker string `toml:"picker"`
-	// Palette opens the agent switcher for the current worktree.
+	// Palette opens the agent board: every agent across all open worktrees,
+	// attention first, plus the new-agent launcher.
 	Palette string `toml:"palette"`
 	// NextAgent / PrevAgent cycle the focused agent within the worktree.
 	NextAgent string `toml:"next_agent"`
@@ -46,8 +47,11 @@ type Keys struct {
 	Help string `toml:"help"`
 	// GlobalConfig opens the home-directory workspace for editing global config.
 	GlobalConfig string `toml:"global_config"`
-	// Notif opens the notification overlay.
+	// Notif is a legacy alias that also opens the agent board (it used to open
+	// a separate notification overlay).
 	Notif string `toml:"notif"`
+	// Prompt opens the new-agent form pre-set for a background home agent.
+	Prompt string `toml:"prompt"`
 	// Terminal pane management (only intercepted on the terminal screen).
 	TermSplitV string `toml:"term_split_v"` // new pane to the right
 	TermSplitH string `toml:"term_split_h"` // new pane below
@@ -72,7 +76,7 @@ func Default() Config {
 		Keys: Keys{
 			Cycle: "ctrl+o", Picker: "ctrl+g",
 			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n",
+			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n", Prompt: "ctrl+y",
 			TermSplitV: "ctrl+\\", TermSplitH: "ctrl+-",
 			TermCycle: "ctrl+w", TermZoom: "ctrl+f", TermClose: "ctrl+x",
 		},

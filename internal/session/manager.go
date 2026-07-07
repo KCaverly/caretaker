@@ -27,7 +27,7 @@ type Workspace struct {
 	TermLayout *PaneNode  // nil when Terms is empty
 	ActiveTerm int        // index of the focused pane in Terms
 	TermZoomed bool       // when true, only the focused pane is shown full-size
-	Agents      []*Session
+	Agents     []*Session
 	// ActiveAgent indexes the focused agent in Agents (clamped to a valid index
 	// while any agent exists).
 	ActiveAgent int

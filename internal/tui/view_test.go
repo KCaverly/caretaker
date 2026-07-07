@@ -89,32 +89,47 @@ func TestBarNotifZone(t *testing.T) {
 		t.Errorf("bar should not show notif glyphs when nothing is unread:\n%s", bar)
 	}
 
-	// Waiting unread: "!" should appear in the bar, count in palette (not bar).
-	m.unread = map[string]notifLevel{"r/w": notifWaiting, "other/wt": notifDone}
+	// A live-waiting agent elsewhere shows "!", a stored unread marker shows "*".
+	// (The waiting agent is in another worktree so it maps via m.active.)
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "other"}, view: WorktreeView{WT: repo.Worktree{Name: "wt", Path: "/other/wt"}}},
+	}
+	m.agentStatus = map[int]AgentStatus{7: {Status: "waiting", Cwd: "/other/wt"}}
+	m.attention[8] = attnEntry{level: attnDone, key: "r/w"}
 	bar = m.renderBar()
 	if !strings.Contains(bar, "!") {
-		t.Errorf("bar should show ! for waiting notif:\n%s", bar)
+		t.Errorf("bar should show ! for a live-waiting agent:\n%s", bar)
 	}
 	if !strings.Contains(bar, "*") {
-		t.Errorf("bar should show * for done notif:\n%s", bar)
+		t.Errorf("bar should show * for an unread completion:\n%s", bar)
 	}
 
-	// Palette header should show agent count when open.
-	m.paletteOpen = true
-	m.paletteCursor = 0
-	palette := m.renderPalette(m.height - barHeight)
-	if !strings.Contains(palette, "2") {
-		t.Errorf("palette header should show pool count 2:\n%s", palette)
+	// Board header should show the agent count when open.
+	m.boardOpen = true
+	m.boardCursor = 0
+	board := m.renderBoard(m.height - barHeight)
+	if !strings.Contains(board, "2") {
+		t.Errorf("board header should show pool count 2:\n%s", board)
 	}
 }
 
-func TestPaletteRender(t *testing.T) {
+func TestBoardRender(t *testing.T) {
 	m := modelWithAgents(2)
-	m = m.openPalette().(Model)
-	out := m.renderPalette(m.height - barHeight)
-	for _, want := range []string{"claude", "new agent", "focus"} {
+	mm, _ := m.openBoard()
+	m = mm.(Model)
+	out := m.renderBoard(m.height - barHeight)
+	for _, want := range []string{"AGENTS", "r/w", "claude", "new agent", "focus", "current"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("palette missing %q:\n%s", want, out)
+			t.Errorf("board missing %q:\n%s", want, out)
+		}
+	}
+
+	// The form renders the inputs and both toggles.
+	m = m.openNewAgentForm().(Model)
+	out = m.renderBoard(m.height - barHeight)
+	for _, want := range []string{"NEW AGENT", "label", "prompt", "active worktree", "background", "launch"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("form missing %q:\n%s", want, out)
 		}
 	}
 }

@@ -402,58 +402,143 @@ func TestRotateAgentWraps(t *testing.T) {
 	}
 }
 
-func TestPaletteNavigateAndFocus(t *testing.T) {
+func TestBoardNavigateAndFocus(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0
 
-	m = m.openPalette().(Model)
-	if !m.paletteOpen || m.paletteCursor != 0 {
-		t.Fatalf("open: open=%v cursor=%d", m.paletteOpen, m.paletteCursor)
-	}
-
-	// Down moves the cursor; it can reach the trailing "+ new agent" row (index 3)
-	// but no further.
-	for i := 0; i < 5; i++ {
-		mm, _ := m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
-		m = mm.(Model)
-	}
-	if m.paletteCursor != 3 {
-		t.Fatalf("cursor should clamp at the new-agent row (3), got %d", m.paletteCursor)
-	}
-
-	// Up back to agent 1, then enter focuses it and closes the palette.
-	for i := 0; i < 2; i++ {
-		mm, _ := m.handlePalette(tea.KeyPressMsg{Code: tea.KeyUp})
-		m = mm.(Model)
-	}
-	mm, _ := m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	mm, _ := m.openBoard()
 	m = mm.(Model)
-	if m.paletteOpen {
-		t.Error("enter should close the palette")
+	if !m.boardOpen || m.boardCursor != 0 {
+		t.Fatalf("open: open=%v cursor=%d", m.boardOpen, m.boardCursor)
+	}
+
+	// Down moves the cursor; it can reach the trailing "+ new agent" row (nav
+	// index 3) but no further.
+	for i := 0; i < 5; i++ {
+		mm, _ := m.handleBoard(tea.KeyPressMsg{Code: tea.KeyDown})
+		m = mm.(Model)
+	}
+	if m.boardCursor != 3 {
+		t.Fatalf("cursor should clamp at the new-agent row (3), got %d", m.boardCursor)
+	}
+
+	// Up back to agent 1, then enter focuses it and closes the board.
+	for i := 0; i < 2; i++ {
+		mm, _ := m.handleBoard(tea.KeyPressMsg{Code: tea.KeyUp})
+		m = mm.(Model)
+	}
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.boardOpen {
+		t.Error("enter should close the board")
 	}
 	if m.current.ws.ActiveAgent != 1 || m.screen != screenAgent {
 		t.Fatalf("enter should focus agent 1 on the agent screen, got active=%d screen=%v", m.current.ws.ActiveAgent, m.screen)
 	}
 }
 
-func TestPaletteDigitJump(t *testing.T) {
+func TestBoardDigitJump(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0
-	m = m.openPalette().(Model)
-
-	// "3" jumps straight to agent index 2, focuses it, and closes the palette.
-	mm, _ := m.handlePalette(tea.KeyPressMsg{Code: '3', Text: "3"})
+	mm, _ := m.openBoard()
 	m = mm.(Model)
-	if m.current.ws.ActiveAgent != 2 || m.screen != screenAgent || m.paletteOpen {
-		t.Fatalf("digit jump: active=%d screen=%v open=%v", m.current.ws.ActiveAgent, m.screen, m.paletteOpen)
+
+	// "3" jumps straight to the third agent, focuses it, and closes the board.
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: '3', Text: "3"})
+	m = mm.(Model)
+	if m.current.ws.ActiveAgent != 2 || m.screen != screenAgent || m.boardOpen {
+		t.Fatalf("digit jump: active=%d screen=%v open=%v", m.current.ws.ActiveAgent, m.screen, m.boardOpen)
 	}
 
-	// A digit past the pool size is ignored (palette stays open).
-	m = m.openPalette().(Model)
-	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: '9', Text: "9"})
+	// A digit past the pool size is ignored (board stays open).
+	mm, _ = m.openBoard()
 	m = mm.(Model)
-	if !m.paletteOpen {
-		t.Error("out-of-range digit should be a no-op (palette stays open)")
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: '9', Text: "9"})
+	m = mm.(Model)
+	if !m.boardOpen {
+		t.Error("out-of-range digit should be a no-op (board stays open)")
+	}
+}
+
+func TestBoardOpensFromPicker(t *testing.T) {
+	m := sampleModel() // picker, no current workspace
+
+	mm, _ := m.handleKey(ctrlKey('a'))
+	m = mm.(Model)
+	if !m.boardOpen {
+		t.Fatal("ctrl+a should open the board from the picker")
+	}
+	// With no open workspaces the board still offers the "+ new agent" row.
+	rows, nav := m.buildBoard()
+	if len(nav) != 1 || !rows[nav[0]].isNew {
+		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
+	}
+	// The notif key is an alias: it closes the board again.
+	mm, _ = m.handleKey(ctrlKey('n'))
+	m = mm.(Model)
+	if m.boardOpen {
+		t.Fatal("ctrl+n should toggle the board closed")
+	}
+}
+
+func TestQuickPromptOpensForm(t *testing.T) {
+	m := sampleModel()
+
+	mm, _ := m.handleKey(ctrlKey('y'))
+	m = mm.(Model)
+	if !m.boardOpen || !m.formOpen {
+		t.Fatalf("ctrl+y should open the new-agent form: board=%v form=%v", m.boardOpen, m.formOpen)
+	}
+	if m.formLocation != 1 || !m.formBackground || m.formFocus != formFieldPrompt {
+		t.Fatalf("quick prompt should preselect home+background with prompt focused: loc=%d bg=%v focus=%d",
+			m.formLocation, m.formBackground, m.formFocus)
+	}
+}
+
+func TestBoardFormFieldCycleAndToggles(t *testing.T) {
+	m := modelWithAgents(1)
+	m = m.openNewAgentForm().(Model)
+	if m.formFocus != formFieldLabel || m.formLocation != 0 || m.formBackground {
+		t.Fatalf("form defaults: focus=%d loc=%d bg=%v", m.formFocus, m.formLocation, m.formBackground)
+	}
+
+	// Tab cycles label → prompt → where → mode → label.
+	for _, want := range []int{formFieldPrompt, formFieldWhere, formFieldMode, formFieldLabel} {
+		mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab})
+		m = mm.(Model)
+		if m.formFocus != want {
+			t.Fatalf("tab: focus=%d want %d", m.formFocus, want)
+		}
+	}
+
+	// Enter on the label field advances to the prompt instead of launching.
+	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.formFocus != formFieldPrompt || !m.formOpen {
+		t.Fatalf("enter on label should advance to prompt: focus=%d open=%v", m.formFocus, m.formOpen)
+	}
+
+	// Space on the where/mode rows flips the toggles.
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // → where
+	m = mm.(Model)
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
+	m = mm.(Model)
+	if m.formLocation != 1 {
+		t.Fatalf("space should flip location, got %d", m.formLocation)
+	}
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // → mode
+	m = mm.(Model)
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
+	m = mm.(Model)
+	if !m.formBackground {
+		t.Fatal("space should flip mode to background")
+	}
+
+	// Esc returns to the board list without closing the overlay.
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.formOpen || !m.boardOpen {
+		t.Fatalf("esc should return to the board list: form=%v board=%v", m.formOpen, m.boardOpen)
 	}
 }
 
@@ -482,19 +567,20 @@ func TestStatusAutoExpires(t *testing.T) {
 	}
 }
 
-func TestPaletteEnterNewRowStartsNaming(t *testing.T) {
+func TestBoardEnterNewRowOpensForm(t *testing.T) {
 	m := modelWithAgents(2)
-	m = m.openPalette().(Model)
-	m.paletteCursor = 2 // the "+ new agent" row
-
-	mm, _ := m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	mm, _ := m.openBoard()
 	m = mm.(Model)
-	if !m.naming {
-		t.Error("entering on the new-agent row should begin naming")
+	m.boardCursor = 2 // the "+ new agent" row
+
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if !m.formOpen {
+		t.Error("entering on the new-agent row should open the new-agent form")
 	}
 }
 
-func TestNotifTransitionDetection(t *testing.T) {
+func TestAttentionTransitionDetection(t *testing.T) {
 	m := sampleModel()
 	m.active = []activeItem{
 		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
@@ -509,11 +595,18 @@ func TestNotifTransitionDetection(t *testing.T) {
 	}})
 	m2 := result.(Model)
 
-	if m2.unread[wsKey("r", "a")] != notifDone {
-		t.Errorf("r/a: want notifDone after busy→idle, got %v", m2.unread[wsKey("r", "a")])
+	if e := m2.attention[1]; e.level != attnDone || e.key != wsKey("r", "a") {
+		t.Errorf("pid 1: want stored attnDone for r/a after busy→idle, got %+v", e)
 	}
-	if m2.unread[wsKey("r", "b")] != notifWaiting {
-		t.Errorf("r/b: want notifWaiting after busy→waiting, got %v", m2.unread[wsKey("r", "b")])
+	// Waiting is derived live from the polled status, not stored.
+	if _, ok := m2.attention[2]; ok {
+		t.Error("pid 2: waiting must not be stored as an unread marker")
+	}
+	if got := m2.agentAttn(2); got != attnWaiting {
+		t.Errorf("pid 2: agentAttn should derive waiting, got %v", got)
+	}
+	if got := m2.worktreeAttn(wsKey("r", "b")); got != attnWaiting {
+		t.Errorf("r/b: worktreeAttn should derive waiting, got %v", got)
 	}
 
 	// A pid that was idle (not busy) going idle again should not fire.
@@ -524,73 +617,80 @@ func TestNotifTransitionDetection(t *testing.T) {
 		1: {Status: "idle", Cwd: "/r/a"},
 	}})
 	m4 := result3.(Model)
-	if m4.unread[wsKey("r", "a")] != notifNone {
-		t.Errorf("idle→idle should not produce a notification, got %v", m4.unread[wsKey("r", "a")])
+	if len(m4.attention) != 0 {
+		t.Errorf("idle→idle should not produce a marker, got %v", m4.attention)
 	}
 }
 
-func TestNotifLevelPrecedence(t *testing.T) {
+func TestAttentionPrecedence(t *testing.T) {
 	m := sampleModel()
 	m.active = []activeItem{
 		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
 	}
-	// Already has a waiting notification; a done transition should not downgrade it.
-	m.unread = map[string]notifLevel{wsKey("r", "a"): notifWaiting}
-	m.agentPrevStatus = map[int]string{1: "busy"}
-	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
-		1: {Status: "idle", Cwd: "/r/a"},
-	}})
-	m2 := result.(Model)
-	if m2.unread[wsKey("r", "a")] != notifWaiting {
-		t.Errorf("notifWaiting should not be downgraded by notifDone, got %v", m2.unread[wsKey("r", "a")])
+	// A live-waiting agent outranks another agent's unread completion for the
+	// worktree badge.
+	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: "/r/a"}}
+	m.attention[2] = attnEntry{level: attnDone, key: wsKey("r", "a")}
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnWaiting {
+		t.Errorf("waiting should outrank done, got %v", got)
+	}
+
+	// recordAttention never downgrades a stored marker.
+	m.attention[3] = attnEntry{level: attnMessage, key: "~/config", preview: "hi"}
+	m.recordAttention(3, attnDone, "~/config", "")
+	if e := m.attention[3]; e.level != attnMessage || e.preview != "hi" {
+		t.Errorf("recordAttention must not downgrade message → done, got %+v", e)
 	}
 }
 
-func TestNotifClearedOnAgentView(t *testing.T) {
+func TestAttentionClearedOnAgentView(t *testing.T) {
 	m := sampleModel()
-	m.unread = map[string]notifLevel{
-		"r/a": notifDone,
-		"r/b": notifWaiting,
+	m.attention = map[int]attnEntry{
+		1: {level: attnDone, key: "r/a"},
+		2: {level: attnDone, key: "r/b"},
 	}
 	ws := &session.Workspace{Agents: []*session.Session{{}, {}}}
 	m.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
 	m.screen = screenEditor // start on editor, cycle to agent
 
-	// Cycling to the agent screen (keyCycle) clears unread for the current workspace.
+	// Cycling to the agent screen (keyCycle) clears markers for the current workspace.
 	result, _ := m.update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
 	m2 := result.(Model)
 
 	if m2.screen != screenAgent {
 		t.Fatalf("expected screenAgent after cycle, got %v", m2.screen)
 	}
-	if m2.unread["r/a"] != notifNone {
-		t.Errorf("r/a unread should clear when cycling to agent screen, got %v", m2.unread["r/a"])
+	if _, ok := m2.attention[1]; ok {
+		t.Error("r/a marker should clear when cycling to the agent screen")
 	}
-	if m2.unread["r/b"] != notifWaiting {
-		t.Errorf("r/b unread should be unaffected, got %v", m2.unread["r/b"])
+	if e := m2.attention[2]; e.level != attnDone {
+		t.Errorf("r/b marker should be unaffected, got %+v", e)
 	}
 
 	// selectTab(screenAgent) also clears.
 	m3 := sampleModel()
-	m3.unread = map[string]notifLevel{"r/a": notifDone, "r/b": notifWaiting}
+	m3.attention = map[int]attnEntry{
+		1: {level: attnDone, key: "r/a"},
+		2: {level: attnDone, key: "r/b"},
+	}
 	m3.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
 	m4 := m3.selectTab(screenAgent).(Model)
-	if m4.unread["r/a"] != notifNone {
-		t.Errorf("r/a unread should clear on selectTab(agent), got %v", m4.unread["r/a"])
+	if _, ok := m4.attention[1]; ok {
+		t.Error("r/a marker should clear on selectTab(agent)")
 	}
-	if m4.unread["r/b"] != notifWaiting {
-		t.Errorf("r/b unread should be unaffected after selectTab, got %v", m4.unread["r/b"])
+	if e := m4.attention[2]; e.level != attnDone {
+		t.Errorf("r/b marker should be unaffected after selectTab, got %+v", e)
 	}
 
 	// Being on screenAgent during an unrelated message does NOT clear.
 	m5 := sampleModel()
-	m5.unread = map[string]notifLevel{"r/a": notifDone}
+	m5.attention = map[int]attnEntry{1: {level: attnDone, key: "r/a"}}
 	m5.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
 	m5.screen = screenAgent
 	result5, _ := m5.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m6 := result5.(Model)
-	if m6.unread["r/a"] != notifDone {
-		t.Errorf("unrelated message on agent screen should NOT clear unread, got %v", m6.unread["r/a"])
+	if e := m6.attention[1]; e.level != attnDone {
+		t.Errorf("unrelated message on agent screen should NOT clear markers, got %+v", e)
 	}
 }
 
@@ -664,5 +764,65 @@ func TestActivateFlow(t *testing.T) {
 	m = mm.(Model)
 	if m.current.ws.Editor != before {
 		t.Fatal("re-activate should reuse existing sessions")
+	}
+}
+
+// TestBoardSortsAttentionFirst activates two real workspaces and checks that
+// the one with an unread marker sorts above the current one, and that the
+// board cursor opens on it.
+func TestBoardSortsAttentionFirst(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	mm, _ = m.activate("repo", "a", dirA)
+	m = mm.(Model)
+	mm, _ = m.activate("repo", "b", dirB)
+	m = mm.(Model) // current is now repo/b
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "repo"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dirA}}},
+		{repo: repo.Repo{Name: "repo"}, view: WorktreeView{WT: repo.Worktree{Name: "b", Path: dirB}}},
+	}
+
+	wsA, _ := mgr.Workspace("repo/a")
+	pid := wsA.Agents[0].Pid()
+	m.attention[pid] = attnEntry{level: attnDone, key: "repo/a"}
+
+	rows, nav := m.buildBoard()
+	if len(rows) == 0 || rows[0].isAgent || rows[0].key != "repo/a" {
+		t.Fatalf("worktree with attention should sort first, got %+v", rows[0])
+	}
+	// nav: repo/a's agent, repo/b's agent, new row.
+	if len(nav) != 3 {
+		t.Fatalf("expected 3 navigable rows, got %d", len(nav))
+	}
+	if got := rows[nav[0]]; got.key != "repo/a" || got.attn != attnDone {
+		t.Fatalf("first navigable row should be repo/a's unread agent, got %+v", got)
+	}
+
+	// openBoard lands the cursor on the attention row.
+	mm2, _ := m.openBoard()
+	m2 := mm2.(Model)
+	if m2.boardCursor != 0 {
+		t.Fatalf("cursor should start on the attention row, got %d", m2.boardCursor)
+	}
+
+	// Focusing it clears repo/a's marker and switches workspaces.
+	mm2, _ = m2.handleBoard(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m2 = mm2.(Model)
+	if m2.current == nil || m2.current.key != "repo/a" || m2.screen != screenAgent {
+		t.Fatalf("enter should switch to repo/a's agent screen, got %+v screen=%v", m2.current, m2.screen)
+	}
+	if _, ok := m2.attention[pid]; ok {
+		t.Error("focusing the agent should clear its unread marker")
 	}
 }
