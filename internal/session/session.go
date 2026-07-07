@@ -147,6 +147,9 @@ func (s *Session) Resize(w, h int) {
 	_ = pty.Setsize(s.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
 }
 
+// Size returns the emulator's current dimensions.
+func (s *Session) Size() (w, h int) { return s.emu.Width(), s.emu.Height() }
+
 // Alive reports whether the program is still running.
 func (s *Session) Alive() bool { return !s.closed.Load() }
 

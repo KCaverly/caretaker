@@ -31,6 +31,10 @@ type Workspace struct {
 	// ActiveAgent indexes the focused agent in Agents (clamped to a valid index
 	// while any agent exists).
 	ActiveAgent int
+	// w, h is the body size last applied to this workspace's sessions. Only
+	// the current workspace is resized on terminal resize; others catch up in
+	// Activate when this differs from the requested size.
+	w, h int
 }
 
 // ActiveAgentSession returns the focused agent, or nil if the pool is empty.
@@ -141,10 +145,15 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 	defer m.mu.Unlock()
 
 	if ws, ok := m.spaces[key]; ok {
+		// A workspace that sat in the background through terminal resizes has
+		// stale pty sizes; bring it up to date now that it's becoming current.
+		if ws.w != w || ws.h != h {
+			m.resizeLocked(ws, w, h)
+		}
 		return ws, nil
 	}
 
-	ws := &Workspace{}
+	ws := &Workspace{w: w, h: h}
 	for _, sp := range specs {
 		s, err := Start(sp.Kind, sp.Title, dir, sp.Argv, w, h, m.signalDirty)
 		if err != nil {
@@ -209,18 +218,34 @@ func (m *Manager) CloseAgent(key string, idx int) {
 	s.Close()
 }
 
-// Resize resizes every non-terminal session (editor and agents). Terminal
-// panes are resized separately by ResizeTermPanes because each pane has its
-// own dimensions determined by the split tree.
-func (m *Manager) Resize(w, h int) {
+// ResizeWorkspace resizes key's editor and agents to w×h and recomputes its
+// terminal pane rectangles. Other workspaces are deliberately left alone —
+// resizing them means one pty ioctl (and a SIGWINCH redraw in the program)
+// per session for output nobody is watching; Activate brings a stale
+// workspace up to date when it next becomes current.
+func (m *Manager) ResizeWorkspace(key string, w, h int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, ws := range m.spaces {
-		if ws.Editor != nil {
-			ws.Editor.Resize(w, h)
-		}
-		for _, a := range ws.Agents {
-			a.Resize(w, h)
+	if ws, ok := m.spaces[key]; ok {
+		m.resizeLocked(ws, w, h)
+	}
+}
+
+// resizeLocked applies w×h to every session of ws and records the size.
+// Callers must hold m.mu.
+func (m *Manager) resizeLocked(ws *Workspace, w, h int) {
+	ws.w, ws.h = w, h
+	if ws.Editor != nil {
+		ws.Editor.Resize(w, h)
+	}
+	for _, a := range ws.Agents {
+		a.Resize(w, h)
+	}
+	if ws.TermLayout != nil {
+		for _, b := range ComputePaneBounds(ws.TermLayout, 0, 0, w, h) {
+			if b.Idx < len(ws.Terms) && ws.Terms[b.Idx] != nil {
+				ws.Terms[b.Idx].Resize(b.W, b.H)
+			}
 		}
 	}
 }

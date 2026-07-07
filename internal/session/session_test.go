@@ -148,6 +148,32 @@ func TestManagerActivateReuses(t *testing.T) {
 	}
 }
 
+func TestActivateResizesStaleWorkspace(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	specs := []Spec{
+		{Kind: Editor, Argv: []string{"sleep", "5"}},
+		{Kind: Terminal, Argv: []string{"sleep", "5"}},
+	}
+	if _, err := m.Activate("r/w", t.TempDir(), specs, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+
+	// The terminal was resized while this workspace sat in the background;
+	// re-activating it at the new size must bring its sessions up to date.
+	ws, err := m.Activate("r/w", t.TempDir(), specs, 100, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w, h := ws.Editor.Size(); w != 100 || h != 30 {
+		t.Fatalf("stale editor not resized on activate: %dx%d, want 100x30", w, h)
+	}
+	if w, h := ws.Terms[0].Size(); w != 100 || h != 30 {
+		t.Fatalf("stale term pane not resized on activate: %dx%d, want 100x30", w, h)
+	}
+}
+
 func TestManagerSpawnAndCloseAgent(t *testing.T) {
 	m := NewManager()
 	defer m.CloseAll()

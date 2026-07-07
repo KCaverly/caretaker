@@ -495,10 +495,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
 		m.promptInput.SetWidth(clamp(m.width-16, 20, 52))
-		w, h := m.sessionSize()
-		m.mgr.Resize(w, h)
+		// Only the current workspace is resized; background ones are brought up
+		// to date by Activate when they next become current.
 		if m.current != nil {
-			m.mgr.ResizeTermPanes(m.current.key, w, h)
+			w, h := m.sessionSize()
+			m.mgr.ResizeWorkspace(m.current.key, w, h)
 		}
 		return m, nil
 

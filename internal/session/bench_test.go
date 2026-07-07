@@ -8,6 +8,45 @@ import (
 	"github.com/charmbracelet/x/vt"
 )
 
+// resizeForWindowMsg mirrors what the TUI does on tea.WindowSizeMsg. It lives
+// here (not inline in the benchmark) so the pre/post comparison changes only
+// this one function when the resize strategy changes.
+func resizeForWindowMsg(m *Manager, currentKey string, w, h int) {
+	m.ResizeWorkspace(currentKey, w, h)
+}
+
+// BenchmarkWindowResize measures the synchronous work one tea.WindowSizeMsg
+// triggers on the UI goroutine with 6 open workspaces (editor + 2 agents +
+// 1 terminal each): the manager resize plus the current workspace's pane
+// recompute. Sizes alternate so every iteration performs real emulator
+// resizes and pty ioctls rather than no-ops.
+func BenchmarkWindowResize(b *testing.B) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	sleep := []string{"sleep", "60"}
+	specs := []Spec{
+		{Kind: Editor, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+		{Kind: Terminal, Argv: sleep},
+	}
+	keys := make([]string, 6)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("repo/wt-%d", i)
+		if _, err := m.Activate(keys[i], b.TempDir(), specs, 120, 40); err != nil {
+			b.Fatal(err)
+		}
+	}
+	current := keys[0]
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := 120 + i%2
+		resizeForWindowMsg(m, current, w, 40)
+	}
+}
+
 // BenchmarkEmulatorRender measures the cost of serialising a full emulator
 // screen to a styled string — the work every repaint pays per visible session.
 // This is what makes dropping repaints for invisible sessions worthwhile: the
