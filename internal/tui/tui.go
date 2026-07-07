@@ -431,9 +431,52 @@ func (m Model) activeSession() *session.Session {
 	}
 }
 
-// Update implements tea.Model.
+// Update implements tea.Model. After every message it re-declares which
+// sessions are on screen so the manager can drop repaint wakeups from
+// invisible ones (background agents streaming output would otherwise trigger
+// a full re-render each pty read).
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	return m.update(msg)
+	mm, cmd := m.update(msg)
+	if model, ok := mm.(Model); ok {
+		model.syncVisible()
+		return model, cmd
+	}
+	return mm, cmd
+}
+
+// syncVisible pushes the currently visible session set to the manager.
+func (m Model) syncVisible() {
+	if m.mgr == nil {
+		return
+	}
+	m.mgr.SetVisible(m.visibleSessions()...)
+}
+
+// visibleSessions returns the sessions whose output is currently drawn:
+// nothing while the picker, setup, or a full-body overlay (help, board) is
+// shown; the editor or focused agent on their screens; and on the terminal
+// screen either the focused pane (zoomed/single) or every pane in the split
+// layout. Mirrors the branch structure of View.
+func (m Model) visibleSessions() []*session.Session {
+	if m.helpOpen || m.boardOpen || m.screen == screenPicker || m.screen == screenSetup {
+		return nil
+	}
+	if m.current == nil || m.current.ws == nil {
+		return nil
+	}
+	ws := m.current.ws
+	switch m.screen {
+	case screenEditor:
+		return []*session.Session{ws.Editor}
+	case screenAgent:
+		return []*session.Session{ws.ActiveAgentSession()}
+	case screenTerminal:
+		if ws.TermZoomed || len(ws.Terms) == 1 || ws.TermLayout == nil {
+			return []*session.Session{ws.ActiveTermSession()}
+		}
+		return ws.Terms
+	}
+	return nil
 }
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {

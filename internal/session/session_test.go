@@ -28,7 +28,7 @@ func TestSessionRendersOutput(t *testing.T) {
 	dirty := make(chan struct{}, 16)
 	s, err := Start(Terminal, "term", t.TempDir(),
 		[]string{"sh", "-c", "echo ct-smoke-output; sleep 2"}, 80, 24,
-		func() {
+		func(*Session) {
 			select {
 			case dirty <- struct{}{}:
 			default:
@@ -50,7 +50,7 @@ func TestSessionRendersOutput(t *testing.T) {
 }
 
 func TestSessionSendKey(t *testing.T) {
-	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func() {})
+	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +62,64 @@ func TestSessionSendKey(t *testing.T) {
 	}
 	s.SendKey(keyEnter())
 	waitFor(t, s, "ping")
+}
+
+func TestDirtyOnlyForVisibleSessions(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	specs := []Spec{
+		{Kind: Terminal, Argv: []string{"cat"}},
+		{Kind: Agent, Argv: []string{"cat"}},
+	}
+	ws, err := m.Activate("r/w", t.TempDir(), specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	term, agent := ws.Terms[0], ws.Agents[0]
+
+	drain := func() {
+		for {
+			select {
+			case <-m.Dirty():
+			default:
+				return
+			}
+		}
+	}
+
+	// Only the terminal is on screen.
+	m.SetVisible(term)
+	drain()
+
+	// Output from the invisible agent must not wake the UI.
+	_, _ = agent.WriteInput([]byte("off-screen\n"))
+	waitFor(t, agent, "off-screen")
+	select {
+	case <-m.Dirty():
+		t.Fatal("dirty signal fired for an invisible session")
+	default:
+	}
+
+	// Output from the visible terminal must wake it.
+	_, _ = term.WriteInput([]byte("on-screen\n"))
+	waitFor(t, term, "on-screen")
+	select {
+	case <-m.Dirty():
+	case <-time.After(time.Second):
+		t.Fatal("no dirty signal for the visible session")
+	}
+
+	// After clearing visibility (picker/overlay shown), nothing wakes the UI.
+	m.SetVisible()
+	drain()
+	_, _ = term.WriteInput([]byte("hidden-now\n"))
+	waitFor(t, term, "hidden-now")
+	select {
+	case <-m.Dirty():
+		t.Fatal("dirty signal fired with no visible sessions")
+	default:
+	}
 }
 
 func TestManagerActivateReuses(t *testing.T) {

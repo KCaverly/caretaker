@@ -65,6 +65,13 @@ type Manager struct {
 	mu     sync.Mutex
 	spaces map[string]*Workspace
 	dirty  chan struct{}
+
+	// visible is the set of sessions currently drawn on screen; output from any
+	// other session is dropped instead of waking the UI. Guarded by its own
+	// RWMutex so pty pump goroutines never contend with mu (which Resize et al.
+	// hold across ioctls).
+	visMu   sync.RWMutex
+	visible map[*Session]struct{}
 }
 
 // NewManager returns an empty Manager.
@@ -75,11 +82,34 @@ func NewManager() *Manager {
 	}
 }
 
-// Dirty returns a channel that receives a value whenever any session's screen
-// changes; callers use it to trigger a repaint.
+// Dirty returns a channel that receives a value whenever a visible session's
+// screen changes; callers use it to trigger a repaint.
 func (m *Manager) Dirty() <-chan struct{} { return m.dirty }
 
-func (m *Manager) signalDirty() {
+// SetVisible replaces the set of sessions considered on-screen. Output from
+// sessions outside the set no longer triggers repaints; switching a session
+// into view repaints it anyway (the switch itself renders), so no frame is
+// ever missed. Call with no arguments when no session is visible (picker,
+// overlays).
+func (m *Manager) SetVisible(ss ...*Session) {
+	vis := make(map[*Session]struct{}, len(ss))
+	for _, s := range ss {
+		if s != nil {
+			vis[s] = struct{}{}
+		}
+	}
+	m.visMu.Lock()
+	m.visible = vis
+	m.visMu.Unlock()
+}
+
+func (m *Manager) signalDirty(s *Session) {
+	m.visMu.RLock()
+	_, ok := m.visible[s]
+	m.visMu.RUnlock()
+	if !ok {
+		return // off-screen output; the poll/badges cover attention
+	}
 	select {
 	case m.dirty <- struct{}{}:
 	default: // coalesce: a repaint is already pending

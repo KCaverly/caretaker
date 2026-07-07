@@ -43,12 +43,13 @@ type Session struct {
 	cursorVisible atomic.Bool
 	closed        atomic.Bool
 	closeOnce     sync.Once
-	dirty         func() // signalled when the screen changes
+	dirty         func(*Session) // signalled when the screen changes
 }
 
 // Start launches argv in dir on a pty sized w×h and returns a running Session.
-// dirty is called whenever the program produces output (so ct can repaint).
-func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func()) (*Session, error) {
+// dirty is called with the session whenever the program produces output, so the
+// caller can decide whether a repaint is needed (e.g. only for visible sessions).
+func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func(*Session)) (*Session, error) {
 	if len(argv) == 0 {
 		shell := os.Getenv("SHELL")
 		if shell == "" {
@@ -113,7 +114,7 @@ func (s *Session) pumpOutput() {
 
 func (s *Session) signal() {
 	if s.dirty != nil {
-		s.dirty()
+		s.dirty(s)
 	}
 }
 
