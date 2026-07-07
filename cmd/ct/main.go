@@ -43,6 +43,11 @@ func run() error {
 		m = m.EnterSetup(configPath)
 	}
 	p := tea.NewProgram(m)
-	_, err = p.Run()
+	final, err := p.Run()
+	// State writes run in the background during the session; flush once
+	// synchronously so an in-flight or just-scheduled write can't be lost.
+	if fm, ok := final.(tui.Model); ok {
+		fm.FlushState()
+	}
 	return err
 }

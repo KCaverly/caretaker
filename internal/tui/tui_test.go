@@ -381,23 +381,27 @@ func modelWithAgents(n int) Model {
 func TestRotateAgentWraps(t *testing.T) {
 	m := modelWithAgents(3)
 
-	m = m.rotateAgent(+1).(Model)
+	rotate := func(m Model, delta int) Model {
+		mm, _ := m.rotateAgent(delta)
+		return mm.(Model)
+	}
+
+	m = rotate(m, +1)
 	if m.current.ws.ActiveAgent != 1 || m.screen != screenAgent {
 		t.Fatalf("next: active=%d screen=%v", m.current.ws.ActiveAgent, m.screen)
 	}
-	m = m.rotateAgent(+1).(Model)
-	m = m.rotateAgent(+1).(Model) // 2 -> wrap to 0
+	m = rotate(m, +1)
+	m = rotate(m, +1) // 2 -> wrap to 0
 	if m.current.ws.ActiveAgent != 0 {
 		t.Fatalf("expected wrap to 0, got %d", m.current.ws.ActiveAgent)
 	}
-	m = m.rotateAgent(-1).(Model) // 0 -> wrap to 2
+	m = rotate(m, -1) // 0 -> wrap to 2
 	if m.current.ws.ActiveAgent != 2 {
 		t.Fatalf("expected wrap to 2, got %d", m.current.ws.ActiveAgent)
 	}
 
 	// No agents: rotate is a no-op and doesn't switch the screen.
-	empty := modelWithAgents(0)
-	if got := empty.rotateAgent(+1).(Model); got.screen == screenAgent {
+	if got := rotate(modelWithAgents(0), +1); got.screen == screenAgent {
 		t.Error("rotate with no agents should not switch to the agent view")
 	}
 }

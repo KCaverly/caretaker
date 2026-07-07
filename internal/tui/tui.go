@@ -889,9 +889,10 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
 			m.mgr.CloseAgent(r.key, r.agentIdx)
 			delete(m.attention, r.pid)
-			m.saveAgents(r.key)
+			save := m.saveAgents(r.key)
 			_, nav = m.buildBoard()
 			m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
+			return m, save
 		}
 		return m, nil
 	case "enter":
@@ -926,8 +927,7 @@ func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 			m.current.ws.ActiveAgent = r.agentIdx
 		}
 		m.clearWorkspaceAttention()
-		m.saveAgents(r.key)
-		return m, nil
+		return m, m.saveAgents(r.key)
 	}
 	mm, cmd := m.activate(r.repo, r.worktree, r.path)
 	model := mm.(Model)
@@ -938,7 +938,7 @@ func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 			model.current.ws.ActiveAgent = r.agentIdx
 		}
 		model.clearWorkspaceAttention()
-		model.saveAgents(r.key)
+		cmd = tea.Batch(cmd, model.saveAgents(r.key))
 	}
 	return model, cmd
 }
@@ -1124,12 +1124,13 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 		m.clearWorkspaceAttention()
 	}
 	m.status = ""
+	var save tea.Cmd
 	if m.state != nil {
 		m.state.Touch(key)
 		m.persistAgents(key)
-		_ = m.state.Save()
+		save = m.writeStateCmd()
 	}
-	return m, m.loadCmd()
+	return m, tea.Batch(m.loadCmd(), save)
 }
 
 // workspaceSpecs builds the session set for activating key: nvim and a shell
@@ -1181,14 +1182,41 @@ func (m *Model) persistAgents(key string) {
 	m.state.SetAgents(key, agents, ws.ActiveAgent)
 }
 
-// saveAgents snapshots the agent pool for key and flushes state to disk. Call it
-// after any change to the pool (spawn, close) or the focused agent.
-func (m *Model) saveAgents(key string) {
+// saveAgents snapshots the agent pool for key and returns a command that
+// flushes state to disk off the UI goroutine. Call it after any change to the
+// pool (spawn, close) or the focused agent, and return the command.
+func (m *Model) saveAgents(key string) tea.Cmd {
 	if m.state == nil {
-		return
+		return nil
 	}
 	m.persistAgents(key)
-	_ = m.state.Save()
+	return m.writeStateCmd()
+}
+
+// writeStateCmd marshals the state in memory (cheap, on the UI goroutine) and
+// returns a command that writes it to disk in the background. Superseded
+// snapshots are dropped by Snapshot's sequence guard, so rapid-fire saves
+// can't roll the file back; a final synchronous flush runs on exit.
+func (m Model) writeStateCmd() tea.Cmd {
+	if m.state == nil {
+		return nil
+	}
+	sn, ok := m.state.Snapshot()
+	if !ok {
+		return nil
+	}
+	return func() tea.Msg {
+		_ = sn.Write()
+		return nil
+	}
+}
+
+// FlushState synchronously writes ct's state to disk. main calls it once after
+// the program exits so a pending background write can't be lost.
+func (m Model) FlushState() {
+	if m.state != nil {
+		_ = m.state.Save()
+	}
 }
 
 // --- key handling ---
@@ -1277,9 +1305,9 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case m.keyNextAgent:
-		return m.rotateAgent(+1), nil
+		return m.rotateAgent(+1)
 	case m.keyPrevAgent:
-		return m.rotateAgent(-1), nil
+		return m.rotateAgent(-1)
 	}
 	if m.screen == screenTerminal && m.current != nil {
 		key := m.current.key
@@ -1315,19 +1343,18 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 // rotateAgent moves the focused agent by delta (wrapping) and switches to the
 // agent view. It's a no-op without at least two agents.
-func (m Model) rotateAgent(delta int) tea.Model {
+func (m Model) rotateAgent(delta int) (tea.Model, tea.Cmd) {
 	if m.current == nil || m.current.ws == nil {
-		return m
+		return m, nil
 	}
 	n := len(m.current.ws.Agents)
 	if n == 0 {
-		return m
+		return m, nil
 	}
 	m.current.ws.ActiveAgent = ((m.current.ws.ActiveAgent+delta)%n + n) % n
 	m.screen = screenAgent
 	m.clearWorkspaceAttention()
-	m.saveAgents(m.current.key)
-	return m
+	return m, m.saveAgents(m.current.key)
 }
 
 // launchAgent spawns a new agent from the board's new-agent form, honouring the
@@ -1359,15 +1386,15 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		if prompt != "" {
 			_, _ = sess.WriteInput([]byte(prompt + "\n"))
 		}
-		m.saveAgents(m.current.key)
+		save := m.saveAgents(m.current.key)
 		if m.formBackground {
 			m.flash("agent launched in background")
-			return m, nil
+			return m, save
 		}
 		m.screen = screenAgent
 		m.clearWorkspaceAttention()
 		m.flash("agent launched")
-		return m, nil
+		return m, save
 	}
 
 	// Home worktree.
@@ -1399,13 +1426,13 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 			_, _ = sess.WriteInput([]byte(prompt + "\n"))
 		}
 		m.bgAgentPIDs[sess.Pid()] = bgAgentMeta{label: label, homeKey: homeKey, homePath: home}
+		var save tea.Cmd
 		if m.state != nil {
 			m.state.Touch(homeKey)
-			m.persistAgents(homeKey)
-			_ = m.state.Save()
+			save = m.saveAgents(homeKey)
 		}
 		m.flash("background agent launched")
-		return m, nil
+		return m, save
 	}
 
 	// Home + foreground: spawn an interactive agent and navigate there.

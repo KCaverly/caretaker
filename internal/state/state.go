@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +17,13 @@ type State struct {
 	path       string
 	LastOpened map[string]int64           `json:"last_opened"` // "repo/worktree" -> unix seconds
 	Workspaces map[string]*WorkspaceState `json:"workspaces"`  // "repo/worktree" -> agent pool
+
+	// Snapshot/Write bookkeeping: seq numbers snapshots as they're taken,
+	// written tracks the newest one flushed, and writeMu serialises flushes so
+	// concurrent Write calls can't interleave their tmp-file renames.
+	seq     atomic.Uint64
+	written atomic.Uint64
+	writeMu sync.Mutex
 }
 
 // WorkspaceState records a worktree's agent pool so ct can rebuild it (resuming
@@ -97,21 +106,65 @@ func (s *State) SetAgents(key string, agents []AgentState, active int) {
 	s.Workspaces[key] = &WorkspaceState{Agents: agents, ActiveAgent: active}
 }
 
-// Save atomically writes the state to disk. It's a no-op if no path resolved.
-func (s *State) Save() error {
+// Snapshot marshals the current state in memory, without touching the disk.
+// It's cheap enough for hot paths (a keystroke handler); pass the result to a
+// goroutine that calls Write. ok is false when there's nothing to write (no
+// state path resolved or marshalling failed).
+//
+// Snapshot must be called from the goroutine that mutates the state (it reads
+// the maps); Write may run anywhere.
+func (s *State) Snapshot() (sn Snapshot, ok bool) {
 	if s.path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
+		return Snapshot{}, false
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
+		return Snapshot{}, false
+	}
+	return Snapshot{st: s, data: data, seq: s.seq.Add(1)}, true
+}
+
+// Snapshot is one marshalled copy of the state, ready to be flushed to disk
+// from any goroutine.
+type Snapshot struct {
+	st   *State
+	data []byte
+	seq  uint64
+}
+
+// Write atomically flushes the snapshot to disk. A snapshot that has been
+// superseded — a newer one already landed — is skipped, so out-of-order
+// flushes from concurrent goroutines can't roll the file back.
+func (sn Snapshot) Write() error {
+	if sn.st == nil {
+		return nil
+	}
+	sn.st.writeMu.Lock()
+	defer sn.st.writeMu.Unlock()
+	if sn.seq <= sn.st.written.Load() {
+		return nil // stale: newer state already on disk
+	}
+	if err := os.MkdirAll(filepath.Dir(sn.st.path), 0o755); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp := sn.st.path + ".tmp"
+	if err := os.WriteFile(tmp, sn.data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, sn.st.path); err != nil {
+		return err
+	}
+	sn.st.written.Store(sn.seq)
+	return nil
+}
+
+// Save synchronously snapshots and writes the state to disk. Use it where
+// blocking is fine (exit flush); hot paths should Snapshot and Write the
+// result off-thread instead. It's a no-op if no path resolved.
+func (s *State) Save() error {
+	sn, ok := s.Snapshot()
+	if !ok {
+		return nil
+	}
+	return sn.Write()
 }

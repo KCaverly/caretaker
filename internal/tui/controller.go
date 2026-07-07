@@ -22,6 +22,10 @@ type Controller struct {
 	// deciding whether a persisted agent can be resumed. Empty means the default
 	// ~/.claude/projects; tests point it at a temp dir.
 	projectsDir string
+	// homeTrusted records that EnsureHomeDirTrusted has already verified (or
+	// set) the trust flag, so subsequent agent launches skip re-reading
+	// ~/.claude.json. Only touched from the UI goroutine.
+	homeTrusted bool
 }
 
 // NewController builds a Controller from config.
@@ -125,11 +129,18 @@ func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir()
 // every spawn: it only rewrites the file when the flag isn't already true, and
 // preserves every other field byte-for-byte.
 func (c *Controller) EnsureHomeDirTrusted() error {
+	if c.homeTrusted {
+		return nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
-	return ensureProjectTrusted(filepath.Join(home, ".claude.json"), home)
+	if err := ensureProjectTrusted(filepath.Join(home, ".claude.json"), home); err != nil {
+		return err
+	}
+	c.homeTrusted = true
+	return nil
 }
 
 // ensureProjectTrusted sets projects[projectPath].hasTrustDialogAccepted to
