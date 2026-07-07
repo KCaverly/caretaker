@@ -463,6 +463,11 @@ func (m Model) renderNew(innerW, rows int) []string {
 	lines := []string{header("new", -1), "", m.filter.View(), ""}
 
 	if len(m.repoMatches) == 0 {
+		// Before the first scan lands, an empty list means "still looking",
+		// not "nothing there" — don't claim the root is empty.
+		if !m.groupsLoaded {
+			return append(lines, dimStyle.Render("   scanning repos…"))
+		}
 		return append(lines, dimStyle.Render("   no repos under root"))
 	}
 
@@ -529,6 +534,9 @@ func (m Model) renderActive(innerW, rows int) []string {
 	lines := []string{header("active", len(m.active)), ""}
 
 	if len(m.active) == 0 {
+		if !m.groupsLoaded {
+			return append(lines, dimStyle.Render("scanning…"))
+		}
 		return append(lines, dimStyle.Render("no workspaces yet — pick a repo above to create one"))
 	}
 
@@ -608,6 +616,7 @@ func (m Model) renderHelp(h int) string {
 		row("↑↓ / j k", "move"),
 		row("tab", "switch section"),
 		row("enter", "open / create"),
+		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
 		row("x", "remove worktree"),
 		row("r", "refresh"),
@@ -733,7 +742,7 @@ func (m Model) footerContent() string {
 	} else {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
-			keyhint("d", "stop"), keyhint("x", "remove"),
+			keyhint("1-3", "recent"), keyhint("d", "stop"), keyhint("x", "remove"),
 			keyhint("tab", "new"), keyhint("?", "help"), keyhint("ctrl+c", "quit"),
 		}
 	}
@@ -741,7 +750,7 @@ func (m Model) footerContent() string {
 
 	if m.status != "" {
 		style := helpStyle
-		if strings.Contains(m.status, "error") {
+		if m.statusLevel == statusError {
 			style = errStyle
 		}
 		return style.Render(m.status) + "\n" + help

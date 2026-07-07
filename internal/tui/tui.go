@@ -230,9 +230,23 @@ type Model struct {
 	formBackground bool // false = foreground (default), true = background
 
 	status        string
-	statusAt      time.Time // when a transient status was set (for auto-expiry)
+	statusLevel   statusLevel // errors stick; info auto-expires
+	statusAt      time.Time   // when a transient status was set (for auto-expiry)
 	width, height int
+
+	// groupsLoaded flips on the first applied deck load, so the picker can
+	// show a scanning indicator instead of a wrong "no repos" message.
+	groupsLoaded bool
 }
+
+// statusLevel classifies the footer status so styling and expiry don't rely
+// on sniffing the text for the word "error".
+type statusLevel int
+
+const (
+	statusInfo  statusLevel = iota // transient; auto-expires
+	statusError                    // sticks until the next action clears it
+)
 
 // transientStatusTTL is how long a non-error status message lingers before the
 // status poll clears it.
@@ -521,10 +535,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // superseded by a newer in-flight load
 		}
 		if msg.err != nil {
-			m.status = "load error: " + msg.err.Error()
+			m.setError("load error: " + msg.err.Error())
 			return m, nil
 		}
 		m.groups = msg.groups
+		m.groupsLoaded = true
 		m.recomputeMatches()
 		m.recomputeActive()
 		m.computeRecentRanks()
@@ -532,14 +547,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case createdMsg:
 		if msg.err != nil {
-			m.status = "create error: " + msg.err.Error()
+			m.setError("create error: " + msg.err.Error())
 			return m, m.loadCmd()
 		}
 		return m.activate(msg.wt.Repo, msg.wt.Name, msg.wt.Path)
 
 	case actionDoneMsg:
 		if msg.err != nil {
-			m.status = msg.err.Error()
+			m.setError(msg.err.Error())
 		}
 		return m, m.loadCmd()
 
@@ -659,6 +674,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.forwardMouse(msg)
 		return m, nil
 	case tea.MouseWheelMsg:
+		if m.screen == screenPicker && !m.helpOpen && !m.boardOpen {
+			return m.deckWheel(msg)
+		}
 		m.forwardMouse(msg)
 		return m, nil
 	case tea.MouseMotionMsg:
@@ -1008,7 +1026,7 @@ func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
 	home, err := m.ctrl.GlobalConfigDir()
 	if err != nil {
-		m.status = "home dir error: " + err.Error()
+		m.setError("home dir error: " + err.Error())
 		return m, nil
 	}
 	m.homeWSPath = home
@@ -1162,7 +1180,7 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	w, h := m.sessionSize()
 	ws, err := m.mgr.Activate(key, dir, m.workspaceSpecs(key), w, h)
 	if err != nil {
-		m.status = "open error: " + err.Error()
+		m.setError("open error: " + err.Error())
 		return m, m.loadCmd()
 	}
 	if saved := m.savedActiveAgent(key); saved < len(ws.Agents) {
@@ -1326,11 +1344,11 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		abs, err := config.ResolveRoot(root)
 		if err != nil {
-			m.status = err.Error()
+			m.setError(err.Error())
 			return m, nil
 		}
 		if err := config.Save(m.configPath, abs); err != nil {
-			m.status = "save error: " + err.Error()
+			m.setError("save error: " + err.Error())
 			return m, nil
 		}
 		m.ctrl.SetRoot(abs)
@@ -1442,7 +1460,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		spec := m.ctrl.NewAgentSpec(label)
 		sess, err := m.mgr.SpawnAgent(m.current.key, m.current.path, spec, w, h)
 		if err != nil {
-			m.status = "spawn error: " + err.Error()
+			m.setError("spawn error: " + err.Error())
 			return m, nil
 		}
 		if prompt != "" {
@@ -1462,18 +1480,18 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	// Home worktree.
 	home, err := m.ctrl.GlobalConfigDir()
 	if err != nil {
-		m.status = "home dir error: " + err.Error()
+		m.setError("home dir error: " + err.Error())
 		return m, nil
 	}
 	homeKey := "~/config"
 	m.homeWSPath = home
 	m.homeWSKey = homeKey
 	if _, err := m.mgr.Activate(homeKey, home, m.workspaceSpecs(homeKey), w, h); err != nil {
-		m.status = "open error: " + err.Error()
+		m.setError("open error: " + err.Error())
 		return m, nil
 	}
 	if err := m.ctrl.EnsureHomeDirTrusted(); err != nil {
-		m.status = "trust setup error: " + err.Error()
+		m.setError("trust setup error: " + err.Error())
 		return m, nil
 	}
 
@@ -1481,7 +1499,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		spec := m.ctrl.PromptAgentSpec(label)
 		sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
 		if err != nil {
-			m.status = "spawn error: " + err.Error()
+			m.setError("spawn error: " + err.Error())
 			return m, nil
 		}
 		if prompt != "" {
@@ -1501,7 +1519,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	spec := m.ctrl.NewAgentSpec(label)
 	sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
 	if err != nil {
-		m.status = "spawn error: " + err.Error()
+		m.setError("spawn error: " + err.Error())
 		return m, nil
 	}
 	if prompt != "" {
@@ -1534,6 +1552,41 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.forwardMouse(msg)
+	return m, nil
+}
+
+// deckWheel scrolls the deck section under the pointer: the wheel moves that
+// section's cursor (focusing the section, mirroring what a click does), so
+// the lists scroll the way every other list on screen does.
+func (m Model) deckWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	mo := msg.Mouse()
+	delta := 1
+	if mo.Button == tea.MouseWheelUp {
+		delta = -1
+	} else if mo.Button != tea.MouseWheelDown {
+		return m, nil
+	}
+	if m.mode != modeNormal {
+		return m, nil
+	}
+
+	by := mo.Y - barHeight
+	L := m.deckLayout(m.height - barHeight)
+	switch {
+	case by >= 1 && by < 1+L.newContentH: // NEW box
+		var cmd tea.Cmd
+		if m.focus != focusNew {
+			m.focus = focusNew
+			cmd = m.filter.Focus()
+		}
+		m.newCursor = clamp(m.newCursor+delta, 0, max(0, len(m.repoMatches)-1))
+		return m, cmd
+	case by >= L.newOuterH+1 && by < L.newOuterH+1+L.activeContentH: // ACTIVE box
+		m.focus = focusActive
+		m.filter.Blur()
+		m.activeCursor = clamp(m.activeCursor+delta, 0, max(0, len(m.active)-1))
+		return m, nil
+	}
 	return m, nil
 }
 
@@ -1763,8 +1816,25 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeConfirmRemove
 			m.status = fmt.Sprintf("remove worktree %q and its branch? (y/n)", it.view.WT.Name)
 		}
+	case "1", "2", "3":
+		// The deck badges these ranks next to the most recently opened
+		// worktrees; pressing the digit jumps straight there.
+		if it, ok := m.rankedActive(int(msg.String()[0] - '0')); ok {
+			return m.activate(it.repo.Name, it.view.WT.Name, it.view.WT.Path)
+		}
 	}
 	return m, nil
+}
+
+// rankedActive returns the active item badged with the given recency rank
+// (1..3), if any.
+func (m Model) rankedActive(rank int) (activeItem, bool) {
+	for _, it := range m.active {
+		if m.recentRank[wsKey(it.repo.Name, it.view.WT.Name)] == rank {
+			return it, true
+		}
+	}
+	return activeItem{}, false
 }
 
 func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1841,21 +1911,30 @@ func humanDur(d time.Duration) string {
 	}
 }
 
-// flash sets a transient status message that the status poll auto-clears after
-// transientStatusTTL. Error statuses are set on m.status directly so they stick.
+// flash sets a transient info status that the status poll auto-clears after
+// transientStatusTTL.
 func (m *Model) flash(s string) {
 	m.status = s
+	m.statusLevel = statusInfo
 	m.statusAt = time.Now()
 }
 
-// maybeExpireStatus clears a transient (non-error) status once it has been shown
-// for transientStatusTTL. It's driven by the status poll, which always
+// setError sets a sticky error status: styled red and never auto-expired, it
+// stays until the next action replaces or clears it.
+func (m *Model) setError(s string) {
+	m.status = s
+	m.statusLevel = statusError
+	m.statusAt = time.Time{}
+}
+
+// maybeExpireStatus clears a transient info status once it has been shown for
+// transientStatusTTL. It's driven by the status poll, which always
 // reschedules itself, so the clear lands within a poll interval.
 func (m *Model) maybeExpireStatus() {
 	if m.status == "" || m.mode != modeNormal || m.statusAt.IsZero() {
 		return
 	}
-	if strings.Contains(m.status, "error") {
+	if m.statusLevel == statusError {
 		return
 	}
 	if time.Since(m.statusAt) > transientStatusTTL {

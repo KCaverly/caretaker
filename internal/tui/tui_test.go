@@ -638,11 +638,20 @@ func TestStatusAutoExpires(t *testing.T) {
 	}
 
 	// Errors are sticky regardless of age.
-	m.status = "open error: boom"
-	m.statusAt = m.statusAt.Add(-2 * transientStatusTTL)
+	m.setError("open error: boom")
+	m.statusAt = time.Now().Add(-2 * transientStatusTTL)
 	m.maybeExpireStatus()
 	if m.status == "" {
 		t.Error("error status should not auto-expire")
+	}
+
+	// A transient status that merely mentions "error" in a name still expires
+	// — expiry keys off the typed level, not the text.
+	m.flash("stopped error-handling")
+	m.statusAt = m.statusAt.Add(-2 * transientStatusTTL)
+	m.maybeExpireStatus()
+	if m.status != "" {
+		t.Fatalf("info status naming 'error' should still expire, got %q", m.status)
 	}
 }
 
