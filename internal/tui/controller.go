@@ -115,6 +115,29 @@ func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) 
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 
+// EnsureHomeDirTrusted writes hasTrustDialogAccepted to Claude's internal
+// project settings for the home directory so that interactive sessions started
+// there (e.g. background agents) don't pause to show the workspace trust dialog.
+// It is idempotent and safe to call before every spawn.
+func (c *Controller) EnsureHomeDirTrusted() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	// Claude encodes the project path by replacing every path separator with '-'.
+	encoded := strings.ReplaceAll(home, string(filepath.Separator), "-")
+	dir := filepath.Join(home, ".claude", "projects", encoded)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	settingsPath := filepath.Join(dir, "settings.json")
+	if _, err := os.Stat(settingsPath); err == nil {
+		return nil // already exists
+	}
+	data := []byte(`{"hasTrustDialogAccepted":true}` + "\n")
+	return os.WriteFile(settingsPath, data, 0o644)
+}
+
 // EditorSpec returns the spec for a workspace's nvim session.
 func (c *Controller) EditorSpec() session.Spec {
 	return session.Spec{Kind: session.Editor, Title: "nvim", Argv: []string{c.cfg.Editor}}
