@@ -99,8 +99,6 @@ const (
 // otherwise (faint until a workspace exists). The current repo / worktree sits
 // on the right.
 func (m Model) renderBar() string {
-	has := m.current != nil
-
 	left := "  "
 	for i, z := range m.barZones() {
 		if i > 0 {
@@ -109,15 +107,12 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Right side: notification zone (! N  * N) then repo / worktree.
+	// Right side: notification zone (! N  * N) then the workspace context.
 	right := ""
 	if notif := m.renderNotifZone(); notif != "" {
 		right += notif + "   "
 	}
-	if has {
-		right += lipgloss.NewStyle().Foreground(cDim).
-			Render(m.current.repo + " / " + m.current.worktree)
-	}
+	right += m.barContextLabel()
 	if right != "" {
 		right += "  "
 	}
@@ -148,6 +143,45 @@ func (m Model) renderNotifZone() string {
 			" "+countStyle.Render(strconv.Itoa(msgs)))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// barContextLabel builds the bar's right-side workspace context: the
+// "repo / worktree" label, extended with the agent pool position
+// ("· 2/3 label") whenever the workspace has more than one agent, and the
+// pane position ("· ⊞ 2/3", plus "zoom" while zoomed) on the terminal screen
+// with splits. It surfaces state that is otherwise invisible — which agent
+// is focused, how many exist, whether a pane is zoomed — and thereby
+// advertises the prev/next-agent and zoom keys.
+func (m Model) barContextLabel() string {
+	if m.current == nil {
+		return ""
+	}
+	s := lipgloss.NewStyle().Foreground(cDim).
+		Render(m.current.repo + " / " + m.current.worktree)
+	ws := m.current.ws
+	if ws == nil {
+		return s
+	}
+	sep := dimStyle.Render(" · ")
+	if n := len(ws.Agents); n > 1 {
+		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
+		if a := ws.ActiveAgentSession(); a != nil {
+			pos += " " + truncateTo(agentTitle(a.Title), 14)
+		}
+		st := dimStyle
+		if m.screen == screenAgent {
+			st = lipgloss.NewStyle().Foreground(cPurple)
+		}
+		s += sep + st.Render(pos)
+	}
+	if m.screen == screenTerminal && len(ws.Terms) > 1 {
+		pane := fmt.Sprintf("⊞ %d/%d", clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
+		if ws.TermZoomed {
+			pane += " zoom"
+		}
+		s += sep + lipgloss.NewStyle().Foreground(cAccent).Render(pane)
+	}
+	return s
 }
 
 // barZone is one clickable status-bar icon: its fully-rendered glyph (with any
@@ -222,11 +256,7 @@ func (m Model) notifZoneAt(x, y int) bool {
 	if notif == "" {
 		return false
 	}
-	right := notif + "   "
-	if m.current != nil {
-		right += lipgloss.NewStyle().Foreground(cDim).Render(m.current.repo + " / " + m.current.worktree)
-	}
-	right += "  "
+	right := notif + "   " + m.barContextLabel() + "  "
 	start := m.width - lipgloss.Width(right)
 	end := start + lipgloss.Width(notif)
 	return x >= start && x < end

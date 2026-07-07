@@ -205,7 +205,9 @@ type Model struct {
 
 	// live agent statuses from `claude agents --json`, keyed by pid
 	agentStatus     map[int]AgentStatus
-	agentPrevStatus map[int]string // pid → status from previous poll, for transition detection
+	agentPrevStatus map[int]string    // pid → status from previous poll, for transition detection
+	busySince       map[int]time.Time // pid → when its current busy stretch began
+	pollFails       int               // consecutive status-poll failures, for the one-shot notice
 
 	// stored unread markers (done/message) keyed by agent pid; waiting badges
 	// are derived live from agentStatus and never stored here
@@ -549,7 +551,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.pollStatusCmd()
 
 	case statusMsg:
+		if msg.err != nil {
+			// Surface a persistent outage once (transient, auto-expires): with
+			// the poll dead, every badge/board feature silently freezes and the
+			// user should know why.
+			m.pollFails++
+			if m.pollFails == 3 {
+				m.flash("agent status unavailable (claude agents failing)")
+			}
+		}
 		if msg.err == nil {
+			m.pollFails = 0
 			bell := false
 			for pid, st := range msg.byPid {
 				if _, isBg := m.bgAgentPIDs[pid]; isBg {
@@ -612,6 +624,25 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if bell {
 				fmt.Fprint(os.Stderr, "\a")
+			}
+			// Track when each agent's current busy stretch began, for the
+			// board's elapsed-time column. Accurate to one poll interval.
+			if m.busySince == nil {
+				m.busySince = map[int]time.Time{}
+			}
+			for pid, st := range msg.byPid {
+				if st.Status == "busy" {
+					if _, ok := m.busySince[pid]; !ok {
+						m.busySince[pid] = time.Now()
+					}
+				} else {
+					delete(m.busySince, pid)
+				}
+			}
+			for pid := range m.busySince {
+				if _, ok := msg.byPid[pid]; !ok {
+					delete(m.busySince, pid)
+				}
 			}
 			m.agentPrevStatus = make(map[int]string, len(msg.byPid))
 			for pid, st := range msg.byPid {
@@ -832,6 +863,13 @@ func (m Model) boardStatus(pid int, attn attnLevel) string {
 	st := m.agentStatus[pid]
 	switch st.Status {
 	case "busy":
+		// Elapsed time changes triage: a 12-minute agent means something
+		// different from a 20-second one. Shown once it's meaningful (>=5s).
+		if since, ok := m.busySince[pid]; ok {
+			if d := time.Since(since); d >= 5*time.Second {
+				return "working · " + humanDur(d)
+			}
+		}
 		return "working"
 	case "waiting":
 		if st.WaitingFor != "" {
@@ -1790,6 +1828,18 @@ func (m *Model) stopWorkspace(key string) {
 }
 
 func wsKey(repoName, wtName string) string { return repoName + "/" + wtName }
+
+// humanDur formats an elapsed duration compactly for status columns.
+func humanDur(d time.Duration) string {
+	switch {
+	case d < 90*time.Second:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < 90*time.Minute:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
 
 // flash sets a transient status message that the status poll auto-clears after
 // transientStatusTTL. Error statuses are set on m.status directly so they stick.
