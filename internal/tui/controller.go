@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
@@ -26,6 +28,9 @@ type Controller struct {
 	// set) the trust flag, so subsequent agent launches skip re-reading
 	// ~/.claude.json. Only touched from the UI goroutine.
 	homeTrusted bool
+	// loadSeq stamps each issued Load so the loadedMsg handler can drop
+	// results superseded by a newer in-flight load.
+	loadSeq atomic.Uint64
 }
 
 // NewController builds a Controller from config.
@@ -52,26 +57,58 @@ type Group struct {
 	Worktrees []WorktreeView
 }
 
+// loadConcurrency bounds how many git subprocesses one Load runs at a time.
+const loadConcurrency = 8
+
 // Load discovers repos and their worktrees with git status. Live status is
-// filled in by the model from the session manager.
+// filled in by the model from the session manager. Repos and their worktree
+// status checks run concurrently (bounded by loadConcurrency); result order
+// stays deterministic because each repo writes into its own slot.
 func (c *Controller) Load() ([]Group, error) {
 	repos, err := repo.DiscoverRepos(c.cfg.Root)
 	if err != nil {
 		return nil, err
 	}
 
+	sem := make(chan struct{}, loadConcurrency)
+	results := make([]*Group, len(repos))
+	var wg sync.WaitGroup
+	for i, r := range repos {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			wts, err := repo.ListWorktrees(r)
+			if err != nil {
+				<-sem
+				return // skip repos that fail to list, as before
+			}
+			tips, _ := repo.BranchTipTimes(r)
+			<-sem
+
+			views := make([]WorktreeView, len(wts))
+			var wtWG sync.WaitGroup
+			for j, wt := range wts {
+				wtWG.Add(1)
+				go func() {
+					defer wtWG.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					st, _ := repo.WorktreeStatus(wt)
+					views[j] = WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: tips[wt.Branch]}
+				}()
+			}
+			wtWG.Wait()
+			results[i] = &Group{Repo: r, Worktrees: views}
+		}()
+	}
+	wg.Wait()
+
 	groups := make([]Group, 0, len(repos))
-	for _, r := range repos {
-		wts, err := repo.ListWorktrees(r)
-		if err != nil {
-			continue
+	for _, g := range results {
+		if g != nil {
+			groups = append(groups, *g)
 		}
-		g := Group{Repo: r, Worktrees: make([]WorktreeView, 0, len(wts))}
-		for _, wt := range wts {
-			st, _ := repo.WorktreeStatus(wt)
-			g.Worktrees = append(g.Worktrees, WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: st.CommitTime})
-		}
-		groups = append(groups, g)
 	}
 	return groups, nil
 }

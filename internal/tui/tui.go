@@ -340,6 +340,7 @@ func (m Model) EnterSetup(configPath string) Model {
 type loadedMsg struct {
 	groups []Group
 	err    error
+	seq    uint64 // issue-time load generation; stale results are dropped
 }
 
 type createdMsg struct {
@@ -395,10 +396,16 @@ func (m Model) scheduleStatusTick() tea.Cmd {
 	return tea.Tick(interval, func(time.Time) tea.Msg { return statusTickMsg{} })
 }
 
+// loadCmd issues one deck refresh. The generation stamp is taken at issue
+// time, so when several loads overlap (activate, then a quick stop, then a
+// refresh) only the newest one's result is applied — a slow stale scan can't
+// clobber fresher state.
 func (m Model) loadCmd() tea.Cmd {
+	ctrl := m.ctrl
+	seq := ctrl.loadSeq.Add(1)
 	return func() tea.Msg {
-		g, err := m.ctrl.Load()
-		return loadedMsg{groups: g, err: err}
+		g, err := ctrl.Load()
+		return loadedMsg{groups: g, err: err, seq: seq}
 	}
 }
 
@@ -496,6 +503,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case loadedMsg:
+		if msg.seq != m.ctrl.loadSeq.Load() {
+			return m, nil // superseded by a newer in-flight load
+		}
 		if msg.err != nil {
 			m.status = "load error: " + msg.err.Error()
 			return m, nil

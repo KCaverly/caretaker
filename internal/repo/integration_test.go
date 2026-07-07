@@ -66,6 +66,15 @@ func TestWorktreeLifecycle(t *testing.T) {
 		t.Fatalf("ListWorktrees = %+v", wts)
 	}
 
+	// Branch tip times: one call covers every branch.
+	tips, err := BranchTipTimes(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tips["main"] == 0 || tips["feat"] == 0 {
+		t.Fatalf("expected tip times for main and feat, got %v", tips)
+	}
+
 	// Status: clean, then dirty.
 	st, err := WorktreeStatus(wts[1])
 	if err != nil || st.Dirty {

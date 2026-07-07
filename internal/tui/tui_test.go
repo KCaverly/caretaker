@@ -378,6 +378,27 @@ func modelWithAgents(n int) Model {
 	return m
 }
 
+func TestStaleLoadDropped(t *testing.T) {
+	m := sampleModel()
+	first := m.ctrl.loadSeq.Add(1)  // an older in-flight load
+	latest := m.ctrl.loadSeq.Add(1) // superseded by this newer one
+
+	fresh := []Group{{Repo: repo.Repo{Name: "fresh"}}}
+	mm, _ := m.update(loadedMsg{groups: fresh, seq: latest})
+	m = mm.(Model)
+	if len(m.groups) != 1 || m.groups[0].Repo.Name != "fresh" {
+		t.Fatalf("latest load should apply, got %+v", m.groups)
+	}
+
+	// The older load finishes late; its result must not roll the deck back.
+	stale := []Group{{Repo: repo.Repo{Name: "stale"}}}
+	mm, _ = m.update(loadedMsg{groups: stale, seq: first})
+	m = mm.(Model)
+	if m.groups[0].Repo.Name != "fresh" {
+		t.Fatal("stale load result clobbered newer state")
+	}
+}
+
 func TestRotateAgentWraps(t *testing.T) {
 	m := modelWithAgents(3)
 
