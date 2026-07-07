@@ -120,6 +120,13 @@ func (m *Manager) signalDirty(s *Session) {
 	}
 }
 
+// Count returns the number of active workspaces.
+func (m *Manager) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.spaces)
+}
+
 // Has reports whether a workspace has live sessions.
 func (m *Manager) Has(key string) bool {
 	m.mu.Lock()

@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -107,20 +108,29 @@ func TestTabAtMapsIcons(t *testing.T) {
 func TestSelectTabGating(t *testing.T) {
 	m := sampleModel() // default screen is the picker
 
+	tab := func(m Model, s screen) Model {
+		mm, _ := m.selectTab(s)
+		return mm.(Model)
+	}
+
 	// Session tabs are ignored until a workspace is active.
-	if got := m.selectTab(screenEditor).(Model); got.screen != screenPicker {
+	if got := tab(m, screenEditor); got.screen != screenPicker {
 		t.Error("session tab should be ignored without an active workspace")
 	}
 
 	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w"}
-	if got := m.selectTab(screenEditor).(Model); got.screen != screenEditor {
+	if got := tab(m, screenEditor); got.screen != screenEditor {
 		t.Error("session tab should switch when a workspace is active")
 	}
 
-	// The picker tab is always reachable.
+	// The picker tab is always reachable, and entering it refreshes the deck.
 	m.screen = screenTerminal
-	if got := m.selectTab(screenPicker).(Model); got.screen != screenPicker {
+	mm, cmd := m.selectTab(screenPicker)
+	if mm.(Model).screen != screenPicker {
 		t.Error("picker tab should always be reachable")
+	}
+	if cmd == nil {
+		t.Error("entering the picker from a session should trigger a deck refresh")
 	}
 }
 
@@ -376,6 +386,50 @@ func modelWithAgents(n int) Model {
 	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: "/r/w", ws: ws}
 	m.screen = screenEditor
 	return m
+}
+
+func TestStatusTickInterval(t *testing.T) {
+	// Nothing hosted and nothing tracked: slow idle watch.
+	m := sampleModel()
+	if got := m.statusTickInterval(); got != 30*time.Second {
+		t.Errorf("empty deck interval = %v, want 30s", got)
+	}
+
+	// A busy agent (even one started outside ct) forces the fast cadence.
+	m.agentStatus = map[int]AgentStatus{7: {Status: "busy"}}
+	if got := m.statusTickInterval(); got != 2*time.Second {
+		t.Errorf("busy interval = %v, want 2s", got)
+	}
+
+	// Idle agents with a live workspace: the medium cadence.
+	m.agentStatus = map[int]AgentStatus{7: {Status: "idle"}}
+	if _, err := m.mgr.Activate("r/w", t.TempDir(),
+		[]session.Spec{{Kind: session.Terminal, Argv: []string{"sleep", "5"}}}, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	if got := m.statusTickInterval(); got != 5*time.Second {
+		t.Errorf("live-workspace idle interval = %v, want 5s", got)
+	}
+
+	// A pending background agent also forces the fast cadence.
+	m.bgAgentPIDs[123] = bgAgentMeta{}
+	if got := m.statusTickInterval(); got != 2*time.Second {
+		t.Errorf("bg-agent interval = %v, want 2s", got)
+	}
+}
+
+func TestPickerKeyRefreshesDeck(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenEditor
+
+	mm, cmd := m.handleKey(ctrlKey('g'))
+	if mm.(Model).screen != screenPicker {
+		t.Fatal("picker key should return to the deck")
+	}
+	if cmd == nil {
+		t.Error("returning to the deck should trigger a refresh")
+	}
 }
 
 func TestStaleLoadDropped(t *testing.T) {
@@ -699,7 +753,8 @@ func TestAttentionClearedOnAgentView(t *testing.T) {
 		2: {level: attnDone, key: "r/b"},
 	}
 	m3.current = &workspaceRef{key: "r/a", path: "/r/a", ws: ws}
-	m4 := m3.selectTab(screenAgent).(Model)
+	mm3, _ := m3.selectTab(screenAgent)
+	m4 := mm3.(Model)
 	if _, ok := m4.attention[1]; ok {
 		t.Error("r/a marker should clear on selectTab(agent)")
 	}

@@ -380,20 +380,31 @@ func (m Model) pollStatusCmd() tea.Cmd {
 	}
 }
 
-// scheduleStatusTick re-arms the poll timer, polling faster while any agent is
-// active (busy/waiting) and backing off when everything is idle.
+// scheduleStatusTick re-arms the poll timer at statusTickInterval.
 func (m Model) scheduleStatusTick() tea.Cmd {
+	return tea.Tick(m.statusTickInterval(), func(time.Time) tea.Msg { return statusTickMsg{} })
+}
+
+// statusTickInterval picks the agent-poll cadence: 2s while any agent is
+// active (busy/waiting) or a background agent is pending, 5s while ct hosts
+// idle sessions, and 30s when ct hosts nothing at all — the slow tick only
+// keeps a lazy watch for claude sessions started outside ct in known
+// worktrees, so their deck badges still appear (just up to 30s late) without
+// ct spawning a subprocess every 5s for an empty deck.
+func (m Model) statusTickInterval() time.Duration {
 	interval := 5 * time.Second
+	if (m.mgr == nil || m.mgr.Count() == 0) && len(m.bgAgentPIDs) == 0 {
+		interval = 30 * time.Second
+	}
 	for _, st := range m.agentStatus {
 		if st.Status == "busy" || st.Status == "waiting" {
-			interval = 2 * time.Second
-			break
+			return 2 * time.Second
 		}
 	}
 	if len(m.bgAgentPIDs) > 0 {
-		interval = 2 * time.Second
+		return 2 * time.Second
 	}
-	return tea.Tick(interval, func(time.Time) tea.Msg { return statusTickMsg{} })
+	return interval
 }
 
 // loadCmd issues one deck refresh. The generation stamp is taken at issue
@@ -1314,7 +1325,9 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if len(m.active) > 0 {
 			m.focus = focusActive
 		}
-		return m, nil
+		// Refresh the deck on entry: dirty markers and worktree lists go stale
+		// while you edit inside a session, and this is the moment they're read.
+		return m, m.loadCmd()
 	case m.keyNextAgent:
 		return m.rotateAgent(+1)
 	case m.keyPrevAgent:
@@ -1471,7 +1484,7 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	mo := msg.Mouse()
 	if mo.Button == tea.MouseLeft {
 		if s, ok := m.tabAt(mo.X, mo.Y); ok {
-			return m.selectTab(s), nil
+			return m.selectTab(s)
 		}
 		if m.notifZoneAt(mo.X, mo.Y) {
 			return m.openBoard()
@@ -1561,15 +1574,20 @@ func (m Model) deckClick(x, y int) (tea.Model, tea.Cmd, bool) {
 }
 
 // selectTab activates a clicked bar tab: the picker is always reachable; the
-// session tabs only switch when a workspace is active.
-func (m Model) selectTab(s screen) tea.Model {
+// session tabs only switch when a workspace is active. Switching to the
+// picker refreshes the deck, matching the picker key.
+func (m Model) selectTab(s screen) (tea.Model, tea.Cmd) {
 	if s == screenPicker || m.current != nil {
+		wasSession := m.screen != screenPicker
 		m.screen = s
 		if s == screenAgent && m.current != nil {
 			m.clearWorkspaceAttention()
 		}
+		if s == screenPicker && wasSession {
+			return m, m.loadCmd()
+		}
 	}
-	return m
+	return m, nil
 }
 
 // forwardMouse relays a mouse event to the active session (translated below the
