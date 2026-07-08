@@ -162,6 +162,11 @@ type Model struct {
 	current  *workspaceRef
 	helpOpen bool
 
+	// hintSeen records that the user has typed into a session at least once,
+	// which retires the one-line "f1 help" hint shown beneath session bodies.
+	// Reserved as a row until then (see sessionSize / sessionFooterH).
+	hintSeen bool
+
 	groups []Group
 
 	focus focus
@@ -424,7 +429,22 @@ func (m Model) repaintCmd() tea.Cmd {
 }
 
 func (m Model) sessionSize() (int, int) {
-	return m.width, max(1, m.height-barHeight)
+	return m.width, max(1, m.height-barHeight-m.sessionFooterH())
+}
+
+// dismissHint retires the session help hint on the user's first keystroke into
+// a session and hands the reclaimed row back to the workspace's sessions. It's
+// a no-op once the hint has already been dismissed.
+func (m Model) dismissHint() Model {
+	if m.hintSeen {
+		return m
+	}
+	m.hintSeen = true
+	if m.current != nil {
+		w, h := m.sessionSize()
+		m.mgr.ResizeWorkspace(m.current.key, w, h)
+	}
+	return m
 }
 
 func (m Model) activeSession() *session.Session {
@@ -1356,6 +1376,7 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if s := m.activeSession(); s != nil {
+		m = m.dismissHint()
 		s.SendKey(toUVKey(msg))
 	}
 	return m, nil

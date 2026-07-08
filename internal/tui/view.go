@@ -65,13 +65,15 @@ func (m Model) View() tea.View {
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
-		body, cursor = m.renderTermPanes(w, h-barHeight)
+		body, cursor = m.renderTermPanes(w, h-barHeight-m.sessionFooterH())
+		body = m.appendSessionFooter(body)
 	default:
 		if s := m.activeSession(); s != nil {
 			body = s.Render()
 			if x, y, visible := s.Cursor(); visible {
 				cursor = tea.NewCursor(x, y+barHeight)
 			}
+			body = m.appendSessionFooter(body)
 		}
 	}
 
@@ -88,6 +90,7 @@ const (
 	iconEditor = ""          // fa-code (U+F121)     — nvim
 	iconAgent  = "󰚩"          // md-robot (U+F06A9)   — claude
 	iconTerm   = ""          // fa-terminal (U+F120) — term
+	iconPanes  = "\U0000F009" // fa-th-large (U+F009) — the split-pane grid
 )
 
 // renderBar draws the pinned status bar plus a light separator directly
@@ -143,7 +146,7 @@ func (m Model) renderNotifZone() string {
 // barContextLabel builds the bar's right-side workspace context: the
 // "repo / worktree" label, preceded by the agent pool position
 // ("2/3 label ·") on the agent screen when the workspace has more than one
-// agent, and the pane position ("⊞ 2/3 ·", plus "zoom" while zoomed) on the
+// agent, and the pane position (grid glyph + "2/3 ·", plus "zoom" while zoomed) on the
 // terminal screen with splits. Each volatile segment shows only on the screen
 // it steers, so the bar never advertises a position the current keys can't
 // change. Both segments sit to the left because they hot-swap
@@ -164,7 +167,7 @@ func (m Model) barContextLabel() string {
 	}
 	sep := dimStyle.Render(" · ")
 	if m.screen == screenTerminal && len(ws.Terms) > 1 {
-		pane := fmt.Sprintf("⊞ %d/%d", clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
+		pane := fmt.Sprintf("%s %d/%d", iconPanes, clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
 		if ws.TermZoomed {
 			pane += " zoom"
 		}
@@ -713,6 +716,56 @@ func centerBlock(block string, w, h int) string {
 
 func (m Model) renderFooter() string {
 	return m.centerFooter(m.footerContent())
+}
+
+// sessionFooterH is the number of rows reserved beneath a session body for the
+// one-line help hint: one until the user's first keystroke into a session,
+// zero after (see hintSeen). It is intentionally screen-independent so the
+// reserved size is stable across every session view — sessionSize is queried
+// before the target screen is even set.
+func (m Model) sessionFooterH() int {
+	if m.hintSeen {
+		return 0
+	}
+	return 1
+}
+
+// appendSessionFooter tacks the help hint onto a session body while it is still
+// reserved. The body was already rendered a row shorter (sessionSize subtracts
+// sessionFooterH), so the combined height matches the non-hint case exactly.
+func (m Model) appendSessionFooter(body string) string {
+	if m.sessionFooterH() == 0 {
+		return body
+	}
+	return body + "\n" + m.sessionFooter()
+}
+
+// sessionFooter builds the dim one-line hint shown beneath a session until the
+// user first types. It always leads with the help key (which opens the full
+// overlay) and, on the terminal screen, surfaces the pane-management keys the
+// hint mainly exists to teach. Trailing hints are dropped rather than wrapped
+// so the line always fits the single reserved row.
+func (m Model) sessionFooter() string {
+	hints := []string{keyhint(m.keyHelp, "help")}
+	if m.screen == screenTerminal {
+		hints = append(hints,
+			keyhint(m.keyTermSplitV+" "+m.keyTermSplitH, "split"),
+			keyhint(m.keyTermCycle, "cycle pane"),
+			keyhint(m.keyTermZoom, "zoom"),
+			keyhint(m.keyTermClose, "close"))
+	} else {
+		hints = append(hints,
+			keyhint(m.keyCycle, "cycle view"),
+			keyhint(m.keyPicker, "deck"))
+	}
+	sep := helpStyle.Render("  ·  ")
+	for n := len(hints); n >= 1; n-- {
+		line := "  " + strings.Join(hints[:n], sep)
+		if lipgloss.Width(line) <= m.width {
+			return line
+		}
+	}
+	return "  " + hints[0]
 }
 
 // footerContent builds the two-row footer (status line + help line) before

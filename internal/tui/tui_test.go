@@ -925,3 +925,45 @@ func TestAttentionSweepOnPidReuse(t *testing.T) {
 		t.Errorf("marker for a pid whose StartedAt matches should survive, got %+v ok=%v", e, ok)
 	}
 }
+
+// TestSessionHelpHint covers the one-line help hint shown beneath a session
+// until the user's first keystroke: it reserves a row, names the help and
+// pane keys, and is retired (row reclaimed) once a key reaches the session.
+func TestSessionHelpHint(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenTerminal
+
+	// Fresh session: the hint reserves exactly one row of the viewport.
+	if got := m.sessionFooterH(); got != 1 {
+		t.Fatalf("fresh session should reserve one hint row, got %d", got)
+	}
+	if _, h := m.sessionSize(); h != m.height-barHeight-1 {
+		t.Errorf("session height should drop the hint row, got %d want %d", h, m.height-barHeight-1)
+	}
+
+	// On the terminal screen it leads with the help key and surfaces panelling.
+	foot := m.sessionFooter()
+	for _, want := range []string{m.keyHelp, "help", "split", "zoom"} {
+		if !strings.Contains(foot, want) {
+			t.Errorf("terminal footer missing %q:\n%s", want, foot)
+		}
+	}
+
+	// appendSessionFooter adds exactly the reserved row while the hint is live.
+	body := "a\nb"
+	if got, want := strings.Count(m.appendSessionFooter(body), "\n"), strings.Count(body, "\n")+1; got != want {
+		t.Errorf("appended footer newline count = %d, want %d", got, want)
+	}
+
+	// First keystroke into the session retires the hint and reclaims the row.
+	m2 := m.dismissHint()
+	if got := m2.sessionFooterH(); got != 0 {
+		t.Errorf("dismissed hint should reserve no rows, got %d", got)
+	}
+	if _, h := m2.sessionSize(); h != m2.height-barHeight {
+		t.Errorf("session should reclaim the row after dismiss, got %d want %d", h, m2.height-barHeight)
+	}
+	if got := m2.appendSessionFooter(body); got != body {
+		t.Errorf("dismissed hint should append nothing, got %q", got)
+	}
+}

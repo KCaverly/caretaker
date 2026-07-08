@@ -67,11 +67,12 @@ func TestBarShowsAgentPoolPosition(t *testing.T) {
 		t.Errorf("agent position should precede the repo / worktree label:\n%s", bar)
 	}
 
-	// The position stays visible from other screens (it advertises the
-	// prev/next-agent keys), still labelled with the focused agent.
+	// The position is agent-screen context (it advertises the prev/next-agent
+	// keys); other screens omit it so the bar never shows a position the
+	// current keys can't change.
 	m.screen = screenEditor
-	if bar := barLine(t, m); !strings.Contains(bar, "2/3") {
-		t.Errorf("agent position should stay visible on the editor screen:\n%s", bar)
+	if bar := barLine(t, m); strings.Contains(bar, "2/3") {
+		t.Errorf("agent position should not appear off the agent screen:\n%s", bar)
 	}
 
 	// A single-agent pool renders no position — nothing to rotate through.
@@ -99,7 +100,7 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 	}
 	// Like the agent segment, the pane segment sits to the left of the
 	// right-anchored "repo / worktree" label.
-	if strings.Index(bar, "⊞") > strings.Index(bar, "r / w") {
+	if strings.Index(bar, iconPanes) > strings.Index(bar, "r / w") {
 		t.Errorf("pane position should precede the repo / worktree label:\n%s", bar)
 	}
 	if strings.Contains(bar, "zoom") {
@@ -113,7 +114,7 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 
 	// Pane position is terminal-screen context; other screens omit it.
 	m.screen = screenEditor
-	if bar := barLine(t, m); strings.Contains(bar, "⊞") {
+	if bar := barLine(t, m); strings.Contains(bar, iconPanes) {
 		t.Errorf("pane indicator should not appear off the terminal screen:\n%s", bar)
 	}
 }
