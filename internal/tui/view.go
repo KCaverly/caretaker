@@ -142,9 +142,11 @@ func (m Model) renderNotifZone() string {
 
 // barContextLabel builds the bar's right-side workspace context: the
 // "repo / worktree" label, preceded by the agent pool position
-// ("2/3 label ·") whenever the workspace has more than one agent, and the
-// pane position ("⊞ 2/3 ·", plus "zoom" while zoomed) on the terminal screen
-// with splits. Both volatile segments sit to the left because they hot-swap
+// ("2/3 label ·") on the agent screen when the workspace has more than one
+// agent, and the pane position ("⊞ 2/3 ·", plus "zoom" while zoomed) on the
+// terminal screen with splits. Each volatile segment shows only on the screen
+// it steers, so the bar never advertises a position the current keys can't
+// change. Both segments sit to the left because they hot-swap
 // far more often than the worktree — keeping the repo / worktree label
 // anchored at the right edge while agents and panes rotate. It surfaces
 // state that is otherwise invisible — which agent is focused, how many exist,
@@ -168,16 +170,12 @@ func (m Model) barContextLabel() string {
 		}
 		s = lipgloss.NewStyle().Foreground(cAccent).Render(pane) + sep + s
 	}
-	if n := len(ws.Agents); n > 1 {
+	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
 		if a := ws.ActiveAgentSession(); a != nil {
 			pos += " " + truncateTo(agentTitle(a.Title), 14)
 		}
-		st := dimStyle
-		if m.screen == screenAgent {
-			st = lipgloss.NewStyle().Foreground(cPurple)
-		}
-		s = st.Render(pos) + sep + s
+		s = lipgloss.NewStyle().Foreground(cPurple).Render(pos) + sep + s
 	}
 	return s
 }
