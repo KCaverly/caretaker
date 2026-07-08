@@ -84,11 +84,12 @@ func (m Model) View() tea.View {
 
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
-	iconDeck   = "" // fa-smile (U+F118)    — tending the deck (picker)
-	iconAway   = "󰚌" // md-skull (U+F068C)   — away in a session
-	iconEditor = "" // fa-code (U+F121)     — nvim
-	iconAgent  = "󰚩" // md-robot (U+F06A9)   — claude
-	iconTerm   = "" // fa-terminal (U+F120) — term
+	iconDeck    = "" // fa-smile (U+F118)    — tending the deck (picker)
+	iconAway    = "󰚌" // md-skull (U+F068C)   — away in a session
+	iconWorried = "" // fa-frown (U+F119)    — an agent is waiting on input
+	iconEditor  = "" // fa-code (U+F121)     — nvim
+	iconAgent   = "󰚩" // md-robot (U+F06A9)   — claude
+	iconTerm    = "" // fa-terminal (U+F120) — term
 )
 
 // renderBar draws the pinned status bar plus a light separator directly
@@ -210,10 +211,16 @@ func (m Model) barZones() []barZone {
 		}
 	}
 
-	// Caretaker: smiley (tending the deck) vs skull (away in a session).
+	// Caretaker: smiley while tending the deck, skull while away in a session
+	// — and a worried face overriding both whenever an agent you're not
+	// watching is waiting on input. The face answers "does anything need me?"
+	// at a glance, agreeing with the ! badge on the right.
 	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
 	if m.screen != screenPicker {
 		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
+	}
+	if waiting, _, _ := m.attnSummary(); waiting > 0 {
+		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconWorried)
 	}
 
 	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
@@ -641,6 +648,7 @@ func (m Model) renderHelp(h int) string {
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
+		"  "+faceLegend(),
 		"",
 		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keyHelp)+
 			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
@@ -667,6 +675,15 @@ func markLegend() string {
 	return strings.Join([]string{
 		dirtyStyle.Render("✷") + helpStyle.Render(" uncommitted"),
 		recentStyle.Render("1 2 3") + helpStyle.Render(" recently opened"),
+	}, helpStyle.Render("   "))
+}
+
+// faceLegend explains the caretaker's bar faces.
+func faceLegend() string {
+	return strings.Join([]string{
+		lipgloss.NewStyle().Foreground(cYellow).Render(iconDeck) + helpStyle.Render(" tending the deck"),
+		lipgloss.NewStyle().Foreground(cRed).Render(iconAway) + helpStyle.Render(" in a session"),
+		lipgloss.NewStyle().Foreground(cRed).Render(iconWorried) + helpStyle.Render(" agent waiting"),
 	}, helpStyle.Render("   "))
 }
 
