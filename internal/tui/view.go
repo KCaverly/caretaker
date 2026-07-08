@@ -123,11 +123,11 @@ func (m Model) renderBar() string {
 }
 
 // renderNotifZone builds the right-side attention summary: "! N" (red) for
-// worktrees where an agent is waiting on input, "* N" (green) for worktrees
-// with unread completions, "@ N" (blue) for unread background-agent messages.
-// Returns "" when nothing is pending. Clicking it opens the agent board.
+// worktrees where an agent is waiting on input and "* N" (green) for worktrees
+// with unread completions. Returns "" when nothing is pending. Clicking it
+// opens the agent board.
 func (m Model) renderNotifZone() string {
-	waiting, done, msgs := m.attnSummary()
+	waiting, done := m.attnSummary()
 	var parts []string
 	if waiting > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")+
@@ -136,10 +136,6 @@ func (m Model) renderNotifZone() string {
 	if done > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")+
 			" "+countStyle.Render(strconv.Itoa(done)))
-	}
-	if msgs > 0 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("@")+
-			" "+countStyle.Render(strconv.Itoa(msgs)))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -175,7 +171,7 @@ func (m Model) barContextLabel() string {
 	if n := len(ws.Agents); n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
 		if a := ws.ActiveAgentSession(); a != nil {
-			pos += " " + truncateTo(m.agentDisplayTitle(a.Pid(), a.Title), 14)
+			pos += " " + truncateTo(agentTitle(a.Title), 14)
 		}
 		st := dimStyle
 		if m.screen == screenAgent {
@@ -332,7 +328,7 @@ func (m Model) renderBoard(h int) string {
 }
 
 // boardAgentLine renders one agent row: quick-jump number, attention glyph,
-// label, and the right-aligned (truncated) status/preview column.
+// label, and the right-aligned (truncated) status column.
 func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	numCol := " "
 	if r.num > 0 {
@@ -342,8 +338,6 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	switch r.attn {
 	case attnWaiting:
 		glyph, glyphSt = "!", lipgloss.NewStyle().Foreground(cRed).Bold(true)
-	case attnMessage:
-		glyph, glyphSt = "@", lipgloss.NewStyle().Foreground(cAccent).Bold(true)
 	case attnDone:
 		glyph, glyphSt = "*", lipgloss.NewStyle().Foreground(cGreen).Bold(true)
 	}
@@ -569,9 +563,6 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	case attnWaiting:
 		notifChar = "!"
 		notifSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
-	case attnMessage:
-		notifChar = "@"
-		notifSt = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
 	case attnDone:
 		notifChar = "*"
 		notifSt = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
@@ -664,7 +655,6 @@ func statusLegend() string {
 		dimStyle.Render("○") + helpStyle.Render(" stopped"),
 		lipgloss.NewStyle().Foreground(cRed).Render("!") + helpStyle.Render(" waiting"),
 		lipgloss.NewStyle().Foreground(cGreen).Render("*") + helpStyle.Render(" done"),
-		lipgloss.NewStyle().Foreground(cAccent).Render("@") + helpStyle.Render(" message"),
 	}, helpStyle.Render("   "))
 }
 

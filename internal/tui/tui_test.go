@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -412,12 +411,6 @@ func TestStatusTickInterval(t *testing.T) {
 	if got := m.statusTickInterval(); got != 5*time.Second {
 		t.Errorf("live-workspace idle interval = %v, want 5s", got)
 	}
-
-	// A pending background agent also forces the fast cadence.
-	m.bgAgentPIDs[123] = bgAgentMeta{}
-	if got := m.statusTickInterval(); got != 2*time.Second {
-		t.Errorf("bg-agent interval = %v, want 2s", got)
-	}
 }
 
 func TestPickerKeyRefreshesDeck(t *testing.T) {
@@ -578,12 +571,12 @@ func TestQuickPromptOpensForm(t *testing.T) {
 func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m := modelWithAgents(1)
 	m = m.openNewAgentForm().(Model)
-	if m.formFocus != formFieldLabel || m.formLocation != 0 || m.formBackground {
+	if m.formFocus != formFieldPrompt || m.formLocation != 0 || m.formBackground {
 		t.Fatalf("form defaults: focus=%d loc=%d bg=%v", m.formFocus, m.formLocation, m.formBackground)
 	}
 
-	// Tab cycles label → prompt → where → mode → label.
-	for _, want := range []int{formFieldPrompt, formFieldWhere, formFieldMode, formFieldLabel} {
+	// Tab cycles prompt → where → mode → prompt.
+	for _, want := range []int{formFieldWhere, formFieldMode, formFieldPrompt} {
 		mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab})
 		m = mm.(Model)
 		if m.formFocus != want {
@@ -591,15 +584,8 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 		}
 	}
 
-	// Enter on the label field advances to the prompt instead of launching.
-	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m = mm.(Model)
-	if m.formFocus != formFieldPrompt || !m.formOpen {
-		t.Fatalf("enter on label should advance to prompt: focus=%d open=%v", m.formFocus, m.formOpen)
-	}
-
 	// Space on the where/mode rows flips the toggles.
-	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // → where
+	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // prompt → where
 	m = mm.(Model)
 	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
 	m = mm.(Model)
@@ -725,10 +711,10 @@ func TestAttentionPrecedence(t *testing.T) {
 	}
 
 	// recordAttention never downgrades a stored marker.
-	m.attention[3] = attnEntry{level: attnMessage, key: "~/config", preview: "hi"}
-	m.recordAttention(3, attnDone, "~/config", "", 0)
-	if e := m.attention[3]; e.level != attnMessage || e.preview != "hi" {
-		t.Errorf("recordAttention must not downgrade message → done, got %+v", e)
+	m.attention[3] = attnEntry{level: attnWaiting, key: "~/config"}
+	m.recordAttention(3, attnDone, "~/config", 0)
+	if e := m.attention[3]; e.level != attnWaiting {
+		t.Errorf("recordAttention must not downgrade waiting → done, got %+v", e)
 	}
 }
 
@@ -914,26 +900,6 @@ func TestBoardSortsAttentionFirst(t *testing.T) {
 	}
 	if _, ok := m2.attention[pid]; ok {
 		t.Error("focusing the agent should clear its unread marker")
-	}
-}
-
-// TestLastMeaningfulLinesRuneSafe verifies truncation cuts on rune boundaries,
-// not byte offsets, so a long run of multibyte characters isn't split mid-rune.
-func TestLastMeaningfulLinesRuneSafe(t *testing.T) {
-	long := strings.Repeat("é", 150) // multibyte well past the 120 mark
-	rendered := "first line\n\n" + long + "\n\n"
-
-	got := lastMeaningfulLines(rendered)
-
-	if !utf8.ValidString(got) {
-		t.Fatalf("truncated line is not valid UTF-8: %q", got)
-	}
-	if !strings.HasSuffix(got, "…") {
-		t.Fatalf("truncated line should end with an ellipsis, got %q", got)
-	}
-	wantRunes := 120
-	if n := utf8.RuneCountInString(strings.TrimSuffix(got, "…")); n != wantRunes {
-		t.Fatalf("expected %d runes before the ellipsis, got %d (%q)", wantRunes, n, got)
 	}
 }
 

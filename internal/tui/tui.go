@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,23 +92,21 @@ const (
 
 // attnLevel ranks an agent's attention state, highest first when sorting.
 // attnWaiting is derived live from the polled agent status and never stored;
-// attnDone and attnMessage are unread markers recorded when a transition is
-// observed and cleared when the user views the workspace's agents.
+// attnDone is an unread marker recorded when a transition is observed and
+// cleared when the user views the workspace's agents.
 type attnLevel int
 
 const (
 	attnNone    attnLevel = iota // nothing pending
 	attnDone                     // busy → idle while unviewed (*)
-	attnMessage                  // background home agent completed, preview attached (@)
 	attnWaiting                  // live status "waiting" — needs input/permission (!)
 )
 
-// attnEntry is one stored unread marker (attnDone or attnMessage) for an agent,
-// keyed by pid in Model.attention.
+// attnEntry is one stored unread marker (attnDone) for an agent, keyed by pid
+// in Model.attention.
 type attnEntry struct {
 	level     attnLevel
 	key       string // workspace key the agent belongs to
-	preview   string // attnMessage: last meaningful line scraped at completion
 	startedAt int64  // unix ms of the owning process's start, from AgentStatus.StartedAt; 0 = unknown
 }
 
@@ -125,27 +124,18 @@ type boardRow struct {
 	agentIdx int // index in ws.Agents
 	pid      int
 	label    string    // display name
-	status   string    // right-hand status/preview column
+	status   string    // right-hand status column
 	attn     attnLevel // includes derived waiting
 	num      int       // 1-based quick-jump number (first 9 agent rows)
 }
 
 // Focus order of the new-agent form's fields.
 const (
-	formFieldLabel = iota
-	formFieldPrompt
+	formFieldPrompt = iota
 	formFieldWhere
 	formFieldMode
 	formFieldCount
 )
-
-// bgAgentMeta tracks a background home-worktree agent launched via the
-// new-agent form, pending completion.
-type bgAgentMeta struct {
-	label    string
-	homeKey  string
-	homePath string
-}
 
 // activeItem is a worktree shown in the "active" section, with its owning repo.
 type activeItem struct {
@@ -200,7 +190,6 @@ type Model struct {
 	// agent board overlay (unified agent switcher + notifications)
 	boardOpen   bool
 	boardCursor int // index into the board's navigable rows
-	agentName   textinput.Model
 	rootInput   textinput.Model
 
 	// live agent statuses from `claude agents --json`, keyed by pid
@@ -209,15 +198,12 @@ type Model struct {
 	busySince       map[int]time.Time // pid → when its current busy stretch began
 	pollFails       int               // consecutive status-poll failures, for the one-shot notice
 
-	// stored unread markers (done/message) keyed by agent pid; waiting badges
-	// are derived live from agentStatus and never stored here
+	// stored unread markers (done) keyed by agent pid; waiting badges are
+	// derived live from agentStatus and never stored here
 	attention map[int]attnEntry
 
 	// prompt input for the board's new-agent form
 	promptInput textinput.Model
-
-	// background home-agent tracking
-	bgAgentPIDs map[int]bgAgentMeta // PIDs of home-mode agents pending completion
 
 	// home workspace path/key, cached on first open for pathToKey lookups
 	homeWSPath string
@@ -225,7 +211,7 @@ type Model struct {
 
 	// new-agent form (sub-state of the agent board)
 	formOpen       bool
-	formFocus      int  // formFieldLabel..formFieldMode
+	formFocus      int  // formFieldPrompt..formFieldMode
 	formLocation   int  // 0 = active worktree, 1 = home worktree
 	formBackground bool // false = foreground (default), true = background
 
@@ -262,10 +248,6 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	name := textinput.New()
 	name.Placeholder = "branch-name"
 	name.Prompt = "› "
-
-	agentName := textinput.New()
-	agentName.Placeholder = "task label (optional)"
-	agentName.Prompt = "› "
 
 	rootInput := textinput.New()
 	rootInput.Placeholder = "~/repos"
@@ -333,12 +315,11 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyPrompt:     prompt,
 		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
-		filter: filter, nameInput: name, agentName: agentName, rootInput: rootInput,
+		filter: filter, nameInput: name, rootInput: rootInput,
 		promptInput:     promptInput,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
 		attention:       map[int]attnEntry{},
-		bgAgentPIDs:     make(map[int]bgAgentMeta),
 	}
 }
 
@@ -402,23 +383,20 @@ func (m Model) scheduleStatusTick() tea.Cmd {
 }
 
 // statusTickInterval picks the agent-poll cadence: 2s while any agent is
-// active (busy/waiting) or a background agent is pending, 5s while ct hosts
-// idle sessions, and 30s when ct hosts nothing at all — the slow tick only
-// keeps a lazy watch for claude sessions started outside ct in known
-// worktrees, so their deck badges still appear (just up to 30s late) without
-// ct spawning a subprocess every 5s for an empty deck.
+// active (busy/waiting), 5s while ct hosts idle sessions, and 30s when ct hosts
+// nothing at all — the slow tick only keeps a lazy watch for claude sessions
+// started outside ct in known worktrees, so their deck badges still appear
+// (just up to 30s late) without ct spawning a subprocess every 5s for an empty
+// deck.
 func (m Model) statusTickInterval() time.Duration {
 	interval := 5 * time.Second
-	if (m.mgr == nil || m.mgr.Count() == 0) && len(m.bgAgentPIDs) == 0 {
+	if m.mgr == nil || m.mgr.Count() == 0 {
 		interval = 30 * time.Second
 	}
 	for _, st := range m.agentStatus {
 		if st.Status == "busy" || st.Status == "waiting" {
 			return 2 * time.Second
 		}
-	}
-	if len(m.bgAgentPIDs) > 0 {
-		return 2 * time.Second
 	}
 	return interval
 }
@@ -579,9 +557,6 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pollFails = 0
 			bell := false
 			for pid, st := range msg.byPid {
-				if _, isBg := m.bgAgentPIDs[pid]; isBg {
-					continue // background completions are handled below
-				}
 				prev := m.agentPrevStatus[pid]
 				if prev != "busy" || (st.Status != "idle" && st.Status != "waiting") {
 					continue
@@ -595,7 +570,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					continue
 				}
 				if key, ok := m.pathToKey(st.Cwd); ok {
-					m.recordAttention(pid, attnDone, key, "", st.StartedAt)
+					m.recordAttention(pid, attnDone, key, st.StartedAt)
 					bell = true
 				}
 			}
@@ -606,35 +581,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if _, stillTracked := msg.byPid[pid]; stillTracked {
 					continue
 				}
-				if _, isBg := m.bgAgentPIDs[pid]; isBg {
-					continue // handled in the bg loop below
-				}
 				if prev != "busy" {
 					continue
 				}
 				if last, ok := m.agentStatus[pid]; ok {
 					if key, ok := m.pathToKey(last.Cwd); ok {
-						m.recordAttention(pid, attnDone, key, "", last.StartedAt)
+						m.recordAttention(pid, attnDone, key, last.StartedAt)
 						bell = true
 					}
-				}
-			}
-			// Detect background home-agent completions.
-			for pid, meta := range m.bgAgentPIDs {
-				newSt, stillTracked := msg.byPid[pid]
-				prev := m.agentPrevStatus[pid]
-				completed := false
-				if stillTracked && newSt.Status == "idle" && (prev == "busy" || prev == "waiting") {
-					completed = true
-				} else if !stillTracked && (prev == "busy" || prev == "waiting") {
-					// Agent disappeared from claude agents list — treat as completed.
-					completed = true
-				}
-				if completed {
-					preview := m.scrapeBgAgentPreview(pid, meta)
-					m.attention[pid] = attnEntry{level: attnMessage, key: meta.homeKey, preview: preview, startedAt: m.agentStatus[pid].StartedAt}
-					delete(m.bgAgentPIDs, pid)
-					bell = true
 				}
 			}
 			if bell {
@@ -715,11 +669,6 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.nameInput, cmd = m.nameInput.Update(msg)
 			cmds = append(cmds, cmd)
 		}
-		if m.agentName.Focused() {
-			var cmd tea.Cmd
-			m.agentName, cmd = m.agentName.Update(msg)
-			cmds = append(cmds, cmd)
-		}
 		if m.rootInput.Focused() {
 			var cmd tea.Cmd
 			m.rootInput, cmd = m.rootInput.Update(msg)
@@ -744,11 +693,11 @@ func (m Model) watchingAgent(pid int) bool {
 
 // recordAttention stores an unread marker for pid unless an equal or higher one
 // is already recorded.
-func (m Model) recordAttention(pid int, level attnLevel, key, preview string, startedAt int64) {
+func (m Model) recordAttention(pid int, level attnLevel, key string, startedAt int64) {
 	if cur, ok := m.attention[pid]; ok && cur.level >= level {
 		return
 	}
-	m.attention[pid] = attnEntry{level: level, key: key, preview: preview, startedAt: startedAt}
+	m.attention[pid] = attnEntry{level: level, key: key, startedAt: startedAt}
 }
 
 // clearWorkspaceAttention drops the stored unread markers for every agent in
@@ -798,9 +747,9 @@ func (m Model) worktreeAttn(key string) attnLevel {
 	return level
 }
 
-// attnSummary counts, for the bar badge: worktrees with a live-waiting agent,
-// worktrees with unread completions, and unread background messages.
-func (m Model) attnSummary() (waiting, done, msgs int) {
+// attnSummary counts, for the bar badge: worktrees with a live-waiting agent
+// and worktrees with unread completions.
+func (m Model) attnSummary() (waiting, done int) {
 	waitKeys := map[string]bool{}
 	for pid, st := range m.agentStatus {
 		if st.Status != "waiting" || m.watchingAgent(pid) {
@@ -812,14 +761,11 @@ func (m Model) attnSummary() (waiting, done, msgs int) {
 	}
 	doneKeys := map[string]bool{}
 	for _, e := range m.attention {
-		switch e.level {
-		case attnDone:
+		if e.level == attnDone {
 			doneKeys[e.key] = true
-		case attnMessage:
-			msgs++
 		}
 	}
-	return len(waitKeys), len(doneKeys), msgs
+	return len(waitKeys), len(doneKeys)
 }
 
 // buildBoard constructs the agent board: every agent of every open workspace,
@@ -857,7 +803,7 @@ func (m Model) buildBoard() (rows []boardRow, nav []int) {
 			attn := m.agentAttn(pid)
 			g.agents = append(g.agents, boardRow{
 				isAgent: true, key: key, repo: repoName, worktree: wtName, path: path,
-				agentIdx: i, pid: pid, label: m.agentDisplayTitle(pid, a.Title),
+				agentIdx: i, pid: pid, label: agentTitle(a.Title),
 				status: m.boardStatus(pid, attn), attn: attn,
 			})
 			if attn > g.attn {
@@ -913,15 +859,9 @@ func (m Model) buildBoard() (rows []boardRow, nav []int) {
 	return rows, nav
 }
 
-// boardStatus renders the right-hand column for an agent row: the message
-// preview for background completions, otherwise the live polled status.
+// boardStatus renders the right-hand column for an agent row: the live polled
+// status.
 func (m Model) boardStatus(pid int, attn attnLevel) string {
-	if attn == attnMessage {
-		if p := m.attention[pid].preview; p != "" {
-			return p
-		}
-		return "done"
-	}
 	st := m.agentStatus[pid]
 	switch st.Status {
 	case "busy":
@@ -1080,20 +1020,19 @@ func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
 
 // openNewAgentForm switches the board into the new-agent form with defaults:
 // active worktree (home when no workspace is active), foreground, focus on the
-// label field.
+// prompt field. Agents are no longer manually named — claude names the session
+// after its topic — so the form opens straight on the prompt.
 func (m Model) openNewAgentForm() tea.Model {
 	m.boardOpen = true
 	m.formOpen = true
-	m.formFocus = formFieldLabel
+	m.formFocus = formFieldPrompt
 	m.formLocation = 0
 	if m.current == nil {
 		m.formLocation = 1
 	}
 	m.formBackground = false
-	m.agentName.SetValue("")
 	m.promptInput.SetValue("")
-	m.promptInput.Blur()
-	m.agentName.Focus()
+	m.promptInput.Focus()
 	return m
 }
 
@@ -1103,35 +1042,27 @@ func (m Model) openQuickPrompt() (tea.Model, tea.Cmd) {
 	mm := m.openNewAgentForm().(Model)
 	mm.formLocation = 1
 	mm.formBackground = true
-	mm.formFocus = formFieldPrompt
-	mm.agentName.Blur()
 	return mm, mm.promptInput.Focus()
 }
 
 // setFormFocus moves the new-agent form's focus to field f (wrapping), keeping
-// the text inputs' focus state in sync.
+// the prompt input's focus state in sync.
 func (m Model) setFormFocus(f int) (Model, tea.Cmd) {
 	m.formFocus = ((f % formFieldCount) + formFieldCount) % formFieldCount
-	m.agentName.Blur()
 	m.promptInput.Blur()
-	switch m.formFocus {
-	case formFieldLabel:
-		return m, m.agentName.Focus()
-	case formFieldPrompt:
+	if m.formFocus == formFieldPrompt {
 		return m, m.promptInput.Focus()
 	}
 	return m, nil
 }
 
 // handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓) move between
-// the label, prompt, where, and mode fields; space or ←/→ flip the focused
-// toggle; enter launches — except on the label field, where it advances to the
-// prompt so the old label→prompt→launch muscle memory still works.
+// the prompt, where, and mode fields; space or ←/→ flip the focused toggle;
+// enter launches from any field.
 func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.formOpen = false
-		m.agentName.Blur()
 		m.promptInput.Blur()
 		return m, nil
 	case "tab", "down":
@@ -1139,17 +1070,9 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab", "up":
 		return m.setFormFocus(m.formFocus - 1)
 	case "enter":
-		if m.formFocus == formFieldLabel {
-			return m.setFormFocus(formFieldPrompt)
-		}
 		return m.launchAgent()
 	}
-	switch m.formFocus {
-	case formFieldLabel:
-		var cmd tea.Cmd
-		m.agentName, cmd = m.agentName.Update(msg)
-		return m, cmd
-	case formFieldPrompt:
+	if m.formFocus == formFieldPrompt {
 		var cmd tea.Cmd
 		m.promptInput, cmd = m.promptInput.Update(msg)
 		return m, cmd
@@ -1165,48 +1088,28 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// agentDisplayTitle resolves what to call an agent in the board and status
-// bar: the user's own label wins, then the live session name from the status
-// poll (claude's one-line topic summary when the user didn't name it), then
-// the plain "claude" placeholder until the first poll lands.
-func (m Model) agentDisplayTitle(pid int, label string) string {
-	if label != "" {
-		return label
-	}
-	if st, ok := m.agentStatus[pid]; ok && st.Name != "" {
-		return st.Name
-	}
-	return agentTitle(label)
+// Agents the user doesn't name get a random adjective-noun title (e.g.
+// "amber-fox") — a stable, recognisable placeholder until a future change
+// summarises the conversation into something descriptive.
+var promptAdjectives = []string{
+	"amber", "bold", "calm", "deft", "eager", "fast", "grand", "hazy",
+	"idle", "jade", "keen", "lazy", "mild", "nimble", "odd", "proud",
+	"quick", "rare", "shy", "tame", "umber", "vivid", "warm", "young",
+	"zany", "brave", "crisp", "dark", "fleet", "grey",
 }
 
-// scrapeBgAgentPreview extracts the last meaningful line(s) from a background
-// agent's terminal screen to use as a notification preview.
-func (m Model) scrapeBgAgentPreview(pid int, meta bgAgentMeta) string {
-	ws, ok := m.mgr.Workspace(meta.homeKey)
-	if !ok {
-		return ""
-	}
-	for _, a := range ws.Agents {
-		if a.Pid() == pid {
-			return lastMeaningfulLines(a.Render())
-		}
-	}
-	return ""
+var promptNouns = []string{
+	"badger", "cedar", "drift", "ember", "falcon", "grove", "haven",
+	"inlet", "jasper", "kelp", "lantern", "moth", "nebula", "otter",
+	"pine", "quartz", "raven", "stone", "tide", "vale", "willow",
+	"fox", "creek", "dune", "fern", "gust", "hawk", "iris", "juniper",
+	"kestrel", "larch",
 }
 
-// lastMeaningfulLines walks a rendered terminal screen backwards and returns
-// the last non-empty line, truncated to 120 runes.
-func lastMeaningfulLines(rendered string) string {
-	lines := splitLines(rendered)
-	for i := len(lines) - 1; i >= 0; i-- {
-		if ln := strings.TrimSpace(lines[i]); ln != "" {
-			if runes := []rune(ln); len(runes) > 120 {
-				ln = string(runes[:120]) + "…"
-			}
-			return ln
-		}
-	}
-	return ""
+func randomAgentTitle() string {
+	adj := promptAdjectives[rand.Intn(len(promptAdjectives))]
+	noun := promptNouns[rand.Intn(len(promptNouns))]
+	return adj + "-" + noun
 }
 
 // activate ensures the workspace's sessions are running and switches to the
@@ -1478,12 +1381,11 @@ func (m Model) rotateAgent(delta int) (tea.Model, tea.Cmd) {
 // selected location (active/home worktree) and mode (foreground/background).
 func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	prompt := strings.TrimSpace(m.promptInput.Value())
-	// An empty label is deliberate: claude then names the session after the
-	// conversation topic, which the status poll feeds back into the UI.
-	label := strings.TrimSpace(m.agentName.Value())
+	// The form no longer takes a label; every agent gets an auto-generated
+	// placeholder title until a future change summarises it.
+	label := randomAgentTitle()
 	m.formOpen = false
 	m.boardOpen = false
-	m.agentName.Blur()
 	m.promptInput.Blur()
 	w, h := m.sessionSize()
 
@@ -1541,7 +1443,6 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		if prompt != "" {
 			_, _ = sess.WriteInput([]byte(prompt + "\n"))
 		}
-		m.bgAgentPIDs[sess.Pid()] = bgAgentMeta{label: label, homeKey: homeKey, homePath: home}
 		var save tea.Cmd
 		if m.state != nil {
 			m.state.Touch(homeKey)
