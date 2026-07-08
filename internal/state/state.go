@@ -34,7 +34,8 @@ type WorkspaceState struct {
 }
 
 // AgentState is one persisted agent: the claude session UUID to resume and the
-// display label shown in the agent palette.
+// user's label for it. An empty label means claude names the session itself,
+// and the UI shows that live name instead.
 type AgentState struct {
 	SessionID string `json:"session_id"`
 	Label     string `json:"label"`

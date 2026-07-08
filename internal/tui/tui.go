@@ -4,7 +4,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -858,7 +857,7 @@ func (m Model) buildBoard() (rows []boardRow, nav []int) {
 			attn := m.agentAttn(pid)
 			g.agents = append(g.agents, boardRow{
 				isAgent: true, key: key, repo: repoName, worktree: wtName, path: path,
-				agentIdx: i, pid: pid, label: agentTitle(a.Title),
+				agentIdx: i, pid: pid, label: m.agentDisplayTitle(pid, a.Title),
 				status: m.boardStatus(pid, attn), attn: attn,
 			})
 			if attn > g.attn {
@@ -1166,25 +1165,18 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-var promptAdjectives = []string{
-	"amber", "bold", "calm", "deft", "eager", "fast", "grand", "hazy",
-	"idle", "jade", "keen", "lazy", "mild", "nimble", "odd", "proud",
-	"quick", "rare", "shy", "tame", "umber", "vivid", "warm", "young",
-	"zany", "brave", "crisp", "dark", "fleet", "grey",
-}
-
-var promptNouns = []string{
-	"badger", "cedar", "drift", "ember", "falcon", "grove", "haven",
-	"inlet", "jasper", "kelp", "lantern", "moth", "nebula", "otter",
-	"pine", "quartz", "raven", "stone", "tide", "vale", "willow",
-	"fox", "creek", "dune", "fern", "gust", "hawk", "iris", "juniper",
-	"kestrel", "larch",
-}
-
-func randomAgentTitle() string {
-	adj := promptAdjectives[rand.Intn(len(promptAdjectives))]
-	noun := promptNouns[rand.Intn(len(promptNouns))]
-	return adj + "-" + noun
+// agentDisplayTitle resolves what to call an agent in the board and status
+// bar: the user's own label wins, then the live session name from the status
+// poll (claude's one-line topic summary when the user didn't name it), then
+// the plain "claude" placeholder until the first poll lands.
+func (m Model) agentDisplayTitle(pid int, label string) string {
+	if label != "" {
+		return label
+	}
+	if st, ok := m.agentStatus[pid]; ok && st.Name != "" {
+		return st.Name
+	}
+	return agentTitle(label)
 }
 
 // scrapeBgAgentPreview extracts the last meaningful line(s) from a background
@@ -1486,10 +1478,9 @@ func (m Model) rotateAgent(delta int) (tea.Model, tea.Cmd) {
 // selected location (active/home worktree) and mode (foreground/background).
 func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	prompt := strings.TrimSpace(m.promptInput.Value())
+	// An empty label is deliberate: claude then names the session after the
+	// conversation topic, which the status poll feeds back into the UI.
 	label := strings.TrimSpace(m.agentName.Value())
-	if label == "" {
-		label = randomAgentTitle()
-	}
 	m.formOpen = false
 	m.boardOpen = false
 	m.agentName.Blur()

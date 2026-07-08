@@ -242,7 +242,8 @@ func (c *Controller) TermSpec() session.Spec {
 	return session.Spec{Kind: session.Terminal, Title: "term", Argv: []string{c.cfg.Shell}}
 }
 
-// agentTitle is the palette/display title for an agent with the given label.
+// agentTitle is the palette/display title for an agent with the given label,
+// used once the live session name (claude's own topic summary) is also empty.
 func agentTitle(label string) string {
 	if label == "" {
 		return "claude"
@@ -258,15 +259,17 @@ func (c *Controller) PromptAgentSpec(label string) session.Spec {
 	if label != "" {
 		argv = append(argv, "-n", label)
 	}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	return session.Spec{Kind: session.Agent, Title: label, Argv: argv, SessionID: id}
 }
 
 // NewAgentSpec returns the spec for a brand-new Claude agent session, optionally
 // named. ct generates the session UUID and passes it as --session-id so it can
 // persist the id and resume the same conversation in a later run. The label is
 // passed to claude as -n (so it appears in `claude agents --json` and the agent
-// picker), and teammate split-pane mode is pinned off so any agent team renders
-// in-process inside the pane ct controls.
+// picker); when empty, no -n is sent so claude names the session itself — a
+// one-line topic summary ct then picks up from the status poll. Teammate
+// split-pane mode is pinned off so any agent team renders in-process inside
+// the pane ct controls.
 func (c *Controller) NewAgentSpec(label string) session.Spec {
 	return c.freshAgentSpec(newSessionID(), label)
 }
@@ -278,7 +281,7 @@ func (c *Controller) freshAgentSpec(id, label string) session.Spec {
 	if label != "" {
 		argv = append(argv, "-n", label)
 	}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	return session.Spec{Kind: session.Agent, Title: label, Argv: argv, SessionID: id}
 }
 
 // AgentSpec returns the spec to (re)launch a persisted agent. It resumes the
@@ -322,7 +325,7 @@ func (c *Controller) transcriptExists(id string) bool {
 // claude on resume.
 func (c *Controller) ResumeAgentSpec(id, label string) session.Spec {
 	argv := []string{c.cfg.Agent, "--resume", id, "--teammate-mode", "in-process"}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	return session.Spec{Kind: session.Agent, Title: label, Argv: argv, SessionID: id}
 }
 
 // newSessionID returns a random RFC-4122 v4 UUID for a fresh claude session.
@@ -340,7 +343,8 @@ type AgentStatus struct {
 	Status     string // "busy", "idle", or "waiting"
 	WaitingFor string // when waiting: "permission prompt" / "input needed"
 	Cwd        string
-	StartedAt  int64 // unix milliseconds
+	Name       string // session name: the -n label, or claude's own topic summary
+	StartedAt  int64  // unix milliseconds
 }
 
 // rawAgent mirrors one entry of `claude agents --json`.
@@ -349,6 +353,7 @@ type rawAgent struct {
 	Cwd        string `json:"cwd"`
 	Status     string `json:"status"`
 	WaitingFor string `json:"waitingFor"`
+	Name       string `json:"name"`
 	StartedAt  int64  `json:"startedAt"`
 }
 
@@ -364,7 +369,7 @@ func parseAgentStatuses(data []byte) (map[int]AgentStatus, error) {
 		if r.Pid == 0 {
 			continue
 		}
-		out[r.Pid] = AgentStatus{Status: r.Status, WaitingFor: r.WaitingFor, Cwd: r.Cwd, StartedAt: r.StartedAt}
+		out[r.Pid] = AgentStatus{Status: r.Status, WaitingFor: r.WaitingFor, Cwd: r.Cwd, Name: r.Name, StartedAt: r.StartedAt}
 	}
 	return out, nil
 }

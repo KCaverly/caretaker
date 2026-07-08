@@ -9,7 +9,7 @@ import (
 
 func TestParseAgentStatuses(t *testing.T) {
 	data := []byte(`[
-		{"pid":1480,"cwd":"/r/a","kind":"interactive","status":"busy","startedAt":1781790525707},
+		{"pid":1480,"cwd":"/r/a","kind":"interactive","name":"refactor-auth","status":"busy","startedAt":1781790525707},
 		{"pid":43053,"cwd":"/r/b","kind":"interactive","status":"idle"},
 		{"pid":900,"cwd":"/r/c","kind":"interactive","status":"waiting","waitingFor":"permission prompt"},
 		{"cwd":"/r/d","kind":"interactive","state":"done"}
@@ -23,7 +23,7 @@ func TestParseAgentStatuses(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("expected 3 live entries, got %d: %+v", len(got), got)
 	}
-	if got[1480].Status != "busy" || got[1480].Cwd != "/r/a" || got[1480].StartedAt != 1781790525707 {
+	if got[1480].Status != "busy" || got[1480].Cwd != "/r/a" || got[1480].Name != "refactor-auth" || got[1480].StartedAt != 1781790525707 {
 		t.Errorf("busy entry parsed wrong: %+v", got[1480])
 	}
 	if got[43053].Status != "idle" {
@@ -52,8 +52,10 @@ func TestNewAgentSpecLabels(t *testing.T) {
 	if got := unnamed.Argv; !equalStrings(got, wantUnnamed) {
 		t.Errorf("unnamed argv = %v, want %v", got, wantUnnamed)
 	}
-	if unnamed.Title != "claude" {
-		t.Errorf("unnamed title = %q", unnamed.Title)
+	// The title stays empty so the UI can substitute claude's own session
+	// name (from the status poll) once it appears.
+	if unnamed.Title != "" {
+		t.Errorf("unnamed title = %q, want empty", unnamed.Title)
 	}
 
 	named := c.NewAgentSpec("refactor auth")
@@ -87,9 +89,10 @@ func TestResumeAgentSpec(t *testing.T) {
 	if spec.Title != "refactor auth" {
 		t.Errorf("resume title = %q", spec.Title)
 	}
-	// An empty label falls back to the default "claude" display title.
-	if got := c.ResumeAgentSpec(id, "").Title; got != "claude" {
-		t.Errorf("empty-label title = %q, want claude", got)
+	// An empty label stays empty: display code falls back to the live
+	// session name, then "claude".
+	if got := c.ResumeAgentSpec(id, "").Title; got != "" {
+		t.Errorf("empty-label title = %q, want empty", got)
 	}
 }
 
@@ -123,6 +126,20 @@ func TestAgentSpecResumeOrFallback(t *testing.T) {
 	wantResume := []string{"claude", "--resume", id, "--teammate-mode", "in-process"}
 	if got := resumed.Argv; !equalStrings(got, wantResume) {
 		t.Errorf("present-transcript argv = %v, want %v", got, wantResume)
+	}
+}
+
+func TestAgentDisplayTitle(t *testing.T) {
+	var m Model
+	m.agentStatus = map[int]AgentStatus{7: {Name: "fix-login-flow"}}
+	if got := m.agentDisplayTitle(7, "my label"); got != "my label" {
+		t.Errorf("user label should win: got %q", got)
+	}
+	if got := m.agentDisplayTitle(7, ""); got != "fix-login-flow" {
+		t.Errorf("live session name should fill an empty label: got %q", got)
+	}
+	if got := m.agentDisplayTitle(8, ""); got != "claude" {
+		t.Errorf("placeholder before the first poll: got %q", got)
 	}
 }
 

@@ -175,7 +175,7 @@ func (m Model) barContextLabel() string {
 	if n := len(ws.Agents); n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
 		if a := ws.ActiveAgentSession(); a != nil {
-			pos += " " + truncateTo(agentTitle(a.Title), 14)
+			pos += " " + truncateTo(m.agentDisplayTitle(a.Pid(), a.Title), 14)
 		}
 		st := dimStyle
 		if m.screen == screenAgent {
