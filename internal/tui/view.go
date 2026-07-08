@@ -84,7 +84,7 @@ func (m Model) View() tea.View {
 
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
-	iconDeck   = "\U0000F4D8" // fa-seedling (U+F4D8) — the deck: a grove of worktrees
+	iconDeck   = "\U0000EDA7" // fa-seedling (U+EDA7) — the deck: a grove of worktrees
 	iconEditor = ""          // fa-code (U+F121)     — nvim
 	iconAgent  = "󰚩"          // md-robot (U+F06A9)   — claude
 	iconTerm   = ""          // fa-terminal (U+F120) — term
@@ -354,7 +354,7 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
-// renderBoardForm draws the new-agent form: label and prompt inputs plus the
+// renderBoardForm draws the new-agent form: the prompt input plus the
 // where/mode toggles, with the focused field's name highlighted.
 func (m Model) renderBoardForm(h, innerW int) string {
 	fieldName := func(f int, name string) string {
@@ -382,7 +382,6 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	rows := []string{
 		header("new agent", -1),
 		"",
-		"  " + fieldName(formFieldLabel, "label") + m.agentName.View(),
 		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
 		"",
 		"  " + fieldName(formFieldWhere, "where") + toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
