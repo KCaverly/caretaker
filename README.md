@@ -47,13 +47,13 @@ go build -o ct ./cmd/ct && ./ct
 
 A pinned status bar sits at the top at all times:
 
-The bar is a row of spaced **Nerd Font** glyphs (a Nerd Font is required). The caretaker shows a
-yellow smiley while you tend the deck, a red skull once you drop into a session, and a red frown
-whenever an agent you aren't watching is waiting on your input; the nvim (code), claude (robot),
-and term (terminal) icons glow in their own colour when active and dim otherwise (faint until a
-workspace exists). The active repo / worktree shows on the right.
+The bar is a row of spaced **Nerd Font** glyphs (a Nerd Font is required). The caretaker is a
+seedling, lit yellow while you tend the deck and dim once you drop into a session; the nvim (code),
+claude (robot), and term (terminal) icons glow in their own colour when active and dim otherwise
+(faint until a workspace exists). When an agent is waiting on your input, the `! N` badge on the
+right signals it. The active repo / worktree shows on the right.
 
-- **Picker** (smiley): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
+- **Picker** (seedling): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
   worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes). Within each
   repo, worktrees are ordered by when you last opened them in ct (most recent first), falling
   back to git commit time for ones you haven't opened yet. The three most-recently-opened

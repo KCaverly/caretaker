@@ -84,21 +84,19 @@ func (m Model) View() tea.View {
 
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
-	iconDeck    = "" // fa-smile (U+F118)    — tending the deck (picker)
-	iconAway    = "󰚌" // md-skull (U+F068C)   — away in a session
-	iconWorried = "" // fa-frown (U+F119)    — an agent is waiting on input
-	iconEditor  = "" // fa-code (U+F121)     — nvim
-	iconAgent   = "󰚩" // md-robot (U+F06A9)   — claude
-	iconTerm    = "" // fa-terminal (U+F120) — term
+	iconDeck   = "\U0000F4D8" // fa-seedling (U+F4D8) — the deck: a grove of worktrees
+	iconEditor = ""          // fa-code (U+F121)     — nvim
+	iconAgent  = "󰚩"          // md-robot (U+F06A9)   — claude
+	iconTerm   = ""          // fa-terminal (U+F120) — term
 )
 
 // renderBar draws the pinned status bar plus a light separator directly
 // beneath it (barHeight rows total). The four left icons (caretaker, nvim,
-// claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker shows a
-// yellow smiley while you tend the deck and a red skull once you drop into a
-// session; the session icons glow in their own colour when active and dim
-// otherwise (faint until a workspace exists). The current repo / worktree sits
-// on the right.
+// claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker is a
+// stable seedling, lit yellow while the deck is active and dim once you drop
+// into a session; the session icons glow in their own colour when active and
+// dim otherwise (faint until a workspace exists). Agent attention lives in the
+// "! N" badge, not the icons. The current repo / worktree sits on the right.
 func (m Model) renderBar() string {
 	left := "  "
 	for i, z := range m.barZones() {
@@ -211,17 +209,15 @@ func (m Model) barZones() []barZone {
 		}
 	}
 
-	// Caretaker: smiley while tending the deck, skull while away in a session
-	// — and a worried face overriding both whenever an agent you're not
-	// watching is waiting on input. The face answers "does anything need me?"
-	// at a glance, agreeing with the ! badge on the right.
-	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
-	if m.screen != screenPicker {
-		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
+	// Caretaker: a stable seedling that follows the same lit-when-active rule as
+	// the other tabs — yellow while the deck is active, dim otherwise (never
+	// faint: the deck is always reachable). Agent attention lives in the ! badge
+	// on the right, so the icon never reacts to agent status.
+	ctColor := cDim
+	if m.screen == screenPicker {
+		ctColor = cYellow
 	}
-	if waiting, _, _ := m.attnSummary(); waiting > 0 {
-		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconWorried)
-	}
+	ct := lipgloss.NewStyle().Bold(true).Foreground(ctColor).Render(iconDeck)
 
 	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
 
@@ -648,7 +644,6 @@ func (m Model) renderHelp(h int) string {
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
-		"  "+faceLegend(),
 		"",
 		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keyHelp)+
 			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
@@ -675,15 +670,6 @@ func markLegend() string {
 	return strings.Join([]string{
 		dirtyStyle.Render("✷") + helpStyle.Render(" uncommitted"),
 		recentStyle.Render("1 2 3") + helpStyle.Render(" recently opened"),
-	}, helpStyle.Render("   "))
-}
-
-// faceLegend explains the caretaker's bar faces.
-func faceLegend() string {
-	return strings.Join([]string{
-		lipgloss.NewStyle().Foreground(cYellow).Render(iconDeck) + helpStyle.Render(" tending the deck"),
-		lipgloss.NewStyle().Foreground(cRed).Render(iconAway) + helpStyle.Render(" in a session"),
-		lipgloss.NewStyle().Foreground(cRed).Render(iconWorried) + helpStyle.Render(" agent waiting"),
 	}, helpStyle.Render("   "))
 }
 

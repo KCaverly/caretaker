@@ -108,50 +108,34 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 	}
 }
 
-func TestCaretakerFaceWorriesWhenAgentWaits(t *testing.T) {
+func TestCaretakerSeedlingTab(t *testing.T) {
 	m := sampleModel()
 	m.active = []activeItem{
 		{repo: repo.Repo{Name: "other"}, view: WorktreeView{WT: repo.Worktree{Name: "wt", Path: "/other/wt"}}},
 	}
 
-	// All quiet on the deck: the yellow smiley.
-	bar := barLine(t, m)
-	if !strings.Contains(bar, iconDeck) || strings.Contains(bar, iconWorried) {
-		t.Errorf("quiet deck should show the smiley, not the worried face:\n%s", bar)
+	// On the picker the caretaker tab shows the seedling.
+	if bar := barLine(t, m); !strings.Contains(bar, iconDeck) {
+		t.Errorf("picker bar should show the seedling:\n%s", bar)
 	}
 
-	// Away in a session, nothing pending: the skull.
+	// Dropping into a session keeps the same glyph — only the colour changes,
+	// which we can't observe after ansi.Strip, so assert glyph stability.
 	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: "/r/w"}
 	m.screen = screenEditor
-	if bar := barLine(t, m); !strings.Contains(bar, iconAway) {
-		t.Errorf("session screen should show the skull:\n%s", bar)
+	if bar := barLine(t, m); !strings.Contains(bar, iconDeck) {
+		t.Errorf("session bar should still show the seedling:\n%s", bar)
 	}
 
-	// An agent elsewhere starts waiting on input: the worried face overrides
-	// the skull (and agrees with the ! badge).
+	// An agent elsewhere waiting on input must NOT change the icon: the "!"
+	// badge carries the signal, the seedling stays put.
 	m.agentStatus = map[int]AgentStatus{7: {Status: "waiting", Cwd: "/other/wt"}}
-	bar = barLine(t, m)
-	if !strings.Contains(bar, iconWorried) {
-		t.Errorf("waiting agent should worry the caretaker:\n%s", bar)
+	bar := barLine(t, m)
+	if !strings.Contains(bar, iconDeck) {
+		t.Errorf("waiting agent must not change the caretaker icon:\n%s", bar)
 	}
 	if !strings.Contains(bar, "!") {
-		t.Errorf("worried face should coincide with the ! badge:\n%s", bar)
-	}
-
-	// Back on the deck it stays worried until the agent is unblocked.
-	m.screen = screenPicker
-	if bar := barLine(t, m); !strings.Contains(bar, iconWorried) {
-		t.Errorf("deck should show the worried face while an agent waits:\n%s", bar)
-	}
-	m.agentStatus = nil
-	if bar := barLine(t, m); !strings.Contains(bar, iconDeck) {
-		t.Errorf("smiley should return once nothing is waiting:\n%s", bar)
-	}
-
-	// The help overlay explains the faces. (Rendered at a height that fits the
-	// whole box — at 24 rows the overlay bottom clips, a pre-existing issue.)
-	if help := renderToTerminal(t, m.renderHelp(38), m.width, 40); !strings.Contains(help, "agent waiting") {
-		t.Errorf("help legend should explain the worried face:\n%s", help)
+		t.Errorf("waiting agent should raise the ! badge:\n%s", bar)
 	}
 }
 
