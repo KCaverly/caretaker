@@ -61,6 +61,11 @@ func TestBarShowsAgentPoolPosition(t *testing.T) {
 	if !strings.Contains(bar, "refactor-auth") {
 		t.Errorf("bar should show the focused agent's label:\n%s", bar)
 	}
+	// The agent segment sits to the left of "repo / worktree" so the label
+	// stays put at the right edge while agents hot-swap.
+	if strings.Index(bar, "2/3") > strings.Index(bar, "r / w") {
+		t.Errorf("agent position should precede the repo / worktree label:\n%s", bar)
+	}
 
 	// The position stays visible from other screens (it advertises the
 	// prev/next-agent keys), still labelled with the focused agent.
@@ -91,6 +96,11 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 	bar := barLine(t, m)
 	if !strings.Contains(bar, "2/3") {
 		t.Errorf("bar should show the pane position 2/3 on the terminal screen:\n%s", bar)
+	}
+	// Like the agent segment, the pane segment sits to the left of the
+	// right-anchored "repo / worktree" label.
+	if strings.Index(bar, "⊞") > strings.Index(bar, "r / w") {
+		t.Errorf("pane position should precede the repo / worktree label:\n%s", bar)
 	}
 	if strings.Contains(bar, "zoom") {
 		t.Errorf("bar should not show zoom while unzoomed:\n%s", bar)

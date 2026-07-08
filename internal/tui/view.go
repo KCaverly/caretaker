@@ -145,12 +145,15 @@ func (m Model) renderNotifZone() string {
 }
 
 // barContextLabel builds the bar's right-side workspace context: the
-// "repo / worktree" label, extended with the agent pool position
-// ("· 2/3 label") whenever the workspace has more than one agent, and the
-// pane position ("· ⊞ 2/3", plus "zoom" while zoomed) on the terminal screen
-// with splits. It surfaces state that is otherwise invisible — which agent
-// is focused, how many exist, whether a pane is zoomed — and thereby
-// advertises the prev/next-agent and zoom keys.
+// "repo / worktree" label, preceded by the agent pool position
+// ("2/3 label ·") whenever the workspace has more than one agent, and the
+// pane position ("⊞ 2/3 ·", plus "zoom" while zoomed) on the terminal screen
+// with splits. Both volatile segments sit to the left because they hot-swap
+// far more often than the worktree — keeping the repo / worktree label
+// anchored at the right edge while agents and panes rotate. It surfaces
+// state that is otherwise invisible — which agent is focused, how many exist,
+// whether a pane is zoomed — and thereby advertises the prev/next-agent and
+// zoom keys.
 func (m Model) barContextLabel() string {
 	if m.current == nil {
 		return ""
@@ -162,6 +165,13 @@ func (m Model) barContextLabel() string {
 		return s
 	}
 	sep := dimStyle.Render(" · ")
+	if m.screen == screenTerminal && len(ws.Terms) > 1 {
+		pane := fmt.Sprintf("⊞ %d/%d", clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
+		if ws.TermZoomed {
+			pane += " zoom"
+		}
+		s = lipgloss.NewStyle().Foreground(cAccent).Render(pane) + sep + s
+	}
 	if n := len(ws.Agents); n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
 		if a := ws.ActiveAgentSession(); a != nil {
@@ -171,14 +181,7 @@ func (m Model) barContextLabel() string {
 		if m.screen == screenAgent {
 			st = lipgloss.NewStyle().Foreground(cPurple)
 		}
-		s += sep + st.Render(pos)
-	}
-	if m.screen == screenTerminal && len(ws.Terms) > 1 {
-		pane := fmt.Sprintf("⊞ %d/%d", clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
-		if ws.TermZoomed {
-			pane += " zoom"
-		}
-		s += sep + lipgloss.NewStyle().Foreground(cAccent).Render(pane)
+		s = st.Render(pos) + sep + s
 	}
 	return s
 }
