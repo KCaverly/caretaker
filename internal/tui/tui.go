@@ -106,9 +106,10 @@ const (
 // attnEntry is one stored unread marker (attnDone or attnMessage) for an agent,
 // keyed by pid in Model.attention.
 type attnEntry struct {
-	level   attnLevel
-	key     string // workspace key the agent belongs to
-	preview string // attnMessage: last meaningful line scraped at completion
+	level     attnLevel
+	key       string // workspace key the agent belongs to
+	preview   string // attnMessage: last meaningful line scraped at completion
+	startedAt int64  // unix ms of the owning process's start, from AgentStatus.StartedAt; 0 = unknown
 }
 
 // boardRow is one row of the agent board: a non-navigable worktree group
@@ -595,7 +596,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					continue
 				}
 				if key, ok := m.pathToKey(st.Cwd); ok {
-					m.recordAttention(pid, attnDone, key, "")
+					m.recordAttention(pid, attnDone, key, "", st.StartedAt)
 					bell = true
 				}
 			}
@@ -614,7 +615,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if last, ok := m.agentStatus[pid]; ok {
 					if key, ok := m.pathToKey(last.Cwd); ok {
-						m.recordAttention(pid, attnDone, key, "")
+						m.recordAttention(pid, attnDone, key, "", last.StartedAt)
 						bell = true
 					}
 				}
@@ -632,7 +633,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if completed {
 					preview := m.scrapeBgAgentPreview(pid, meta)
-					m.attention[pid] = attnEntry{level: attnMessage, key: meta.homeKey, preview: preview}
+					m.attention[pid] = attnEntry{level: attnMessage, key: meta.homeKey, preview: preview, startedAt: m.agentStatus[pid].StartedAt}
 					delete(m.bgAgentPIDs, pid)
 					bell = true
 				}
@@ -657,6 +658,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for pid := range m.busySince {
 				if _, ok := msg.byPid[pid]; !ok {
 					delete(m.busySince, pid)
+				}
+			}
+			// Drop stored attention entries whose pid has been recycled: if the
+			// polled process at pid started at a different, known time than the
+			// entry's known startedAt, the pid now belongs to a different agent
+			// and the marker no longer applies.
+			for pid, e := range m.attention {
+				if e.startedAt == 0 {
+					continue
+				}
+				if st, ok := msg.byPid[pid]; ok && st.StartedAt != 0 && st.StartedAt != e.startedAt {
+					delete(m.attention, pid)
 				}
 			}
 			m.agentPrevStatus = make(map[int]string, len(msg.byPid))
@@ -685,9 +698,41 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
-	}
 
-	return m, nil
+	default:
+		// Route everything else (notably the cursor-blink tick from
+		// textinput.Blink, started in Init) to whichever text input is
+		// currently focused, so its blink loop keeps re-arming itself.
+		// KeyPressMsg and mouse messages never reach here — they have
+		// explicit cases above.
+		var cmds []tea.Cmd
+		if m.filter.Focused() {
+			var cmd tea.Cmd
+			m.filter, cmd = m.filter.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		if m.nameInput.Focused() {
+			var cmd tea.Cmd
+			m.nameInput, cmd = m.nameInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		if m.agentName.Focused() {
+			var cmd tea.Cmd
+			m.agentName, cmd = m.agentName.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		if m.rootInput.Focused() {
+			var cmd tea.Cmd
+			m.rootInput, cmd = m.rootInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		if m.promptInput.Focused() {
+			var cmd tea.Cmd
+			m.promptInput, cmd = m.promptInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	}
 }
 
 // watchingAgent reports whether the user is on the agent screen with the agent
@@ -700,11 +745,11 @@ func (m Model) watchingAgent(pid int) bool {
 
 // recordAttention stores an unread marker for pid unless an equal or higher one
 // is already recorded.
-func (m Model) recordAttention(pid int, level attnLevel, key, preview string) {
+func (m Model) recordAttention(pid int, level attnLevel, key, preview string, startedAt int64) {
 	if cur, ok := m.attention[pid]; ok && cur.level >= level {
 		return
 	}
-	m.attention[pid] = attnEntry{level: level, key: key, preview: preview}
+	m.attention[pid] = attnEntry{level: level, key: key, preview: preview, startedAt: startedAt}
 }
 
 // clearWorkspaceAttention drops the stored unread markers for every agent in
@@ -1158,13 +1203,13 @@ func (m Model) scrapeBgAgentPreview(pid int, meta bgAgentMeta) string {
 }
 
 // lastMeaningfulLines walks a rendered terminal screen backwards and returns
-// the last non-empty line, truncated to 120 chars.
+// the last non-empty line, truncated to 120 runes.
 func lastMeaningfulLines(rendered string) string {
 	lines := splitLines(rendered)
 	for i := len(lines) - 1; i >= 0; i-- {
 		if ln := strings.TrimSpace(lines[i]); ln != "" {
-			if len(ln) > 120 {
-				ln = ln[:120] + "…"
+			if runes := []rune(ln); len(runes) > 120 {
+				ln = string(runes[:120]) + "…"
 			}
 			return ln
 		}

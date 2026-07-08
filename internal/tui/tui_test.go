@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -725,7 +726,7 @@ func TestAttentionPrecedence(t *testing.T) {
 
 	// recordAttention never downgrades a stored marker.
 	m.attention[3] = attnEntry{level: attnMessage, key: "~/config", preview: "hi"}
-	m.recordAttention(3, attnDone, "~/config", "")
+	m.recordAttention(3, attnDone, "~/config", "", 0)
 	if e := m.attention[3]; e.level != attnMessage || e.preview != "hi" {
 		t.Errorf("recordAttention must not downgrade message → done, got %+v", e)
 	}
@@ -913,5 +914,48 @@ func TestBoardSortsAttentionFirst(t *testing.T) {
 	}
 	if _, ok := m2.attention[pid]; ok {
 		t.Error("focusing the agent should clear its unread marker")
+	}
+}
+
+// TestLastMeaningfulLinesRuneSafe verifies truncation cuts on rune boundaries,
+// not byte offsets, so a long run of multibyte characters isn't split mid-rune.
+func TestLastMeaningfulLinesRuneSafe(t *testing.T) {
+	long := strings.Repeat("é", 150) // multibyte well past the 120 mark
+	rendered := "first line\n\n" + long + "\n\n"
+
+	got := lastMeaningfulLines(rendered)
+
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated line is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("truncated line should end with an ellipsis, got %q", got)
+	}
+	wantRunes := 120
+	if n := utf8.RuneCountInString(strings.TrimSuffix(got, "…")); n != wantRunes {
+		t.Fatalf("expected %d runes before the ellipsis, got %d (%q)", wantRunes, n, got)
+	}
+}
+
+// TestAttentionSweepOnPidReuse verifies that when a polled pid reports a
+// StartedAt different from a stored attention entry's known startedAt, the
+// pid has been recycled to a new process and the stale marker is dropped.
+// An entry whose StartedAt matches the poll is left alone.
+func TestAttentionSweepOnPidReuse(t *testing.T) {
+	m := sampleModel()
+	m.attention[42] = attnEntry{level: attnDone, key: "r/w", startedAt: 111}
+	m.attention[43] = attnEntry{level: attnDone, key: "r/w", startedAt: 111}
+
+	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		42: {Status: "idle", StartedAt: 222}, // recycled pid: different, nonzero StartedAt
+		43: {Status: "idle", StartedAt: 111}, // same process: StartedAt matches
+	}})
+	m2 := result.(Model)
+
+	if _, ok := m2.attention[42]; ok {
+		t.Error("stale marker for a recycled pid should be swept away")
+	}
+	if e, ok := m2.attention[43]; !ok || e.level != attnDone {
+		t.Errorf("marker for a pid whose StartedAt matches should survive, got %+v ok=%v", e, ok)
 	}
 }
