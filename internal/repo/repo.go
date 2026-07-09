@@ -150,6 +150,60 @@ func BranchTipTimes(r Repo) (map[string]int64, error) {
 	return tips, nil
 }
 
+// worktreeNameForbidden lists the punctuation git forbids inside a ref name
+// (git-check-ref-format). A new-worktree name is substituted verbatim into both
+// the branch name and the worktree path, so any of these would otherwise fail
+// deep inside `git worktree add` with raw stderr. Space and control characters
+// are checked separately (as a range), and '/' is deliberately absent — interior
+// slashes are allowed for branch namespacing.
+const worktreeNameForbidden = "~^:?*[\\"
+
+// ValidateWorktreeName rejects new-worktree names before ct runs `git worktree
+// add`, so bad input yields an inline hint instead of raw git stderr — and so a
+// name containing ".." can never place the worktree outside the repo when it is
+// filepath.Join'd into the worktree_path template.
+//
+// It lives in repo (next to CreateWorktree, the consumer of the name) rather
+// than tui because it guards a git/filesystem operation, not UI state, and is
+// reusable as a defense-in-depth check by any future caller of CreateWorktree.
+//
+// Interior "/" is intentionally allowed: branch namespacing like "feature/foo"
+// is legitimate and the worktree_path template nests it as a subdirectory. Path
+// traversal stays impossible because ".." (in any component) is rejected, so no
+// join can climb out of the repo.
+func ValidateWorktreeName(name string) error {
+	switch {
+	case strings.TrimSpace(name) == "":
+		return fmt.Errorf("name cannot be empty")
+	case strings.HasPrefix(name, "-"):
+		return fmt.Errorf("name cannot start with '-'")
+	case strings.HasPrefix(name, "/"):
+		return fmt.Errorf("name cannot start with '/'")
+	case strings.HasSuffix(name, "/"):
+		return fmt.Errorf("name cannot end with '/'")
+	case strings.HasSuffix(name, ".lock"):
+		return fmt.Errorf("name cannot end with '.lock'")
+	case strings.Contains(name, ".."):
+		return fmt.Errorf("name cannot contain '..'")
+	// No slash-separated component may begin with '.' (a git ref rule; it also
+	// keeps the worktree directory out of hidden-file territory). This covers a
+	// leading '.' and any "/." sequence.
+	case strings.HasPrefix(name, "."), strings.Contains(name, "/."):
+		return fmt.Errorf("name component cannot start with '.'")
+	}
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("name cannot contain control characters")
+		case r == ' ':
+			return fmt.Errorf("name cannot contain spaces")
+		case strings.ContainsRune(worktreeNameForbidden, r):
+			return fmt.Errorf("name cannot contain %q", r)
+		}
+	}
+	return nil
+}
+
 // CreateWorktree adds a new worktree at relPath (relative to the repo) on a new
 // branch, based on baseRef. If baseRef is empty, the repo's current HEAD is used.
 // Returns the created Worktree.

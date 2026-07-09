@@ -1314,6 +1314,28 @@ func branchExists(t *testing.T, repoDir, branch string) bool {
 	return strings.Contains(string(out), branch)
 }
 
+// actionDoneFromBatch runs cmd — which may be a single command or a tea.Batch —
+// and returns the actionDoneMsg it produces. It stops at the first actionDoneMsg
+// so it never executes a batched flash-expiry tick (which would sleep).
+func actionDoneFromBatch(t *testing.T, cmd tea.Cmd) actionDoneMsg {
+	t.Helper()
+	switch msg := cmd().(type) {
+	case actionDoneMsg:
+		return msg
+	case tea.BatchMsg:
+		for _, c := range msg {
+			if c == nil {
+				continue
+			}
+			if done, ok := c().(actionDoneMsg); ok {
+				return done
+			}
+		}
+	}
+	t.Fatal("command did not yield an actionDoneMsg")
+	return actionDoneMsg{}
+}
+
 func TestRemoveConfirmYDeletesBranch(t *testing.T) {
 	m, repoDir, branch := removeGitModel(t)
 
@@ -1323,10 +1345,8 @@ func TestRemoveConfirmYDeletesBranch(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("'y' should schedule a removal command")
 	}
-	msg, ok := cmd().(actionDoneMsg)
-	if !ok {
-		t.Fatalf("removal command should yield actionDoneMsg, got %T", cmd())
-	}
+	// The removal is batched with the "removing…" flash-expiry tick; unwrap it.
+	msg := actionDoneFromBatch(t, cmd)
 	if msg.err != nil {
 		t.Fatalf("remove failed: %v", msg.err)
 	}
@@ -1344,10 +1364,7 @@ func TestRemoveConfirmBKeepsBranch(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("'b' should schedule a removal command")
 	}
-	msg, ok := cmd().(actionDoneMsg)
-	if !ok {
-		t.Fatalf("removal command should yield actionDoneMsg, got %T", cmd())
-	}
+	msg := actionDoneFromBatch(t, cmd)
 	if msg.err != nil {
 		t.Fatalf("remove failed: %v", msg.err)
 	}
@@ -1357,5 +1374,102 @@ func TestRemoveConfirmBKeepsBranch(t *testing.T) {
 	// The working tree itself must still be gone.
 	if wts, _ := repo.ListWorktrees(repo.Repo{Name: "demo", Path: repoDir}); len(wts) != 1 {
 		t.Fatalf("expected only main worktree after remove, got %+v", wts)
+	}
+}
+
+// TestFlashClearsViaDedicatedTick covers the idle-deck stale-flash fix: with no
+// hosted workspaces the agent-status poll is 30s away, so a flash must be
+// cleared by its own one-shot expiry tick, not the poll.
+func TestFlashClearsViaDedicatedTick(t *testing.T) {
+	m := sampleModel()
+
+	// sampleModel hosts no workspaces, so the only *other* expiry path — the
+	// agent-status poll — is 30s out. Guard the premise so the test still means
+	// something if the cadence changes.
+	if iv := m.statusTickInterval(); iv < 30*time.Second {
+		t.Fatalf("expected the 30s idle-deck poll cadence, got %v", iv)
+	}
+
+	tick := m.flashCmd("creating foo…")
+	if tick == nil {
+		t.Fatal("flashCmd should return an expiry tick command")
+	}
+	if m.status != "creating foo…" {
+		t.Fatalf("flashCmd should set the status, got %q", m.status)
+	}
+
+	// Simulate the tick firing once the TTL has elapsed (backdate rather than
+	// sleep). The tick is stamped with the current statusAt, so it matches and
+	// clears — exactly what the dedicated timer guarantees on an idle deck.
+	m.statusAt = time.Now().Add(-2 * transientStatusTTL)
+	mm, _ := m.Update(statusExpireMsg{at: m.statusAt})
+	m = mm.(Model)
+	if m.status != "" {
+		t.Fatalf("dedicated tick should clear the stale flash, got %q", m.status)
+	}
+}
+
+// TestFlashTickDoesNotClearNewerFlash covers the staleness guard: a tick armed
+// by an earlier flash must not clear a newer flash that replaced it.
+func TestFlashTickDoesNotClearNewerFlash(t *testing.T) {
+	m := sampleModel()
+
+	m.flash("first")
+	staleAt := m.statusAt.Add(-time.Second) // the first flash's tick, armed earlier
+	m.flash("second")                       // a newer flash supersedes it
+	// Age the newer flash past its own TTL so that, absent the guard, the stale
+	// tick would wrongly clear it.
+	m.statusAt = time.Now().Add(-2 * transientStatusTTL)
+
+	mm, _ := m.Update(statusExpireMsg{at: staleAt})
+	m = mm.(Model)
+	if m.status != "second" {
+		t.Fatalf("a stale tick must not clear a newer flash, got %q", m.status)
+	}
+
+	// The newer flash's *own* tick still expires it.
+	mm, _ = m.Update(statusExpireMsg{at: m.statusAt})
+	m = mm.(Model)
+	if m.status != "" {
+		t.Fatalf("the newer flash's own tick should clear it, got %q", m.status)
+	}
+}
+
+// TestHandleCreateKeyValidation checks that an invalid worktree name is rejected
+// inline without dispatching a create, while a valid name (including interior
+// slashes) proceeds.
+func TestHandleCreateKeyValidation(t *testing.T) {
+	m := sampleModel()
+	m.pendingRepo = repo.Repo{Name: "api", Path: t.TempDir()}
+	m.mode = modeCreateName
+	m.nameInput.Focus()
+
+	// Invalid: rejected inline. Error status, form stays open, no create cmd.
+	m.nameInput.SetValue("../escape")
+	mm, cmd := m.handleCreateKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if cmd != nil {
+		t.Fatal("invalid name should not dispatch a create command")
+	}
+	if m.mode != modeCreateName {
+		t.Fatalf("invalid name should keep the create form open, got mode %v", m.mode)
+	}
+	if m.statusLevel != statusError || m.status == "" {
+		t.Fatalf("invalid name should set an error status, got %q level=%v", m.status, m.statusLevel)
+	}
+
+	// Valid (interior slash namespacing): form closes, progress flashes, and a
+	// create command is dispatched.
+	m.nameInput.SetValue("feature/foo")
+	mm, cmd = m.handleCreateKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if cmd == nil {
+		t.Fatal("valid name should dispatch a create command")
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("valid name should close the form, got mode %v", m.mode)
+	}
+	if m.statusLevel != statusInfo || m.status != "creating feature/foo…" {
+		t.Fatalf("valid name should flash progress, got %q level=%v", m.status, m.statusLevel)
 	}
 }

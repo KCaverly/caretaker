@@ -380,6 +380,13 @@ type dirtyMsg struct{}
 // one `claude agents --json` poll.
 type statusTickMsg struct{}
 
+// statusExpireMsg is the dedicated one-shot flash-expiry tick scheduled by
+// flashCmd. It carries the statusAt it was armed for so a newer flash set before
+// it fires is never cleared early: only the flash that scheduled this tick may
+// expire it. This is what keeps a flash on an idle deck (whose agent-status poll
+// stretches to 30s) from lingering ~26s past its 4s TTL.
+type statusExpireMsg struct{ at time.Time }
+
 type statusMsg struct {
 	byPid map[int]AgentStatus
 	err   error
@@ -650,14 +657,25 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.maybeExpireStatus()
 		return m, m.pollStatusCmd()
 
+	case statusExpireMsg:
+		// Ignore a tick left over from a flash that a newer one has since
+		// replaced (statusAt moved); otherwise the fresh flash would be cleared
+		// early. maybeExpireStatus's own TTL check makes the surviving tick a
+		// no-op if the status was already replaced by a non-transient one.
+		if msg.at.Equal(m.statusAt) {
+			m.maybeExpireStatus()
+		}
+		return m, nil
+
 	case statusMsg:
+		var flashTick tea.Cmd
 		if msg.err != nil {
 			// Surface a persistent outage once (transient, auto-expires): with
 			// the poll dead, every badge/board feature silently freezes and the
 			// user should know why.
 			m.pollFails++
 			if m.pollFails == 3 {
-				m.flash("agent status unavailable (claude agents failing)")
+				flashTick = m.flashCmd("agent status unavailable (claude agents failing)")
 			}
 		}
 		if msg.err == nil {
@@ -739,7 +757,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentStatus = msg.byPid
 		}
 		m.maybeExpireStatus()
-		return m, m.scheduleStatusTick()
+		return m, tea.Batch(m.scheduleStatusTick(), flashTick)
 
 	case usageTickMsg:
 		return m, m.pollUsageCmd()
@@ -1481,8 +1499,8 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.ctrl.SetRoot(abs)
 		m.screen = screenPicker
-		m.flash("config saved — welcome to caretaker!")
-		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd(), m.pollUsageCmd())
+		flashTick := m.flashCmd("config saved — welcome to caretaker!")
+		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd(), m.pollUsageCmd(), flashTick)
 	}
 	var cmd tea.Cmd
 	m.rootInput, cmd = m.rootInput.Update(msg)
@@ -1586,8 +1604,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	if m.formLocation == 0 {
 		// Active worktree.
 		if m.current == nil {
-			m.flash("no active workspace")
-			return m, nil
+			return m, m.flashCmd("no active workspace")
 		}
 		spec := m.ctrl.NewAgentSpec(label)
 		sess, err := m.mgr.SpawnAgent(m.current.key, m.current.path, spec, w, h)
@@ -1600,13 +1617,11 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		}
 		save := m.saveAgents(m.current.key)
 		if m.formBackground {
-			m.flash("agent launched in background")
-			return m, save
+			return m, tea.Batch(save, m.flashCmd("agent launched in background"))
 		}
 		m.screen = screenAgent
 		m.clearWorkspaceAttention()
-		m.flash("agent launched")
-		return m, save
+		return m, tea.Batch(save, m.flashCmd("agent launched"))
 	}
 
 	// Home worktree.
@@ -1642,8 +1657,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 			m.state.Touch(homeKey)
 			save = m.saveAgents(homeKey)
 		}
-		m.flash("background agent launched")
-		return m, save
+		return m, tea.Batch(save, m.flashCmd("background agent launched"))
 	}
 
 	// Home + foreground: spawn an interactive agent and navigate there.
@@ -1661,8 +1675,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	mm, cmd := m.activate("~", "config", home)
 	model := mm.(Model)
 	model.screen = screenAgent
-	model.flash("agent launched")
-	return model, cmd
+	return model, tea.Batch(cmd, model.flashCmd("agent launched"))
 }
 
 // handleMouseClick switches tabs when a left-click lands on a bar icon, and
@@ -1966,8 +1979,7 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.stopWorkspace(key)
-			m.flash("stopped " + it.view.WT.Name)
-			return m, m.loadCmd()
+			return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+it.view.WT.Name))
 		}
 	case "x":
 		if it, ok := m.selectedActive(); ok && !it.view.WT.IsMain {
@@ -2011,16 +2023,26 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.filter.Focus()
 	case "enter":
 		name := strings.TrimSpace(m.nameInput.Value())
+		if name == "" {
+			// Empty stays a silent no-op: dismiss the form, no error.
+			m.mode = modeNormal
+			m.nameInput.Blur()
+			m.status = ""
+			return m, m.filter.Focus()
+		}
+		if err := repo.ValidateWorktreeName(name); err != nil {
+			// Reject client-side: keep the form open so the user can fix the
+			// name, and surface the reason inline instead of letting it fail
+			// later with raw git stderr (or, for "..", escape the repo).
+			m.setError("invalid name: " + err.Error())
+			return m, nil
+		}
 		m.mode = modeNormal
 		m.nameInput.Blur()
 		r := m.pendingRepo
 		focusCmd := m.filter.Focus()
-		if name == "" {
-			m.status = ""
-			return m, focusCmd
-		}
-		m.flash("creating " + name + "…")
-		return m, tea.Batch(focusCmd, func() tea.Msg {
+		flashTick := m.flashCmd("creating " + name + "…")
+		return m, tea.Batch(focusCmd, flashTick, func() tea.Msg {
 			wt, err := m.ctrl.Create(r, name, "")
 			return createdMsg{wt: wt, err: err}
 		})
@@ -2046,12 +2068,14 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		r, wt := it.repo, it.view.WT
+		var flashTick tea.Cmd
 		if deleteBranch {
-			m.flash("removing " + wt.Name + "…")
+			flashTick = m.flashCmd("removing " + wt.Name + "…")
 		} else {
-			m.flash("removing " + wt.Name + " (keeping branch)…")
+			flashTick = m.flashCmd("removing " + wt.Name + " (keeping branch)…")
 		}
-		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt, deleteBranch)} }
+		remove := func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt, deleteBranch)} }
+		return m, tea.Batch(remove, flashTick)
 	}
 	m.mode = modeNormal
 	m.status = ""
@@ -2081,8 +2105,7 @@ func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
-		m.flash("stopped " + it.view.WT.Name)
-		return m, m.loadCmd()
+		return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+it.view.WT.Name))
 	}
 	m.mode = modeNormal
 	m.status = ""
@@ -2124,6 +2147,22 @@ func (m *Model) flash(s string) {
 	m.status = s
 	m.statusLevel = statusInfo
 	m.statusAt = time.Now()
+}
+
+// flashCmd sets a transient status like flash and returns a dedicated one-shot
+// tick that expires it after transientStatusTTL. The agent-status poll also
+// calls maybeExpireStatus, but its cadence stretches to 30s on an idle deck, so
+// relying on it alone lets flashes linger far past their TTL; this tick fires on
+// its own timer regardless of deck activity. It's stamped with the current
+// statusAt so a flash set before it fires won't be cleared early (see
+// statusExpireMsg). Callers batch the returned cmd with any command they already
+// return.
+func (m *Model) flashCmd(s string) tea.Cmd {
+	m.flash(s)
+	at := m.statusAt
+	return tea.Tick(transientStatusTTL, func(time.Time) tea.Msg {
+		return statusExpireMsg{at: at}
+	})
 }
 
 // setError sets a sticky error status: styled red and never auto-expired, it

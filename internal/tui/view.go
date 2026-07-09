@@ -1055,6 +1055,11 @@ func (m Model) sessionFooter() string {
 func (m Model) footerContent() string {
 	switch m.mode {
 	case modeCreateName:
+		// A rejected name (client-side validation) sets a sticky error status;
+		// style it red here so the hint stands out from ordinary form chrome.
+		if m.statusLevel == statusError {
+			return "\n" + errStyle.Render(m.status)
+		}
 		return "\n" + helpStyle.Render(m.status)
 	case modeConfirmRemove, modeConfirmQuit, modeConfirmStop:
 		return "\n" + errStyle.Render(m.status)
