@@ -44,6 +44,27 @@ type Session struct {
 	closed        atomic.Bool
 	closeOnce     sync.Once
 	dirty         func(*Session) // signalled when the screen changes
+
+	// Render cache. emu.Render() re-serialises the entire w×h buffer to an ANSI
+	// string on every call (~60µs/616 allocs at 80×24 up to ~253µs/1,901 allocs
+	// at 200×50), so a frame triggered by anything other than this session's own
+	// output — a bar poll tick, a badge update, another pane's write — must not
+	// pay that cost. renderCache holds the last serialisation and is returned
+	// while the screen is unchanged.
+	//
+	// The screen only changes via emu.Write (the pty pump) and emu.Resize;
+	// SendKey/SendMouse/Paste write to the child's input pipe, not the screen
+	// (their echo returns through the pty as ordinary output). So renderCacheDirty
+	// is set in exactly those two places. The cursor is queried separately, per
+	// frame, via Cursor()/emu.CursorPosition() and is never part of the cached
+	// string, so caching cannot stale the cursor.
+	//
+	// Concurrency: renderCache is read and written only on the UI goroutine
+	// (Render and Resize), so it needs no lock of its own. renderCacheDirty is
+	// the sole cross-goroutine handshake — the pty pump goroutine sets it after
+	// each emu.Write — so it is atomic. See Render for the set/clear ordering.
+	renderCache      string
+	renderCacheDirty atomic.Bool
 }
 
 // Start launches argv in dir on a pty sized w×h and returns a running Session.
@@ -83,6 +104,7 @@ func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func(*Se
 		dirty: dirty,
 	}
 	s.cursorVisible.Store(true)
+	s.renderCacheDirty.Store(true) // no cache yet: first Render must serialise
 	s.emu.SetCallbacks(vt.Callbacks{
 		CursorVisibility: func(v bool) { s.cursorVisible.Store(v) },
 	})
@@ -101,6 +123,9 @@ func (s *Session) pumpOutput() {
 		n, err := s.pty.Read(buf)
 		if n > 0 {
 			_, _ = s.emu.Write(buf[:n])
+			// Mark the cache stale BEFORE signalling the repaint, so the frame
+			// this write triggers never serves the pre-write screen.
+			s.renderCacheDirty.Store(true)
 			s.signal()
 		}
 		if err != nil {
@@ -137,8 +162,23 @@ func (s *Session) Paste(text string) { s.emu.Paste(text) }
 // if the program has requested a mouse mode).
 func (s *Session) SendMouse(m uv.MouseEvent) { s.emu.SendMouse(m) }
 
-// Render returns the program's current screen as a styled string.
-func (s *Session) Render() string { return s.emu.Render() }
+// Render returns the program's current screen as a styled string, reusing the
+// cached serialisation while the screen is unchanged (see the renderCache
+// field). Called only on the UI goroutine.
+//
+// The dirty flag is cleared BEFORE serialising, not after: a pty write that
+// lands mid-render re-sets the flag, so the next frame re-serialises and never
+// serves a screen that predates that write. Clearing after Render could instead
+// swallow such a write (we would read the pre-write buffer, then clear the flag
+// the write had set) and leave the stale frame on screen until the next write.
+// The CompareAndSwap collapses a burst of writes since the last frame into a
+// single re-serialisation.
+func (s *Session) Render() string {
+	if s.renderCacheDirty.CompareAndSwap(true, false) {
+		s.renderCache = s.emu.Render()
+	}
+	return s.renderCache
+}
 
 // Cursor returns the program's cursor position and visibility.
 func (s *Session) Cursor() (x, y int, visible bool) {
@@ -152,6 +192,7 @@ func (s *Session) Resize(w, h int) {
 		return
 	}
 	s.emu.Resize(w, h)
+	s.renderCacheDirty.Store(true) // resize reshapes the buffer; drop the cache
 	_ = pty.Setsize(s.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
 }
 

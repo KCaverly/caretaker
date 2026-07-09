@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -184,6 +185,128 @@ func TestDirtyOnlyForVisibleSessions(t *testing.T) {
 	case <-m.Dirty():
 		t.Fatal("dirty signal fired with no visible sessions")
 	default:
+	}
+}
+
+// TestRenderCacheMatchesEmulator proves the cache is transparent: once the
+// screen has settled, Session.Render() returns exactly what the uncached
+// emu.Render() would, and repeated calls return the identical string.
+func TestRenderCacheMatchesEmulator(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, _ = s.WriteInput([]byte("hello-cache\n"))
+	waitFor(t, s, "hello-cache")
+
+	got := s.Render()
+	if want := s.emu.Render(); got != want {
+		t.Fatalf("cached render differs from emulator:\n got %q\nwant %q", got, want)
+	}
+	if again := s.Render(); again != got {
+		t.Fatalf("repeated cached render differs:\n first %q\nsecond %q", got, again)
+	}
+}
+
+// TestRenderCacheInvalidatesOnWrite proves new pty output is reflected on the
+// next Render() rather than being masked by a stale cache.
+func TestRenderCacheInvalidatesOnWrite(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, _ = s.WriteInput([]byte("first-line\n"))
+	waitFor(t, s, "first-line")
+	before := s.Render()
+
+	_, _ = s.WriteInput([]byte("second-line\n"))
+	waitFor(t, s, "second-line") // waitFor renders, so it must observe the write
+	after := s.Render()
+	if after == before {
+		t.Fatal("render did not change after a new write (stale cache)")
+	}
+	if want := s.emu.Render(); after != want {
+		t.Fatalf("post-write render differs from emulator:\n got %q\nwant %q", after, want)
+	}
+}
+
+// TestRenderCacheInvalidatesOnResize proves a resize (which reshapes the buffer
+// with no pty output) drops the cache: the next Render() reflects the new size
+// rather than replaying the pre-resize serialisation.
+func TestRenderCacheInvalidatesOnResize(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, _ = s.WriteInput([]byte("resize-me\n"))
+	waitFor(t, s, "resize-me")
+	before := s.Render() // primes the cache at 80x24
+
+	s.Resize(40, 10)
+	after := s.Render()
+	if after == before {
+		t.Fatal("render did not change after resize (stale cache)")
+	}
+	if want := s.emu.Render(); after != want {
+		t.Fatalf("post-resize render differs from emulator:\n got %q\nwant %q", after, want)
+	}
+}
+
+// TestRenderCacheNoStaleFrameUnderRacingWrites hammers pty output while a
+// separate goroutine renders in a loop (the UI goroutine's role), then — once
+// writes and the render loop have quiesced — asserts the final Render()
+// reflects the final screen. Meant to run under -race: it exercises the pump
+// goroutine's renderCacheDirty store against the render goroutine's load, and
+// catches an ordering bug that would leave a stale frame latched. Rendering is
+// confined to the single loop goroutine (matching the real single-UI-goroutine
+// invariant) so renderCache itself is never touched concurrently.
+func TestRenderCacheNoStaleFrameUnderRacingWrites(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Render()
+			}
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		_, _ = s.WriteInput([]byte(fmt.Sprintf("line-%04d\n", i)))
+	}
+	_, _ = s.WriteInput([]byte("FINAL-MARKER\n"))
+
+	close(stop)
+	<-done // render loop stopped: the main goroutine is now the sole renderer
+
+	// Poll to let the final write drain through the pump, then assert the cache
+	// reflects the last content and matches the emulator exactly.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(s.Render(), "FINAL-MARKER") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := s.Render()
+	if !strings.Contains(got, "FINAL-MARKER") {
+		t.Fatalf("final render missing the last write:\n%s", got)
+	}
+	if want := s.emu.Render(); got != want {
+		t.Fatalf("final render is stale relative to emulator:\n got %q\nwant %q", got, want)
 	}
 }
 

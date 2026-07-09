@@ -6,9 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/session"
 )
 
 // benchGit runs a git command in dir, failing the benchmark on error.
@@ -110,5 +113,45 @@ func BenchmarkEnsureProjectTrusted(b *testing.B) {
 		if err := ensureProjectTrusted(configPath, home); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkViewBarOnlyFrame measures a full Model.View() for a frame where the
+// visible session's screen has NOT changed — the common case behind a status
+// poll tick, a usage poll, or a badge update, all of which redraw the whole
+// frame while the hosted program sits idle. Before the per-session render cache
+// every such frame re-serialised the visible editor's entire vt buffer
+// (~60µs/600+ allocs at this size, per BenchmarkEmulatorRender); with the cache
+// the session contributes only a cached-string return, so what remains here is
+// essentially the bar/chrome cost alone. The editor is filled with styled text
+// and then idles (sleep), so every View() in the loop is a session cache hit.
+func BenchmarkViewBarOnlyFrame(b *testing.B) {
+	m := sampleModel()
+	defer m.mgr.CloseAll()
+
+	dir := b.TempDir()
+	fill := []string{"sh", "-c",
+		`i=0; while [ $i -lt 40 ]; do ` +
+			`printf '\033[33mlorem\033[0m \033[1;34mipsum\033[0m dolor sit amet %d\r\n' $i; ` +
+			`i=$((i+1)); done; sleep 60`}
+	ws, err := m.mgr.Activate("r/w", dir,
+		[]session.Spec{{Kind: session.Editor, Argv: fill}}, m.width, m.height-barHeight)
+	if err != nil {
+		b.Fatal(err)
+	}
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.screen = screenEditor
+
+	// Wait for the fill to land so the benchmarked frames render a busy screen
+	// (a hot cache), not a blank one.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(ws.Editor.Render(), "lorem") {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = m.View()
 	}
 }
