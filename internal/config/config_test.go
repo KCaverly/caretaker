@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -47,6 +48,61 @@ func TestDefault(t *testing.T) {
 	}
 	if d.WorktreePath != ".worktrees/{name}" || d.BranchName != "{name}" {
 		t.Fatalf("unexpected templates: %+v", d)
+	}
+}
+
+func TestDefaultUsage(t *testing.T) {
+	d := Default()
+	if d.Usage.Threshold != 50 {
+		t.Fatalf("usage threshold = %d, want 50", d.Usage.Threshold)
+	}
+	if d.Keys.Usage != "ctrl+u" {
+		t.Fatalf("usage key = %q, want ctrl+u", d.Keys.Usage)
+	}
+}
+
+// loadTOML writes body to a temp config file (with root pointed at a real dir)
+// and loads it, so tests can assert how TOML decodes over the defaults.
+func loadTOML(t *testing.T, body string) Config {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := "root = " + strconv.Quote(dir) + "\n" + body
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CT_CONFIG", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
+}
+
+func TestLoadUsageDefaultsWhenAbsent(t *testing.T) {
+	cfg := loadTOML(t, "")
+	if cfg.Usage.Threshold != 50 {
+		t.Fatalf("threshold = %d, want default 50", cfg.Usage.Threshold)
+	}
+	if cfg.Keys.Usage != "ctrl+u" {
+		t.Fatalf("usage key = %q, want default ctrl+u", cfg.Keys.Usage)
+	}
+}
+
+func TestLoadUsageOverride(t *testing.T) {
+	cfg := loadTOML(t, "[usage]\nthreshold = 80\n[keys]\nusage = \"ctrl+p\"\n")
+	if cfg.Usage.Threshold != 80 {
+		t.Fatalf("threshold = %d, want 80", cfg.Usage.Threshold)
+	}
+	if cfg.Keys.Usage != "ctrl+p" {
+		t.Fatalf("usage key = %q, want ctrl+p", cfg.Keys.Usage)
+	}
+}
+
+func TestLoadUsageNegativeClamped(t *testing.T) {
+	cfg := loadTOML(t, "[usage]\nthreshold = -10\n")
+	if cfg.Usage.Threshold != 0 {
+		t.Fatalf("threshold = %d, want clamped to 0", cfg.Usage.Threshold)
 	}
 }
 

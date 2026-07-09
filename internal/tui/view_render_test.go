@@ -13,6 +13,7 @@ import (
 
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/usage"
 )
 
 // renderToTerminal writes styled frame content into a real terminal emulator
@@ -303,6 +304,145 @@ func TestRankedActiveLookup(t *testing.T) {
 }
 
 func testWindowSize() tea.WindowSizeMsg { return tea.WindowSizeMsg{Width: 72, Height: 24} }
+
+// usageModel returns an agent-screen model with a fresh fabricated snapshot:
+// a five-hour window at `five` percent (resetting in ~2h40m) and a seven-day
+// window at `week` percent. No network is involved anywhere in these tests.
+func usageModel(five, week float64) Model {
+	m := modelWithAgents(1)
+	m.screen = screenAgent
+	m.usageThreshold = 50
+	now := time.Now()
+	m.usageSnap = usage.Snapshot{
+		FiveHour:  &usage.Window{Utilization: five, ResetsAt: now.Add(2*time.Hour + 40*time.Minute + 30*time.Second)},
+		SevenDay:  &usage.Window{Utilization: week, ResetsAt: now.Add(72 * time.Hour)},
+		FetchedAt: now,
+	}
+	m.usageHave = true
+	return m
+}
+
+func TestBarUsageSegmentGating(t *testing.T) {
+	m := usageModel(68, 40)
+
+	bar := barLine(t, m)
+	if !strings.Contains(bar, "◕ 68% 2h40m") {
+		t.Errorf("bar should show the session gauge with pie, percent, and reset:\n%s", bar)
+	}
+	// The gauge is the leftmost volatile segment: it hot-swaps every poll, so
+	// it sits furthest from the right-anchored repo / worktree label.
+	if strings.Index(bar, "68%") > strings.Index(bar, "r / w") {
+		t.Errorf("usage segment should precede the repo / worktree label:\n%s", bar)
+	}
+
+	// Below the threshold the gauge stays out of the bar entirely.
+	m.usageSnap.FiveHour.Utilization = 42
+	if bar := barLine(t, m); strings.Contains(bar, "42%") {
+		t.Errorf("segment should hide below the threshold:\n%s", bar)
+	}
+
+	// The gate is at-or-above: exactly the threshold shows.
+	m.usageSnap.FiveHour.Utilization = 50
+	if bar := barLine(t, m); !strings.Contains(bar, "50%") {
+		t.Errorf("segment should show at exactly the threshold:\n%s", bar)
+	}
+
+	// Off the agent screen the gauge never appears, however hot the window —
+	// the deck and every other screen stay untouched.
+	m.usageSnap.FiveHour.Utilization = 95
+	for _, s := range []screen{screenEditor, screenTerminal, screenPicker} {
+		m.screen = s
+		if bar := barLine(t, m); strings.Contains(bar, "95%") {
+			t.Errorf("segment should not appear on screen %d:\n%s", s, bar)
+		}
+	}
+
+	// A stale snapshot (older than 5 minutes) hides the segment: the number
+	// may no longer be true, and a wrong gauge is worse than none.
+	m.screen = screenAgent
+	m.usageSnap.FetchedAt = time.Now().Add(-6 * time.Minute)
+	if bar := barLine(t, m); strings.Contains(bar, "95%") {
+		t.Errorf("a stale snapshot should hide the segment:\n%s", bar)
+	}
+}
+
+func TestBarUsageSegmentWeekBinding(t *testing.T) {
+	// The seven-day window binds (84 > 60): the segment flips to the wk label
+	// with the reset weekday instead of the session countdown.
+	m := usageModel(60, 84)
+	bar := barLine(t, m)
+	if !strings.Contains(bar, "wk 84%") {
+		t.Errorf("bar should show the binding week window as wk:\n%s", bar)
+	}
+	weekday := strings.ToLower(m.usageSnap.SevenDay.ResetsAt.Local().Format("Mon"))
+	if !strings.Contains(bar, weekday) {
+		t.Errorf("week binding should show the reset weekday %q:\n%s", weekday, bar)
+	}
+	if strings.Contains(bar, "2h40m") {
+		t.Errorf("week binding should not show the session countdown:\n%s", bar)
+	}
+}
+
+func TestUsageSegmentClickOpensOverlay(t *testing.T) {
+	m := usageModel(68, 40)
+	seg, ok := m.usageSegment()
+	if !ok {
+		t.Fatal("usage segment should apply on the agent screen with a fresh snapshot")
+	}
+	// The segment leads the right-anchored context label; hit both edges.
+	start := m.width - lipgloss.Width(m.barContextLabel()+"  ")
+	for _, x := range []int{start, start + lipgloss.Width(seg) - 1} {
+		if !m.usageZoneAt(x, 0) {
+			t.Errorf("usage zone should be hit-tested at column %d", x)
+		}
+	}
+	if m.usageZoneAt(start+lipgloss.Width(seg), 0) {
+		t.Error("the separator after the segment should not hit the usage zone")
+	}
+	mm, _ := m.handleMouseClick(leftClickAt(start, 0))
+	if !mm.(Model).usageOpen {
+		t.Error("clicking the usage segment should open the usage overlay")
+	}
+}
+
+func TestUsageOverlayRows(t *testing.T) {
+	m := usageModel(68, 84)
+	// A rising sample ring spanning >5 minutes: the burn row appears with a
+	// rate and, since capping lands before the reset, the projection line.
+	now := time.Now()
+	m.usageHist = []usageSample{
+		{at: now.Add(-10 * time.Minute), util: 60},
+		{at: now.Add(-5 * time.Minute), util: 64},
+		{at: now, util: 68},
+	}
+
+	out := renderToTerminal(t, m.renderUsage(m.height-barHeight), m.width, m.height-barHeight)
+	for _, want := range []string{"USAGE", "session", "68%", "week", "84%", "resets", "%/hr", "at this pace", "esc"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("overlay missing %q:\n%s", want, out)
+		}
+	}
+	// No opus window on this plan: the row is skipped, not placeholdered.
+	if strings.Contains(out, "opus") {
+		t.Errorf("overlay should skip the absent opus window:\n%s", out)
+	}
+
+	// Only the five-hour window present: week vanishes too.
+	m.usageSnap.SevenDay = nil
+	m.usageHist = nil
+	out = renderToTerminal(t, m.renderUsage(m.height-barHeight), m.width, m.height-barHeight)
+	if strings.Contains(out, "week") {
+		t.Errorf("overlay should skip the absent week window:\n%s", out)
+	}
+
+	// Before any snapshot has ever arrived the overlay says so.
+	empty := modelWithAgents(1)
+	empty.screen = screenAgent
+	out = renderToTerminal(t, empty.renderUsage(empty.height-barHeight), empty.width, empty.height-barHeight)
+	if !strings.Contains(out, "no usage data") {
+		t.Errorf("overlay should report missing data before the first poll:\n%s", out)
+	}
+}
 
 func TestHumanDur(t *testing.T) {
 	cases := []struct {

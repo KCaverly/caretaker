@@ -3,6 +3,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/state"
+	"github.com/KCaverly/caretaker/internal/usage"
 )
 
 // barHeight is the number of rows the top chrome occupies: the status bar and
@@ -37,6 +39,7 @@ const (
 	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
 	defaultKeyNotif        = "ctrl+n" // agent board alias (was the notification overlay)
 	defaultKeyPrompt       = "ctrl+y" // new-agent form pre-set for a background home agent
+	defaultKeyUsage        = "ctrl+u" // usage overlay (agent screen only)
 
 	// Terminal pane management — only intercepted when the terminal screen is active.
 	defaultKeyTermSplitV = "ctrl+\\" // new pane to the right
@@ -153,7 +156,7 @@ type Model struct {
 	keyCycle, keyPicker                    string
 	keyPalette, keyNextAgent, keyPrevAgent string
 	keyHelp, keyGlobalConfig, keyNotif     string
-	keyPrompt                              string
+	keyPrompt, keyUsage                    string
 
 	keyTermSplitV, keyTermSplitH            string
 	keyTermCycle, keyTermZoom, keyTermClose string
@@ -206,6 +209,18 @@ type Model struct {
 	// stored unread markers (done) keyed by agent pid; waiting badges are
 	// derived live from agentStatus and never stored here
 	attention map[int]attnEntry
+
+	// plan usage-limit gauge: the latest snapshot, whether one has ever
+	// arrived, and a ring of five-hour utilization samples (trimmed to
+	// usageHistoryWindow) that feeds the overlay's burn-rate row. The gauge
+	// degrades silently — failures only leave the snapshot to go stale, which
+	// hides the bar segment on its own.
+	usageSnap      usage.Snapshot
+	usageHave      bool
+	usageOpen      bool // usage overlay visibility (agent screen only)
+	usageHist      []usageSample
+	usageFails     int // consecutive poll failures; tracked, never surfaced
+	usageThreshold int // percent at/above which the bar segment shows
 
 	// prompt input for the board's new-agent form
 	promptInput textinput.Model
@@ -295,6 +310,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if prompt == "" {
 		prompt = defaultKeyPrompt
 	}
+	usageKey := ctrl.UsageKey()
+	if usageKey == "" {
+		usageKey = defaultKeyUsage
+	}
 	termSplitV, termSplitH, termCycle, termZoom, termClose := ctrl.TermPaneKeys()
 	if termSplitV == "" {
 		termSplitV = defaultKeyTermSplitV
@@ -317,8 +336,9 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyCycle: cycle, keyPicker: picker,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
-		keyPrompt:     prompt,
-		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
+		keyPrompt: prompt, keyUsage: usageKey,
+		usageThreshold: ctrl.UsageThreshold(),
+		keyTermSplitV:  termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
 		filter: filter, nameInput: name, rootInput: rootInput,
 		promptInput:     promptInput,
@@ -363,12 +383,38 @@ type statusMsg struct {
 	err   error
 }
 
+// usageTickMsg fires on the usage-poll timer; usageMsg carries the result of
+// one plan-usage fetch.
+type usageTickMsg struct{}
+
+type usageMsg struct {
+	snap usage.Snapshot
+	err  error
+}
+
+// usageSample is one successful poll's five-hour utilization, kept in
+// Model.usageHist so the overlay can estimate the burn rate.
+type usageSample struct {
+	at   time.Time
+	util float64
+}
+
+// Plan-usage cadence and freshness bounds. The poll is slow (the window moves
+// in minutes, not seconds); a snapshot older than usageStaleAfter no longer
+// steers the bar segment, and samples beyond usageHistoryWindow no longer
+// weigh on the burn-rate estimate.
+const (
+	usagePollInterval  = 60 * time.Second
+	usageStaleAfter    = 5 * time.Minute
+	usageHistoryWindow = time.Hour
+)
+
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
 	if m.screen == screenSetup {
 		return tea.Batch(textinput.Blink, m.repaintCmd())
 	}
-	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd(), m.pollStatusCmd())
+	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd(), m.pollStatusCmd(), m.pollUsageCmd())
 }
 
 // pollStatusCmd runs one `claude agents --json` poll off the UI goroutine.
@@ -385,6 +431,27 @@ func (m Model) pollStatusCmd() tea.Cmd {
 // scheduleStatusTick re-arms the poll timer at statusTickInterval.
 func (m Model) scheduleStatusTick() tea.Cmd {
 	return tea.Tick(m.statusTickInterval(), func(time.Time) tea.Msg { return statusTickMsg{} })
+}
+
+// pollUsageCmd runs one plan-usage fetch off the UI goroutine.
+func (m Model) pollUsageCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		snap, err := usage.Fetch(ctx)
+		return usageMsg{snap: snap, err: err}
+	}
+}
+
+// scheduleUsageTick re-arms the usage poll at usagePollInterval.
+func (m Model) scheduleUsageTick() tea.Cmd {
+	return tea.Tick(usagePollInterval, func(time.Time) tea.Msg { return usageTickMsg{} })
+}
+
+// usageFresh reports whether the latest snapshot is recent enough to steer
+// the bar segment; the overlay keeps showing whatever it has regardless.
+func (m Model) usageFresh() bool {
+	return m.usageHave && time.Since(m.usageSnap.FetchedAt) <= usageStaleAfter
 }
 
 // statusTickInterval picks the agent-poll cadence: 2s while any agent is
@@ -499,12 +566,12 @@ func (m Model) syncVisible() {
 }
 
 // visibleSessions returns the sessions whose output is currently drawn:
-// nothing while the picker, setup, or a full-body overlay (help, board) is
-// shown; the editor or focused agent on their screens; and on the terminal
-// screen either the focused pane (zoomed/single) or every pane in the split
-// layout. Mirrors the branch structure of View.
+// nothing while the picker, setup, or a full-body overlay (help, board,
+// usage) is shown; the editor or focused agent on their screens; and on the
+// terminal screen either the focused pane (zoomed/single) or every pane in
+// the split layout. Mirrors the branch structure of View.
 func (m Model) visibleSessions() []*session.Session {
-	if m.helpOpen || m.boardOpen || m.screen == screenPicker || m.screen == screenSetup {
+	if m.helpOpen || m.boardOpen || m.usageOpen || m.screen == screenPicker || m.screen == screenSetup {
 		return nil
 	}
 	if m.current == nil || m.current.ws == nil {
@@ -667,6 +734,33 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.maybeExpireStatus()
 		return m, m.scheduleStatusTick()
+
+	case usageTickMsg:
+		return m, m.pollUsageCmd()
+
+	case usageMsg:
+		// Not signed into Claude Code: the feature simply doesn't exist here.
+		// Stop polling — no retries, no error, nothing to show.
+		if errors.Is(msg.err, usage.ErrNoCredentials) {
+			return m, nil
+		}
+		if msg.err != nil {
+			// Degrade silently: the snapshot goes stale and the bar segment
+			// hides on its own; keep polling at the normal cadence.
+			m.usageFails++
+			return m, m.scheduleUsageTick()
+		}
+		m.usageFails = 0
+		m.usageSnap = msg.snap
+		m.usageHave = true
+		if w := msg.snap.FiveHour; w != nil {
+			m.usageHist = append(m.usageHist, usageSample{at: msg.snap.FetchedAt, util: w.Utilization})
+		}
+		cutoff := time.Now().Add(-usageHistoryWindow)
+		for len(m.usageHist) > 0 && m.usageHist[0].at.Before(cutoff) {
+			m.usageHist = m.usageHist[1:]
+		}
+		return m, m.scheduleUsageTick()
 
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
@@ -1287,6 +1381,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.helpOpen = true
 		return m, nil
 	}
+	// The usage overlay is modal like the board, but read-only: it only closes
+	// on esc or its own key, and swallows everything else so no keystroke
+	// leaks into the session underneath.
+	if m.usageOpen {
+		if s := msg.String(); s == "esc" || s == m.keyUsage {
+			m.usageOpen = false
+		}
+		return m, nil
+	}
 	if m.boardOpen {
 		return m.handleBoard(msg)
 	}
@@ -1328,7 +1431,7 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.ctrl.SetRoot(abs)
 		m.screen = screenPicker
 		m.flash("config saved — welcome to caretaker!")
-		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd())
+		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd(), m.pollUsageCmd())
 	}
 	var cmd tea.Cmd
 	m.rootInput, cmd = m.rootInput.Update(msg)
@@ -1337,6 +1440,13 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// The usage key is only reserved on the agent screen (where the gauge
+	// lives); everywhere else it stays an ordinary session key and is
+	// forwarded below.
+	if msg.String() == m.keyUsage && m.screen == screenAgent {
+		m.usageOpen = true
+		return m, nil
+	}
 	switch msg.String() {
 	case m.keyCycle:
 		m.screen = m.screen.next()
@@ -1514,6 +1624,10 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.notifZoneAt(mo.X, mo.Y) {
 			return m.openBoard()
+		}
+		if m.usageZoneAt(mo.X, mo.Y) {
+			m.usageOpen = true
+			return m, nil
 		}
 		if m.paneZoomAt(mo.X, mo.Y) {
 			return m.toggleZoom()

@@ -5,11 +5,13 @@ import (
 	"image/color"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/usage"
 )
 
 // Palette (gruvbox dark, medium contrast).
@@ -62,6 +64,8 @@ func (m Model) View() tea.View {
 		body = m.renderHelp(h - barHeight)
 	case m.boardOpen:
 		body = m.renderBoard(h - barHeight)
+	case m.usageOpen:
+		body = m.renderUsage(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
@@ -183,7 +187,97 @@ func (m Model) barContextLabel() string {
 		}
 		s = lipgloss.NewStyle().Foreground(cPurple).Render(pos) + sep + s
 	}
+	if seg, ok := m.usageSegment(); ok {
+		w, _ := m.usageSnap.Binding()
+		s = usageSeverity(w.Utilization).Render(seg) + sep + s
+	}
 	return s
+}
+
+// usageSegment returns the plan-usage gauge — pie glyph, the binding window's
+// percent, and when it resets — and whether it applies: agent screen only,
+// snapshot still fresh, and utilization at or past the configured threshold.
+// Shared by barContextLabel (which styles and places it) and usageZoneAt
+// (which measures it), so the drawn text and its click target can never
+// drift. Like the other volatile segments it sits left of the stable
+// repo / worktree label; it leads them because it hot-swaps with every poll.
+func (m Model) usageSegment() (string, bool) {
+	if m.screen != screenAgent || !m.usageFresh() {
+		return "", false
+	}
+	w, limit := m.usageSnap.Binding()
+	if w == nil || w.Utilization < float64(m.usageThreshold) {
+		return "", false
+	}
+	seg := usagePie(w.Utilization)
+	switch limit {
+	case usage.LimitWeek:
+		seg += " wk"
+	case usage.LimitOpus:
+		seg += " opus"
+	}
+	seg += fmt.Sprintf(" %d%%", int(w.Utilization+0.5))
+	if !w.ResetsAt.IsZero() {
+		if limit == usage.LimitSession {
+			seg += " " + humanDur(time.Until(w.ResetsAt))
+		} else {
+			// A week-scale reset lands days out; the weekday says enough.
+			seg += " " + strings.ToLower(w.ResetsAt.Local().Format("Mon"))
+		}
+	}
+	return seg, true
+}
+
+// usageZoneAt reports whether bar coordinates land on the usage segment.
+// It mirrors renderBar's right-side layout: the segment leads
+// barContextLabel, so its left edge is where the context label begins.
+func (m Model) usageZoneAt(x, y int) bool {
+	if y != 0 {
+		return false
+	}
+	seg, ok := m.usageSegment()
+	if !ok {
+		return false
+	}
+	prefix := ""
+	if notif := m.renderNotifZone(); notif != "" {
+		prefix = notif + "   "
+	}
+	right := prefix + m.barContextLabel() + "  "
+	start := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
+	return x >= start && x < start+lipgloss.Width(seg)
+}
+
+// usagePie maps a utilization percent to a pie glyph that fills as the
+// window is consumed. Bands are centered so each glyph covers the quarter it
+// depicts (e.g. ◑ spans 37.5–62.5).
+func usagePie(util float64) string {
+	switch {
+	case util < 12.5:
+		return "○"
+	case util < 37.5:
+		return "◔"
+	case util < 62.5:
+		return "◑"
+	case util < 87.5:
+		return "◕"
+	default:
+		return "●"
+	}
+}
+
+// usageSeverity styles a utilization percent: dim while comfortable, yellow
+// from 70, red and bold from 90. Deliberately independent of the visibility
+// threshold, so a low threshold still colour-codes an urgent window.
+func usageSeverity(util float64) lipgloss.Style {
+	switch {
+	case util >= 90:
+		return lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	case util >= 70:
+		return lipgloss.NewStyle().Foreground(cYellow)
+	default:
+		return dimStyle
+	}
 }
 
 // paneSegment returns the terminal-screen pane indicator — grid glyph, pane
@@ -446,6 +540,138 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	return centerBlock(boxStr, m.width, h)
 }
 
+// usageGaugeWidth is the overlay gauge's cell count — wide enough that one
+// cell is a legible ~5.5%, narrow enough to fit the overlay's minimum width.
+const usageGaugeWidth = 18
+
+// usageBurnMinSpan is how much time the sample ring must cover before the
+// overlay shows a burn rate; two adjacent polls would extrapolate noise.
+const usageBurnMinSpan = 5 * time.Minute
+
+// renderUsage draws the plan-usage overlay: one gauge per present limit
+// window with its reset time, plus a burn-rate estimate once the sample ring
+// spans enough time to be meaningful. Unlike the bar segment it ignores the
+// threshold and staleness gates — when the user explicitly asks, they get
+// whatever ct knows.
+func (m Model) renderUsage(h int) string {
+	innerW := clamp(m.width-8, 32, 56)
+	rows := []string{header("usage", -1), ""}
+	if !m.usageHave {
+		rows = append(rows, dimStyle.Render("  no usage data"))
+	} else {
+		rows = append(rows, m.usageWindowRows()...)
+		rows = append(rows, m.usageBurnRows()...)
+	}
+	rows = append(rows, "", "  "+keyhint("esc", "close"))
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// usageWindowRows renders a gauge line (and an indented reset line) per
+// present window; absent windows are skipped outright — a placeholder row
+// would imply a limit the plan doesn't have.
+func (m Model) usageWindowRows() []string {
+	var rows []string
+	add := func(label string, w *usage.Window, session bool) {
+		if w == nil {
+			return
+		}
+		rows = append(rows, "  "+dimStyle.Render(padLine(label, 9))+usageGauge(w.Utilization)+
+			usageSeverity(w.Utilization).Render(fmt.Sprintf(" %3d%%", int(w.Utilization+0.5))))
+		if w.ResetsAt.IsZero() {
+			return
+		}
+		reset := w.ResetsAt.Local()
+		line := "resets " + strings.ToLower(reset.Format("Mon 3:04 PM"))
+		if session {
+			// The session window resets within hours; the countdown matters
+			// more than the weekday.
+			line = fmt.Sprintf("resets %s (%s)",
+				strings.ToLower(reset.Format("3:04 PM")), untilPhrase(time.Until(reset)))
+		}
+		rows = append(rows, "  "+strings.Repeat(" ", 9)+dimStyle.Render(line))
+	}
+	add("session", m.usageSnap.FiveHour, true)
+	add("week", m.usageSnap.SevenDay, false)
+	add("opus", m.usageSnap.SevenDayOpus, false)
+	return rows
+}
+
+// usageBurnRows estimates the five-hour window's burn rate from the sample
+// ring: a sparkline of the between-poll deltas, the hourly rate, and — when
+// the window would cap before it resets — the projected time it caps. Hidden
+// until the ring spans usageBurnMinSpan with a rising trend, so a flat or
+// draining window never shows a scary extrapolation, and the projection line
+// is dropped when the reset lands first (the window frees up before it caps).
+func (m Model) usageBurnRows() []string {
+	hist := m.usageHist
+	if len(hist) < 2 {
+		return nil
+	}
+	first, last := hist[0], hist[len(hist)-1]
+	span := last.at.Sub(first.at)
+	if span < usageBurnMinSpan || last.util <= first.util {
+		return nil
+	}
+	perHour := (last.util - first.util) / span.Hours()
+	rows := []string{"  " + dimStyle.Render(padLine("burn", 9)) + usageSparkline(hist) +
+		dimStyle.Render(fmt.Sprintf(" ~%d%%/hr", int(perHour+0.5)))}
+	if w := m.usageSnap.FiveHour; w != nil && w.Utilization < 100 {
+		caps := time.Now().Add(time.Duration((100 - w.Utilization) / perHour * float64(time.Hour)))
+		if w.ResetsAt.IsZero() || caps.Before(w.ResetsAt) {
+			rows = append(rows, "  "+strings.Repeat(" ", 9)+
+				dimStyle.Render("at this pace: caps ~"+strings.ToLower(caps.Local().Format("3:04 PM"))))
+		}
+	}
+	return rows
+}
+
+// usageSparkline draws the ring's between-sample utilization deltas as a
+// block ramp: flat polls sit on the baseline, the steepest delta tops out.
+// Only the newest deltas are drawn so the line always fits the overlay.
+func usageSparkline(hist []usageSample) string {
+	const maxCells = 24
+	ramp := []rune("▁▂▃▄▅▆▇█")
+	if len(hist) > maxCells+1 {
+		hist = hist[len(hist)-maxCells-1:]
+	}
+	deltas := make([]float64, 0, len(hist)-1)
+	maxD := 0.0
+	for i := 1; i < len(hist); i++ {
+		d := max(0, hist[i].util-hist[i-1].util)
+		deltas = append(deltas, d)
+		maxD = max(maxD, d)
+	}
+	var b strings.Builder
+	for _, d := range deltas {
+		idx := 0
+		if maxD > 0 {
+			idx = int(d / maxD * float64(len(ramp)-1))
+		}
+		b.WriteRune(ramp[idx])
+	}
+	return b.String()
+}
+
+// usageGauge renders a utilization percent as a fixed-width block gauge, the
+// filled span coloured by the same severity ramp as the bar segment.
+func usageGauge(util float64) string {
+	filled := clamp(int(util/100*usageGaugeWidth+0.5), 0, usageGaugeWidth)
+	return usageSeverity(util).Render(strings.Repeat("█", filled)) +
+		dimStyle.Render(strings.Repeat("░", usageGaugeWidth-filled))
+}
+
+// untilPhrase formats a duration as the overlay's parenthetical countdown.
+func untilPhrase(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
+}
+
 // truncateTo shortens s to at most w display columns, appending "…" when it
 // had to cut.
 func truncateTo(s string, w int) string {
@@ -682,6 +908,7 @@ func (m Model) renderHelp(h int) string {
 		row(m.keyPalette, "agent board"),
 		row(m.keyNotif, "agent board (alias)"),
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
+		row(m.keyUsage, "usage limits"),
 		"",
 		repoHdrStyle.Render("  Terminal panes"),
 		row(m.keyTermSplitV, "vertical split"),

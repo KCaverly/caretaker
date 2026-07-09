@@ -149,6 +149,13 @@ func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
 // PromptKey returns the key that opens the quick-prompt overlay.
 func (c *Controller) PromptKey() string { return c.cfg.Keys.Prompt }
 
+// UsageKey returns the key that opens the usage overlay on the agent screen.
+func (c *Controller) UsageKey() string { return c.cfg.Keys.Usage }
+
+// UsageThreshold returns the utilization percent at/above which the bar's
+// usage gauge appears (0 = always, >100 = never).
+func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
+
 // TermPaneKeys returns the reserved keys for terminal pane management. These
 // are only intercepted when the terminal screen is active.
 func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {

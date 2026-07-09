@@ -28,6 +28,15 @@ type Config struct {
 	BranchName string `toml:"branch_name"`
 	// Keys configures the reserved navigation keystrokes.
 	Keys Keys `toml:"keys"`
+	// Usage configures the plan usage-limit gauge.
+	Usage Usage `toml:"usage"`
+}
+
+// Usage configures the plan usage-limit gauge.
+type Usage struct {
+	// Threshold is the utilization percent at/above which the status-bar
+	// usage gauge appears (0 shows it always; values above 100 never show it).
+	Threshold int `toml:"threshold"`
 }
 
 // Keys are the reserved keystrokes ct handles instead of forwarding to an
@@ -58,6 +67,8 @@ type Keys struct {
 	TermCycle  string `toml:"term_cycle"`   // cycle pane focus
 	TermZoom   string `toml:"term_zoom"`    // toggle full-size
 	TermClose  string `toml:"term_close"`   // close active pane
+	// Usage opens the usage overlay on the claude screen.
+	Usage string `toml:"usage"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -79,7 +90,9 @@ func Default() Config {
 			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n", Prompt: "ctrl+y",
 			TermSplitV: "ctrl+\\", TermSplitH: "ctrl+-",
 			TermCycle: "ctrl+w", TermZoom: "ctrl+f", TermClose: "ctrl+x",
+			Usage: "ctrl+u",
 		},
+		Usage: Usage{Threshold: 50},
 	}
 }
 
@@ -174,6 +187,10 @@ func (c *Config) validate() error {
 		return err
 	}
 	c.Root = abs
+	// A negative threshold is meaningless; treat it as "always show".
+	if c.Usage.Threshold < 0 {
+		c.Usage.Threshold = 0
+	}
 	return nil
 }
 
