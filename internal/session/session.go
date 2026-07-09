@@ -125,6 +125,14 @@ func (s *Session) WriteInput(p []byte) (int, error) { return s.pty.Write(p) }
 // SendKey forwards a key event to the program.
 func (s *Session) SendKey(k uv.KeyEvent) { s.emu.SendKey(k) }
 
+// Paste delivers pasted text to the program. The emulator wraps it in the
+// bracketed-paste guards (ESC[200~…ESC[201~) when the child has enabled DEC
+// private mode 2004, so a multi-line paste is received as one literal block
+// rather than as line-by-line keystrokes — nvim and claude both enable the
+// mode, and raw bytes would trigger editor auto-indent mangling or a premature
+// submit. When the child has not enabled the mode the text is sent as-is.
+func (s *Session) Paste(text string) { s.emu.Paste(text) }
+
 // SendMouse forwards a mouse event to the program (the emulator only encodes it
 // if the program has requested a mouse mode).
 func (s *Session) SendMouse(m uv.MouseEvent) { s.emu.SendMouse(m) }

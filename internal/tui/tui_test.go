@@ -770,6 +770,92 @@ func TestAttentionClearedOnAgentView(t *testing.T) {
 	}
 }
 
+// waitForSession polls a session's rendered screen until it contains want.
+func waitForSession(t *testing.T, s *session.Session, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(s.Render(), want) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q; screen was:\n%s", want, s.Render())
+}
+
+// pasteModel activates one real workspace (cheap cat/sh children) on the
+// editor screen and returns the model plus its active session. cat echoes its
+// stdin, so anything routed to the session shows up on the session's screen.
+func pasteModel(t *testing.T) (Model, *session.Session) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	t.Cleanup(mgr.CloseAll)
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+	mm, _ = m.activate("repo", "wt", t.TempDir())
+	m = mm.(Model)
+	return m, m.activeSession()
+}
+
+// TestPasteReachesSession: a paste on a bare session screen is delivered to
+// the active program (and, like typed input, retires the help hint).
+func TestPasteReachesSession(t *testing.T) {
+	m, sess := pasteModel(t)
+	if sess == nil {
+		t.Fatal("expected an active session")
+	}
+	mm, _ := m.Update(tea.PasteMsg{Content: "pasted-into-session"})
+	m = mm.(Model)
+	if !m.hintSeen {
+		t.Error("pasting into a session should dismiss the help hint like typed input")
+	}
+	waitForSession(t, sess, "pasted-into-session")
+}
+
+// TestPasteReachesPickerFilter: a paste on the picker still lands in the
+// focused filter input (the pre-existing textinput behavior is preserved).
+func TestPasteReachesPickerFilter(t *testing.T) {
+	m := sampleModel() // picker, NEW section, filter focused
+	if !m.filter.Focused() {
+		t.Fatal("precondition: the picker filter should be focused")
+	}
+	mm, _ := m.Update(tea.PasteMsg{Content: "api"})
+	m = mm.(Model)
+	if got := m.filter.Value(); got != "api" {
+		t.Fatalf("paste should reach the filter input, got %q", got)
+	}
+}
+
+// TestPasteBlockedByOverlay: a paste while an overlay is open must not leak
+// into the session drawn beneath it.
+func TestPasteBlockedByOverlay(t *testing.T) {
+	m, sess := pasteModel(t)
+	if sess == nil {
+		t.Fatal("expected an active session")
+	}
+	m.helpOpen = true
+	mm, _ := m.Update(tea.PasteMsg{Content: "leaked-through-overlay"})
+	m = mm.(Model)
+
+	// Close the overlay and paste a value that IS allowed through. Messages are
+	// processed in order, so once the allowed paste is on screen the blocked one
+	// would already be visible too — its absence proves it was swallowed.
+	m.helpOpen = false
+	mm, _ = m.Update(tea.PasteMsg{Content: "allowed-after-close"})
+	m = mm.(Model)
+	waitForSession(t, sess, "allowed-after-close")
+	if strings.Contains(sess.Render(), "leaked-through-overlay") {
+		t.Error("paste while an overlay was open leaked into the session")
+	}
+}
+
 func TestToUVKey(t *testing.T) {
 	uvk := toUVKey(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	if uvk.Code != 'a' || uvk.Text != "a" {

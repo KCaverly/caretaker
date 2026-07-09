@@ -780,35 +780,80 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
+	case tea.PasteMsg:
+		// Bubble Tea v2 delivers bracketed paste as its own message type, not a
+		// KeyPressMsg, so it needs routing of its own — see handlePaste.
+		return m.handlePaste(msg)
+
 	default:
 		// Route everything else (notably the cursor-blink tick from
 		// textinput.Blink, started in Init) to whichever text input is
 		// currently focused, so its blink loop keeps re-arming itself.
-		// KeyPressMsg and mouse messages never reach here — they have
+		// KeyPressMsg, paste, and mouse messages never reach here — they have
 		// explicit cases above.
-		var cmds []tea.Cmd
-		if m.filter.Focused() {
-			var cmd tea.Cmd
-			m.filter, cmd = m.filter.Update(msg)
-			cmds = append(cmds, cmd)
-		}
-		if m.nameInput.Focused() {
-			var cmd tea.Cmd
-			m.nameInput, cmd = m.nameInput.Update(msg)
-			cmds = append(cmds, cmd)
-		}
-		if m.rootInput.Focused() {
-			var cmd tea.Cmd
-			m.rootInput, cmd = m.rootInput.Update(msg)
-			cmds = append(cmds, cmd)
-		}
-		if m.promptInput.Focused() {
-			var cmd tea.Cmd
-			m.promptInput, cmd = m.promptInput.Update(msg)
-			cmds = append(cmds, cmd)
-		}
-		return m, tea.Batch(cmds...)
+		mm, cmd := m.routeToFocusedInputs(msg)
+		return mm, cmd
 	}
+}
+
+// routeToFocusedInputs forwards msg to every currently-focused textinput and
+// batches their commands. It backs both the default branch (where the
+// cursor-blink tick must reach the focused input so its blink loop re-arms)
+// and the non-session path of the paste router.
+func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
+	var cmds []tea.Cmd
+	if m.filter.Focused() {
+		var cmd tea.Cmd
+		m.filter, cmd = m.filter.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	if m.nameInput.Focused() {
+		var cmd tea.Cmd
+		m.nameInput, cmd = m.nameInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	if m.rootInput.Focused() {
+		var cmd tea.Cmd
+		m.rootInput, cmd = m.rootInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	if m.promptInput.Focused() {
+		var cmd tea.Cmd
+		m.promptInput, cmd = m.promptInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// handlePaste routes a bracketed-paste message. Pastes need the same routing
+// keys get: without a case of their own they fall to the default branch and
+// reach only a focused textinput, so on a session screen (where none is
+// focused) the paste silently vanishes — the bug this fixes.
+//
+//   - On overlays (help/board/usage), setup, and the picker the paste behaves
+//     like typed input: it goes to whichever textinput is focused (the picker
+//     filter, the name/root/prompt inputs), and is otherwise swallowed — it
+//     never leaks into a session drawn beneath an overlay.
+//   - On a bare session screen it is handed to the active program through the
+//     emulator's paste-aware path (Session.Paste), which honors the child's
+//     bracketed-paste mode.
+func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
+	onSession := m.screen != screenPicker && m.screen != screenSetup &&
+		!m.helpOpen && !m.boardOpen && !m.usageOpen
+	if onSession {
+		if s := m.activeSession(); s != nil {
+			m = m.dismissHint() // first input into a session retires the hint
+			s.Paste(msg.Content)
+		}
+		return m, nil
+	}
+	mm, cmd := m.routeToFocusedInputs(msg)
+	// Mirror handleNewKey: keep the repo matches in sync when the paste lands
+	// in the picker's filter.
+	if mm.filter.Focused() {
+		mm.recomputeMatches()
+	}
+	return mm, cmd
 }
 
 // watchingAgent reports whether the user is on the agent screen with the agent

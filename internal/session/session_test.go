@@ -1,12 +1,77 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	uv "github.com/charmbracelet/ultraviolet"
 )
+
+// waitForFileEquals polls path until its contents equal want, or fails. Used
+// by the paste tests, which capture exactly the bytes a child receives on its
+// stdin so the bracketed-paste wrapping can be asserted precisely.
+func waitForFileEquals(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			got = string(b)
+			if got == want {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out; file %s = %q, want %q", path, got, want)
+}
+
+// TestSessionPasteRaw verifies that when the child has NOT enabled bracketed
+// paste, the pasted text is delivered to its stdin verbatim (unwrapped). The
+// child runs in raw mode with echo off so it receives the bytes immediately
+// and unmodified, and captures them to a file we inspect.
+func TestSessionPasteRaw(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "captured")
+	s, err := Start(Terminal, "term", dir,
+		[]string{"sh", "-c", "stty raw -echo; printf READY; exec cat > '" + out + "'"},
+		80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	waitFor(t, s, "READY") // child up and raw mode in effect
+
+	s.Paste("plain paste")
+	waitForFileEquals(t, out, "plain paste")
+}
+
+// TestSessionPasteBracketed verifies that when the child has enabled DEC
+// private mode 2004 (bracketed paste) — as nvim and claude do — the pasted
+// text arrives wrapped in the ESC[200~…ESC[201~ guards, so a multi-line paste
+// is treated as one literal block instead of per-line keystrokes.
+func TestSessionPasteBracketed(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "captured")
+	// printf '\033[?2004h' enables the mode (child output the emulator sees);
+	// printf READY afterwards guarantees that, once it renders, the mode-set
+	// sequence has already been processed.
+	s, err := Start(Terminal, "term", dir,
+		[]string{"sh", "-c", `stty raw -echo; printf '\033[?2004h'; printf READY; exec cat > '` + out + `'`},
+		80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	waitFor(t, s, "READY")
+
+	s.Paste("alpha\nbeta")
+	const start, end = "\x1b[200~", "\x1b[201~"
+	waitForFileEquals(t, out, start+"alpha\nbeta"+end)
+}
 
 func keyRune(r rune) uv.KeyPressEvent { return uv.KeyPressEvent{Code: r, Text: string(r)} }
 func keyEnter() uv.KeyPressEvent      { return uv.KeyPressEvent{Code: uv.KeyEnter} }
