@@ -896,7 +896,7 @@ func (m Model) renderHelp(h int) string {
 		row("enter", "open / create"),
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
-		row("x", "remove worktree"),
+		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
 		"",

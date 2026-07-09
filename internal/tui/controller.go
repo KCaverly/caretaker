@@ -121,9 +121,9 @@ func (c *Controller) Create(r repo.Repo, name, baseRef string) (repo.Worktree, e
 	return repo.CreateWorktree(r, relPath, branch, baseRef)
 }
 
-// Remove deletes a worktree and its branch.
-func (c *Controller) Remove(r repo.Repo, wt repo.Worktree) error {
-	return repo.RemoveWorktree(r, wt, true)
+// Remove deletes a worktree, and its branch when deleteBranch is set.
+func (c *Controller) Remove(r repo.Repo, wt repo.Worktree, deleteBranch bool) error {
+	return repo.RemoveWorktree(r, wt, deleteBranch)
 }
 
 // Keys returns the reserved navigation keystrokes (cycle, return-to-picker).

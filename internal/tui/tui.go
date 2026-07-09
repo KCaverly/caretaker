@@ -1972,7 +1972,14 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "x":
 		if it, ok := m.selectedActive(); ok && !it.view.WT.IsMain {
 			m.mode = modeConfirmRemove
-			m.status = fmt.Sprintf("remove worktree %q and its branch? (y/n)", it.view.WT.Name)
+			// git worktree remove --force discards uncommitted work silently, so
+			// when the worktree is dirty the prompt must say so. Either way the
+			// user picks whether the branch goes with it.
+			if it.view.Dirty {
+				m.status = fmt.Sprintf("remove worktree %q? UNCOMMITTED CHANGES will be lost. (y = remove + delete branch / b = keep branch / n)", it.view.WT.Name)
+			} else {
+				m.status = fmt.Sprintf("remove worktree %q? (y = remove + delete branch / b = keep branch / n)", it.view.WT.Name)
+			}
 		}
 	case "1", "2", "3":
 		// The deck badges these ranks next to the most recently opened
@@ -2023,17 +2030,28 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// handleConfirmKey resolves the remove-worktree prompt: "y" removes the
+// worktree and deletes its branch, "b" removes the worktree but keeps the
+// branch, anything else cancels. The target is re-read from the cursor (it
+// can't move while the prompt is modal), mirroring the other confirm handlers.
 func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "y" {
+	key := msg.String()
+	if key == "y" || key == "b" {
+		deleteBranch := key == "y"
 		it, ok := m.selectedActive()
 		m.mode = modeNormal
 		if !ok {
+			m.status = ""
 			return m, nil
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		r, wt := it.repo, it.view.WT
-		m.flash("removing " + wt.Name + "…")
-		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt)} }
+		if deleteBranch {
+			m.flash("removing " + wt.Name + "…")
+		} else {
+			m.flash("removing " + wt.Name + " (keeping branch)…")
+		}
+		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt, deleteBranch)} }
 	}
 	m.mode = modeNormal
 	m.status = ""

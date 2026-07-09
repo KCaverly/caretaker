@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1186,5 +1189,173 @@ func TestStopGuardBusyConfirms(t *testing.T) {
 	}
 	if confirmed.mgr.Has("repo/a") {
 		t.Fatal("'y' should stop the workspace")
+	}
+}
+
+// removePromptModel builds a picker model whose active list holds one dirty and
+// one clean worktree, so the remove prompt's dirty-awareness can be exercised
+// without touching git.
+func removePromptModel() Model {
+	m := sampleModel()
+	m.screen = screenPicker
+	m.focus = focusActive
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Repo: "r", Name: "dirtywt", Branch: "dirtywt"}, Dirty: true}},
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Repo: "r", Name: "cleanwt", Branch: "cleanwt"}}},
+	}
+	return m
+}
+
+func TestRemovePromptDirtyAware(t *testing.T) {
+	// Dirty worktree: the prompt must warn that uncommitted work is lost.
+	m := removePromptModel()
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'x' should enter modeConfirmRemove, got %v", m.mode)
+	}
+	if !strings.Contains(m.status, "UNCOMMITTED") {
+		t.Fatalf("dirty worktree prompt must mention uncommitted changes, got %q", m.status)
+	}
+	if !strings.Contains(m.status, "keep branch") {
+		t.Fatalf("prompt should offer the keep-branch choice, got %q", m.status)
+	}
+
+	// Clean worktree: same choices, but no data-loss warning.
+	m = removePromptModel()
+	m.activeCursor = 1
+	mm, _ = m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'x' should enter modeConfirmRemove, got %v", m.mode)
+	}
+	if strings.Contains(m.status, "UNCOMMITTED") {
+		t.Fatalf("clean worktree prompt must not warn of uncommitted changes, got %q", m.status)
+	}
+	if !strings.Contains(m.status, "keep branch") {
+		t.Fatalf("prompt should offer the keep-branch choice, got %q", m.status)
+	}
+}
+
+func TestRemovePromptCancels(t *testing.T) {
+	m := removePromptModel()
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	// Any key that isn't y/b cancels without removing anything.
+	mm, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("'n' should cancel back to normal mode, got %v", m.mode)
+	}
+	if m.status != "" {
+		t.Fatalf("cancel should clear the prompt, got %q", m.status)
+	}
+	if cmd != nil {
+		t.Fatal("cancel must not schedule a removal command")
+	}
+}
+
+// removeGitModel sets up a real repo with one worktree on branch "feat" and a
+// picker model whose selected active item points at it, so the y/b removal
+// paths can be verified against actual git state. Returns the model, repo dir,
+// and branch name.
+func removeGitModel(t *testing.T) (Model, string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "demo")
+	if err := os.Mkdir(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "t@t.t")
+	runGit("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repoDir, "README"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
+
+	r := repo.Repo{Name: "demo", Path: repoDir}
+	wt, err := repo.CreateWorktree(r, ".worktrees/feat", "feat", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := sampleModel()
+	m.screen = screenPicker
+	m.focus = focusActive
+	m.active = []activeItem{{repo: r, view: WorktreeView{WT: wt}}}
+	m.activeCursor = 0
+	return m, repoDir, "feat"
+}
+
+// branchExists reports whether branch is present in repoDir.
+func branchExists(t *testing.T, repoDir, branch string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "branch", "--list", branch)
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git branch --list: %v\n%s", err, out)
+	}
+	return strings.Contains(string(out), branch)
+}
+
+func TestRemoveConfirmYDeletesBranch(t *testing.T) {
+	m, repoDir, branch := removeGitModel(t)
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	_, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if cmd == nil {
+		t.Fatal("'y' should schedule a removal command")
+	}
+	msg, ok := cmd().(actionDoneMsg)
+	if !ok {
+		t.Fatalf("removal command should yield actionDoneMsg, got %T", cmd())
+	}
+	if msg.err != nil {
+		t.Fatalf("remove failed: %v", msg.err)
+	}
+	if branchExists(t, repoDir, branch) {
+		t.Fatalf("'y' should delete branch %q", branch)
+	}
+}
+
+func TestRemoveConfirmBKeepsBranch(t *testing.T) {
+	m, repoDir, branch := removeGitModel(t)
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	_, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'b', Text: "b"})
+	if cmd == nil {
+		t.Fatal("'b' should schedule a removal command")
+	}
+	msg, ok := cmd().(actionDoneMsg)
+	if !ok {
+		t.Fatalf("removal command should yield actionDoneMsg, got %T", cmd())
+	}
+	if msg.err != nil {
+		t.Fatalf("remove failed: %v", msg.err)
+	}
+	if !branchExists(t, repoDir, branch) {
+		t.Fatalf("'b' should keep branch %q", branch)
+	}
+	// The working tree itself must still be gone.
+	if wts, _ := repo.ListWorktrees(repo.Repo{Name: "demo", Path: repoDir}); len(wts) != 1 {
+		t.Fatalf("expected only main worktree after remove, got %+v", wts)
 	}
 }
