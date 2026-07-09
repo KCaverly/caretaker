@@ -91,6 +91,13 @@ const (
 	iconAgent  = "󰚩"          // md-robot (U+F06A9)   — claude
 	iconTerm   = ""          // fa-terminal (U+F120) — term
 	iconPanes  = "\U0000F009" // fa-th-large (U+F009) — the split-pane grid
+	// Zoom toggle shown at the tail of the pane indicator (clickable): diagonal
+	// arrows expanding out to maximize the active pane, collapsing in to restore
+	// the split. Material Design Icons range — the classic Font Awesome
+	// expand/compress glyphs (U+F065/F066) are absent from the bundled Nerd Font
+	// symbols, same as the seedling's pre-v3 codepoint was.
+	iconZoomIn  = "\U000F0616" // md-arrow-expand   (U+F0616) — maximize the active pane
+	iconZoomOut = "\U000F0615" // md-arrow-collapse (U+F0615) — restore the split layout
 )
 
 // renderBar draws the pinned status bar plus a light separator directly
@@ -146,10 +153,10 @@ func (m Model) renderNotifZone() string {
 // barContextLabel builds the bar's right-side workspace context: the
 // "repo / worktree" label, preceded by the agent pool position
 // ("2/3 label ·") on the agent screen when the workspace has more than one
-// agent, and the pane position (grid glyph + "2/3 ·", plus "zoom" while zoomed) on the
-// terminal screen with splits. Each volatile segment shows only on the screen
-// it steers, so the bar never advertises a position the current keys can't
-// change. Both segments sit to the left because they hot-swap
+// agent, and the pane position (grid glyph + "2/3" + a clickable zoom toggle)
+// on the terminal screen with splits. Each volatile segment shows only on the
+// screen it steers, so the bar never advertises a position the current keys
+// can't change. Both segments sit to the left because they hot-swap
 // far more often than the worktree — keeping the repo / worktree label
 // anchored at the right edge while agents and panes rotate. It surfaces
 // state that is otherwise invisible — which agent is focused, how many exist,
@@ -166,12 +173,8 @@ func (m Model) barContextLabel() string {
 		return s
 	}
 	sep := dimStyle.Render(" · ")
-	if m.screen == screenTerminal && len(ws.Terms) > 1 {
-		pane := fmt.Sprintf("%s %d/%d", iconPanes, clamp(ws.ActiveTerm, 0, len(ws.Terms)-1)+1, len(ws.Terms))
-		if ws.TermZoomed {
-			pane += " zoom"
-		}
-		s = lipgloss.NewStyle().Foreground(cAccent).Render(pane) + sep + s
+	if seg, ok := m.paneSegment(); ok {
+		s = lipgloss.NewStyle().Foreground(cAccent).Render(seg) + sep + s
 	}
 	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
@@ -181,6 +184,58 @@ func (m Model) barContextLabel() string {
 		s = lipgloss.NewStyle().Foreground(cPurple).Render(pos) + sep + s
 	}
 	return s
+}
+
+// paneSegment returns the terminal-screen pane indicator — grid glyph, pane
+// position, and a trailing zoom toggle (iconZoomIn to maximize, iconZoomOut to
+// restore) — and whether it applies (only on the terminal screen with more
+// than one pane). Shared by barContextLabel (which styles and places it) and
+// paneZoomAt (which measures it), so the drawn glyph and its click target can
+// never drift. The zoom toggle is always the segment's final glyph.
+func (m Model) paneSegment() (string, bool) {
+	if m.current == nil || m.current.ws == nil {
+		return "", false
+	}
+	ws := m.current.ws
+	if m.screen != screenTerminal || len(ws.Terms) <= 1 {
+		return "", false
+	}
+	pos := clamp(ws.ActiveTerm, 0, len(ws.Terms)-1) + 1
+	return fmt.Sprintf("%s %d/%d %s", iconPanes, pos, len(ws.Terms), m.paneZoomIcon()), true
+}
+
+// paneZoomIcon is the zoom-toggle glyph reflecting the current pane state:
+// inward arrows while a pane is maximized (click to restore), outward arrows
+// otherwise (click to maximize the active pane).
+func (m Model) paneZoomIcon() string {
+	if m.current != nil && m.current.ws != nil && m.current.ws.TermZoomed {
+		return iconZoomOut
+	}
+	return iconZoomIn
+}
+
+// paneZoomAt reports whether bar coordinates land on the pane indicator's zoom
+// toggle. It mirrors renderBar's right-side layout to locate the segment, then
+// targets its trailing icon (the toggle is always the segment's last glyph).
+func (m Model) paneZoomAt(x, y int) bool {
+	if y != 0 {
+		return false
+	}
+	seg, ok := m.paneSegment()
+	if !ok {
+		return false
+	}
+	prefix := ""
+	if notif := m.renderNotifZone(); notif != "" {
+		prefix = notif + "   "
+	}
+	right := prefix + m.barContextLabel() + "  "
+	labelStart := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
+	iconW := lipgloss.Width(m.paneZoomIcon())
+	iconStart := labelStart + lipgloss.Width(seg) - iconW
+	// One column of slack on the left (the space before the icon) so the small
+	// target is easy to hit.
+	return x >= iconStart-1 && x < iconStart+iconW
 }
 
 // barZone is one clickable status-bar icon: its fully-rendered glyph (with any

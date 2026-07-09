@@ -447,6 +447,20 @@ func (m Model) dismissHint() Model {
 	return m
 }
 
+// toggleZoom maximizes the active terminal pane or restores the split layout,
+// resizing the panes to match. Shared by the zoom key and a click on the bar's
+// zoom toggle. A no-op without a current workspace.
+func (m Model) toggleZoom() (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	key := m.current.key
+	w, h := m.sessionSize()
+	m.mgr.ZoomTermPane(key)
+	m.mgr.ResizeTermPanes(key, w, h)
+	return m, nil
+}
+
 func (m Model) activeSession() *session.Session {
 	if m.current == nil || m.current.ws == nil {
 		return nil
@@ -1365,9 +1379,7 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.mgr.CycleTermPane(key)
 			return m, nil
 		case m.keyTermZoom:
-			m.mgr.ZoomTermPane(key)
-			m.mgr.ResizeTermPanes(key, w, h)
-			return m, nil
+			return m.toggleZoom()
 		case m.keyTermClose:
 			_ = m.mgr.CloseTermPane(key)
 			m.mgr.ResizeTermPanes(key, w, h)
@@ -1502,6 +1514,9 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.notifZoneAt(mo.X, mo.Y) {
 			return m.openBoard()
+		}
+		if m.paneZoomAt(mo.X, mo.Y) {
+			return m.toggleZoom()
 		}
 		if m.screen == screenPicker && !m.helpOpen {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 
@@ -103,19 +104,74 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 	if strings.Index(bar, iconPanes) > strings.Index(bar, "r / w") {
 		t.Errorf("pane position should precede the repo / worktree label:\n%s", bar)
 	}
-	if strings.Contains(bar, "zoom") {
-		t.Errorf("bar should not show zoom while unzoomed:\n%s", bar)
+	// Unzoomed: the toggle offers "maximize" (zoom-in), never the restore icon.
+	if !strings.Contains(bar, iconZoomIn) {
+		t.Errorf("bar should show the zoom-in toggle while unzoomed:\n%s", bar)
+	}
+	if strings.Contains(bar, iconZoomOut) {
+		t.Errorf("bar should not show the restore icon while unzoomed:\n%s", bar)
 	}
 
+	// Zoomed: the toggle flips to the restore (zoom-out) icon.
 	ws.TermZoomed = true
-	if bar := barLine(t, m); !strings.Contains(bar, "zoom") {
-		t.Errorf("bar should flag the zoomed pane state:\n%s", bar)
+	if bar := barLine(t, m); !strings.Contains(bar, iconZoomOut) {
+		t.Errorf("bar should show the restore toggle while zoomed:\n%s", bar)
 	}
 
 	// Pane position is terminal-screen context; other screens omit it.
 	m.screen = screenEditor
 	if bar := barLine(t, m); strings.Contains(bar, iconPanes) {
 		t.Errorf("pane indicator should not appear off the terminal screen:\n%s", bar)
+	}
+}
+
+// leftClickAt is a left mouse-button click at bar coordinates (x, y).
+func leftClickAt(x, y int) tea.MouseClickMsg {
+	return tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft}
+}
+
+// TestPaneZoomToggleClick checks the bar's zoom toggle is hit-tested at the
+// tail of the pane segment and that clicking it toggles the pane zoom state.
+func TestPaneZoomToggleClick(t *testing.T) {
+	m := sampleModel()
+	dir := t.TempDir()
+	sleep := []string{"sleep", "5"}
+	ws, err := m.mgr.Activate("r/w", dir,
+		[]session.Spec{{Kind: session.Terminal, Argv: sleep}}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	if _, err := m.mgr.SplitTermPane("r/w", dir,
+		session.Spec{Kind: session.Terminal, Argv: sleep}, session.SplitV, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.screen = screenTerminal
+
+	// Locate the toggle's column: the pane segment leads barContextLabel, which
+	// is right-anchored, and the icon is its final glyph.
+	seg, ok := m.paneSegment()
+	if !ok {
+		t.Fatal("pane segment should apply on the terminal screen with 2 panes")
+	}
+	iconW := lipgloss.Width(m.paneZoomIcon())
+	labelStart := m.width - lipgloss.Width(m.barContextLabel()+"  ")
+	iconX := labelStart + lipgloss.Width(seg) - iconW
+
+	if !m.paneZoomAt(iconX, 0) {
+		t.Fatalf("zoom toggle should be hit-tested at column %d", iconX)
+	}
+	if m.paneZoomAt(labelStart, 0) {
+		t.Error("the grid glyph at the segment head should not hit the zoom toggle")
+	}
+
+	// Clicking the toggle maximizes the active pane; clicking again restores it.
+	if _, _ = m.handleMouseClick(leftClickAt(iconX, 0)); !ws.TermZoomed {
+		t.Error("clicking the zoom toggle should maximize the pane")
+	}
+	if _, _ = m.handleMouseClick(leftClickAt(iconX, 0)); ws.TermZoomed {
+		t.Error("clicking the restore toggle should return to the split layout")
 	}
 }
 
