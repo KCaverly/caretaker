@@ -1053,3 +1053,138 @@ func TestSessionHelpHint(t *testing.T) {
 		t.Errorf("dismissed hint should append nothing, got %q", got)
 	}
 }
+
+// isQuit reports whether cmd is tea.Quit (i.e. running it yields a QuitMsg).
+// Safe to call only on commands that don't have side effects.
+func isQuit(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	_, ok := cmd().(tea.QuitMsg)
+	return ok
+}
+
+// busyGuardModel activates one real workspace ("repo/a") the manager hosts and
+// exposes it via m.active on the picker, so the quit/stop guards can map a busy
+// agent's Cwd to a live workspace. Returns the model and the workspace path.
+func busyGuardModel(t *testing.T) (Model, string) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	t.Cleanup(mgr.CloseAll)
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+
+	dir := t.TempDir()
+	mm, _ = m.activate("repo", "a", dir)
+	m = mm.(Model)
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "repo"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dir}}},
+	}
+	m.screen = screenPicker
+	m.focus = focusActive
+	return m, dir
+}
+
+func TestQuitGuardNoBusyQuitsImmediately(t *testing.T) {
+	m, dir := busyGuardModel(t)
+	m.agentStatus = map[int]AgentStatus{1: {Status: "idle", Cwd: dir}}
+
+	mm, cmd := m.handlePicker(ctrlKey('c'))
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("no busy agent should not open a confirm prompt, got mode %v", m.mode)
+	}
+	if !isQuit(cmd) {
+		t.Fatal("ctrl+c with no busy agent should quit immediately")
+	}
+}
+
+func TestQuitGuardBusyConfirms(t *testing.T) {
+	m, dir := busyGuardModel(t)
+	m.agentStatus = map[int]AgentStatus{1: {Status: "busy", Cwd: dir}}
+
+	mm, cmd := m.handlePicker(ctrlKey('c'))
+	m = mm.(Model)
+	if m.mode != modeConfirmQuit {
+		t.Fatalf("busy agent should enter modeConfirmQuit, got %v", m.mode)
+	}
+	if isQuit(cmd) {
+		t.Fatal("ctrl+c with a busy agent must not quit yet")
+	}
+	if !strings.Contains(m.status, "quit anyway") {
+		t.Fatalf("expected a quit-confirm prompt, got %q", m.status)
+	}
+
+	// 'y' quits.
+	_, cmd = m.handlePicker(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if !isQuit(cmd) {
+		t.Fatal("'y' should quit from the confirm prompt")
+	}
+
+	// Any other key cancels back to normal without quitting.
+	mm, cmd = m.handlePicker(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("'n' should cancel the quit, got mode %v", m.mode)
+	}
+	if isQuit(cmd) {
+		t.Fatal("'n' must not quit")
+	}
+}
+
+func TestStopGuardNoBusyStopsImmediately(t *testing.T) {
+	m, dir := busyGuardModel(t)
+	m.agentStatus = map[int]AgentStatus{1: {Status: "idle", Cwd: dir}}
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("no busy agent should stop without a prompt, got mode %v", m.mode)
+	}
+	if m.mgr.Has("repo/a") {
+		t.Fatal("'d' with no busy agent should stop the workspace immediately")
+	}
+}
+
+func TestStopGuardBusyConfirms(t *testing.T) {
+	m, dir := busyGuardModel(t)
+	m.agentStatus = map[int]AgentStatus{1: {Status: "busy", Cwd: dir}}
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	m = mm.(Model)
+	if m.mode != modeConfirmStop {
+		t.Fatalf("busy agent should enter modeConfirmStop, got %v", m.mode)
+	}
+	if !m.mgr.Has("repo/a") {
+		t.Fatal("workspace must not be stopped before confirmation")
+	}
+	if !strings.Contains(m.status, "stop anyway") {
+		t.Fatalf("expected a stop-confirm prompt, got %q", m.status)
+	}
+
+	// A non-'y' key cancels, leaving the workspace running.
+	mm, _ = m.handlePicker(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	cancel := mm.(Model)
+	if cancel.mode != modeNormal {
+		t.Fatalf("'n' should cancel the stop, got mode %v", cancel.mode)
+	}
+	if !cancel.mgr.Has("repo/a") {
+		t.Fatal("'n' must leave the workspace running")
+	}
+
+	// 'y' stops the workspace.
+	mm, _ = m.handlePicker(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	confirmed := mm.(Model)
+	if confirmed.mode != modeNormal {
+		t.Fatalf("'y' should return to normal mode, got %v", confirmed.mode)
+	}
+	if confirmed.mgr.Has("repo/a") {
+		t.Fatal("'y' should stop the workspace")
+	}
+}

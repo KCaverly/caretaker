@@ -91,6 +91,8 @@ const (
 	modeNormal mode = iota
 	modeCreateName
 	modeConfirmRemove
+	modeConfirmQuit // guarding ctrl+c while a hosted agent is busy
+	modeConfirmStop // guarding "d" while the target worktree has a busy agent
 )
 
 // attnLevel ranks an agent's attention state, highest first when sorting.
@@ -1848,8 +1850,20 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreateKey(msg)
 	case modeConfirmRemove:
 		return m.handleConfirmKey(msg)
+	case modeConfirmQuit:
+		return m.handleConfirmQuitKey(msg)
+	case modeConfirmStop:
+		return m.handleConfirmStopKey(msg)
 	}
 	if msg.String() == "ctrl+c" {
+		// Quitting runs mgr.CloseAll(), which SIGKILLs every hosted pty — every
+		// agent and nvim. Guard it only when a hosted agent is mid-task; the
+		// common (nothing busy) case quits with no friction.
+		if n := m.busyHostedAgents(""); n > 0 {
+			m.mode = modeConfirmQuit
+			m.status = fmt.Sprintf("%d busy agent(s) running — quit anyway? (y/n)", n)
+			return m, nil
+		}
 		return m, tea.Quit
 	}
 	// "?" is a convenient deck-only alias for the help key; the picker owns its
@@ -1943,7 +1957,15 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "d":
 		if it, ok := m.selectedActive(); ok {
-			m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
+			key := wsKey(it.repo.Name, it.view.WT.Name)
+			// Stopping hard-kills this workspace's sessions. Guard it when the
+			// worktree has a busy agent; otherwise stop instantly as before.
+			if m.busyHostedAgents(key) > 0 {
+				m.mode = modeConfirmStop
+				m.status = fmt.Sprintf("%q has a busy agent — stop anyway? (y/n)", it.view.WT.Name)
+				return m, nil
+			}
+			m.stopWorkspace(key)
 			m.flash("stopped " + it.view.WT.Name)
 			return m, m.loadCmd()
 		}
@@ -2012,6 +2034,37 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		r, wt := it.repo, it.view.WT
 		m.flash("removing " + wt.Name + "…")
 		return m, func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt)} }
+	}
+	m.mode = modeNormal
+	m.status = ""
+	return m, nil
+}
+
+// handleConfirmQuitKey resolves the quit guard: "y" quits (running CloseAll,
+// which kills every hosted pty), anything else cancels back to the picker.
+func (m Model) handleConfirmQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "y" {
+		return m, tea.Quit
+	}
+	m.mode = modeNormal
+	m.status = ""
+	return m, nil
+}
+
+// handleConfirmStopKey resolves the stop guard: "y" stops the selected
+// worktree, anything else cancels. The target is re-read from the cursor here
+// (it can't move while the prompt is modal), mirroring handleConfirmKey.
+func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "y" {
+		it, ok := m.selectedActive()
+		m.mode = modeNormal
+		if !ok {
+			m.status = ""
+			return m, nil
+		}
+		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
+		m.flash("stopped " + it.view.WT.Name)
+		return m, m.loadCmd()
 	}
 	m.mode = modeNormal
 	m.status = ""
@@ -2240,6 +2293,37 @@ func (m Model) pathToKey(path string) (string, bool) {
 		return m.homeWSKey, true
 	}
 	return "", false
+}
+
+// busyHostedAgents counts agents polled as busy whose working directory maps to
+// a workspace ct still hosts, optionally filtered to a single workspace key
+// (onlyKey == "" counts across every hosted workspace). It backs the quit and
+// stop guards: only agents ct hosts are killed by CloseAll/Close, so agents
+// running outside ct don't count.
+//
+// Note: agentStatus is refreshed on a poll timer and can lag reality by up to
+// one poll interval, so this may briefly miss an agent that just went busy or
+// still flag one that just finished. That staleness is acceptable for a
+// confirmation prompt — the guard is a safety net, not a hard lock.
+func (m Model) busyHostedAgents(onlyKey string) int {
+	if m.mgr == nil {
+		return 0
+	}
+	n := 0
+	for _, st := range m.agentStatus {
+		if st.Status != "busy" {
+			continue
+		}
+		key, ok := m.pathToKey(st.Cwd)
+		if !ok || !m.mgr.Has(key) {
+			continue
+		}
+		if onlyKey != "" && key != onlyKey {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func (m Model) selectedActive() (activeItem, bool) {

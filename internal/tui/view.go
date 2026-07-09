@@ -1056,7 +1056,7 @@ func (m Model) footerContent() string {
 	switch m.mode {
 	case modeCreateName:
 		return "\n" + helpStyle.Render(m.status)
-	case modeConfirmRemove:
+	case modeConfirmRemove, modeConfirmQuit, modeConfirmStop:
 		return "\n" + errStyle.Render(m.status)
 	}
 
