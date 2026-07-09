@@ -3,7 +3,20 @@ package session
 import (
 	"errors"
 	"sync"
+	"time"
 )
+
+// repaintWindow bounds how often WaitDirty releases the UI to re-render under
+// sustained pty output. The first dirty signal after a quiet gap is released
+// immediately (leading edge) so a lone keystroke echo never waits; further
+// signals that land within the window collapse into a single trailing repaint.
+// The width trades leading-edge input latency against the sustained render
+// ceiling: every repaint re-serialises the whole vt buffer per visible session
+// (~60µs/616 allocs at 80×24 up to ~253µs/1,901 allocs at 200×50), so an
+// uncapped loop under a build or a streaming agent renders back-to-back as fast
+// as frames complete. At 12ms a burst is capped near ~80fps — well below the
+// flicker threshold — while a solitary echo still repaints with no added delay.
+const repaintWindow = 12 * time.Millisecond
 
 // errNoWorkspace is returned when an operation targets a workspace that isn't
 // active.
@@ -70,6 +83,12 @@ type Manager struct {
 	spaces map[string]*Workspace
 	dirty  chan struct{}
 
+	// lastRepaint stamps when WaitDirty last released a repaint, gating the
+	// coalescing window. Only WaitDirty (a single in-flight repaint command)
+	// touches it, but its own mutex keeps that free of any race assumption.
+	repaintMu   sync.Mutex
+	lastRepaint time.Time
+
 	// visible is the set of sessions currently drawn on screen; output from any
 	// other session is dropped instead of waking the UI. Guarded by its own
 	// RWMutex so pty pump goroutines never contend with mu (which Resize et al.
@@ -89,6 +108,39 @@ func NewManager() *Manager {
 // Dirty returns a channel that receives a value whenever a visible session's
 // screen changes; callers use it to trigger a repaint.
 func (m *Manager) Dirty() <-chan struct{} { return m.dirty }
+
+// WaitDirty blocks until a visible session's screen changes, then returns —
+// coalescing bursts into at most one repaint per repaintWindow. The first
+// signal after a quiet gap returns immediately (leading edge: no latency on a
+// lone keystroke echo); a signal that arrives inside the window instead sleeps
+// out the remainder and drains one further pending signal, so a run of fast
+// output collapses into a single trailing repaint rather than re-rendering the
+// whole vt buffer once per frame. Only one repaint command calls this at a
+// time; repaintMu keeps lastRepaint race-free regardless.
+func (m *Manager) WaitDirty() {
+	<-m.dirty
+
+	m.repaintMu.Lock()
+	remaining := repaintWindow - time.Since(m.lastRepaint)
+	m.repaintMu.Unlock()
+
+	if remaining > 0 {
+		// Inside the window from the previous repaint: this is sustained
+		// output. Sleep the remainder, then drain any signal that piled up
+		// during it — the imminent render reads the current buffer and so
+		// already reflects those changes, and dropping it here avoids an
+		// extra redundant repaint once output stops.
+		time.Sleep(remaining)
+		select {
+		case <-m.dirty:
+		default:
+		}
+	}
+
+	m.repaintMu.Lock()
+	m.lastRepaint = time.Now()
+	m.repaintMu.Unlock()
+}
 
 // SetVisible replaces the set of sessions considered on-screen. Output from
 // sessions outside the set no longer triggers repaints; switching a session

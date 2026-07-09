@@ -486,11 +486,15 @@ func (m Model) loadCmd() tea.Cmd {
 	}
 }
 
-// repaintCmd blocks until a session's screen changes, then asks for a re-render.
+// repaintCmd blocks until a session's screen changes, then asks for a
+// re-render. WaitDirty applies the leading-edge coalescing window so a burst of
+// pty output (a build, a streaming agent) collapses into a capped repaint rate
+// instead of re-serialising every vt buffer as fast as frames complete, while a
+// lone keystroke echo still repaints with no added latency.
 func (m Model) repaintCmd() tea.Cmd {
 	mgr := m.mgr
 	return func() tea.Msg {
-		<-mgr.Dirty()
+		mgr.WaitDirty()
 		return dirtyMsg{}
 	}
 }
