@@ -1126,8 +1126,18 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return rows[nav[i]], true
 	}
+	// keyNotif is the legacy board-close alias. At its default (ctrl+n) it is
+	// deliberately shadowed by list-down navigation below: inside an open board
+	// nav wins over the alias, and ctrl+a (palette) plus esc/q still close. Only
+	// honor keyNotif as a close key when the user rebound it off ctrl+n, so it
+	// can't collide with the ctrl+n nav binding. ("ctrl+n" here is the fixed
+	// list-down dialect key, matching the switch case below — not m.keyNotif.)
+	if msg.String() == m.keyNotif && m.keyNotif != "ctrl+n" {
+		m.boardOpen = false
+		return m, nil
+	}
 	switch msg.String() {
-	case "esc", "q", m.keyPalette, m.keyNotif:
+	case "esc", "q", m.keyPalette:
 		m.boardOpen = false
 		return m, nil
 	case m.keyPrompt:
@@ -1137,7 +1147,7 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.boardCursor--
 		}
 		return m, nil
-	case "down", "j":
+	case "down", "j", "ctrl+n":
 		if m.boardCursor < len(nav)-1 {
 			m.boardCursor++
 		}
@@ -1253,7 +1263,8 @@ func (m Model) setFormFocus(f int) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓) move between
+// handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓, or the
+// ctrl+n/ctrl+p list-nav dialect — unused by the prompt textinput) move between
 // the prompt, where, and mode fields; space or ←/→ flip the focused toggle;
 // enter launches from any field.
 func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1262,9 +1273,9 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.formOpen = false
 		m.promptInput.Blur()
 		return m, nil
-	case "tab", "down":
+	case "tab", "down", "ctrl+n":
 		return m.setFormFocus(m.formFocus + 1)
-	case "shift+tab", "up":
+	case "shift+tab", "up", "ctrl+p":
 		return m.setFormFocus(m.formFocus - 1)
 	case "enter":
 		return m.launchAgent()
@@ -1441,9 +1452,21 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleSetupKey(msg)
 	}
 	// Help is modal and reachable from anywhere (including inside a session). Any
-	// key dismisses it; the help key itself toggles it.
+	// key dismisses it. A key that is one of ct's own reserved action keys does
+	// double duty: it closes help AND performs its action, so opening help and
+	// pressing e.g. the cycle key both dismisses the overlay and cycles — the
+	// user shouldn't have to press it twice. We achieve that by closing help then
+	// re-dispatching the same message through the normal path. The help key is
+	// excluded (its "action" is toggling help, already satisfied by the close),
+	// so it never re-opens what it just closed. Every non-reserved key (letters,
+	// esc, enter, space, "?") only closes: re-dispatching one would leak the
+	// keystroke into the embedded session drawn beneath the overlay, which must
+	// never happen.
 	if m.helpOpen {
 		m.helpOpen = false
+		if m.isReservedActionKey(msg.String()) {
+			return m.handleKey(msg)
+		}
 		return m, nil
 	}
 	if msg.String() == m.keyHelp {
@@ -1477,6 +1500,32 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleSessionKey(msg)
 	}
 	return m.handlePicker(msg)
+}
+
+// isReservedActionKey reports whether s is one of ct's own reserved keys that
+// should still fire when it dismisses the help overlay (see handleKey). The
+// globally-reserved keys apply on every screen; keyHelp is intentionally absent
+// (dismissing help already satisfies its toggle, and re-dispatching it would
+// re-open the overlay). The usage key is only reserved on the agent screen and
+// the terminal-pane keys only on the terminal screen — elsewhere they are
+// ordinary session input, so treating them as reserved would forward the key
+// into the session beneath, exactly the leak the help swallow prevents.
+func (m Model) isReservedActionKey(s string) bool {
+	switch s {
+	case m.keyCycle, m.keyPicker, m.keyPalette, m.keyNotif, m.keyPrompt,
+		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent:
+		return true
+	}
+	if s == m.keyUsage && m.screen == screenAgent {
+		return true
+	}
+	if m.screen == screenTerminal {
+		switch s {
+		case m.keyTermSplitV, m.keyTermSplitH, m.keyTermCycle, m.keyTermZoom, m.keyTermClose:
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1919,7 +1968,10 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.newCursor--
 		}
 		return m, nil
-	case "down":
+	case "down", "ctrl+n":
+		// ctrl+n is list-down only when keyNotif was rebound off it; at the
+		// default handleKey catches ctrl+n first to open the board. j/k are left
+		// to fall through to the fuzzy filter, which owns this section's input.
 		if m.newCursor < len(m.repoMatches)-1 {
 			m.newCursor++
 		}
@@ -1953,11 +2005,16 @@ func (m Model) beginCreate() (tea.Model, tea.Cmd) {
 
 func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "up", "k":
+	// Shared list-nav dialect: arrows and ctrl+p/ctrl+n move, and — because the
+	// ACTIVE list owns no text input — j/k do too. ctrl+n only reaches here when
+	// the user rebound keyNotif off it; at its default ctrl+n is intercepted in
+	// handleKey to open the agent board, so in the deck ctrl+n opens the board
+	// rather than moving the cursor (documented there).
+	case "up", "k", "ctrl+p":
 		if m.activeCursor > 0 {
 			m.activeCursor--
 		}
-	case "down", "j":
+	case "down", "j", "ctrl+n":
 		if m.activeCursor < len(m.active)-1 {
 			m.activeCursor++
 		}

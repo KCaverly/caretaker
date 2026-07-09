@@ -891,7 +891,7 @@ func (m Model) renderHelp(h int) string {
 	rows := []string{header("help", -1), ""}
 	rows = append(rows,
 		repoHdrStyle.Render("  Deck"),
-		row("↑↓ / j k", "move"),
+		row("↑↓ ^p / j k", "move"),
 		row("tab", "switch section"),
 		row("enter", "open / create"),
 		row("1 2 3", "open recent worktree"),

@@ -549,11 +549,17 @@ func TestBoardOpensFromPicker(t *testing.T) {
 	if len(nav) != 1 || !rows[nav[0]].isNew {
 		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
 	}
-	// The notif key is an alias: it closes the board again.
+	// Inside an open board ctrl+n is list-down, not the close alias: it keeps the
+	// board open (nav wins over the legacy alias). The primary palette key closes.
 	mm, _ = m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
+	if !m.boardOpen {
+		t.Fatal("ctrl+n inside the board should navigate, not close it")
+	}
+	mm, _ = m.handleKey(ctrlKey('a'))
+	m = mm.(Model)
 	if m.boardOpen {
-		t.Fatal("ctrl+n should toggle the board closed")
+		t.Fatal("ctrl+a should close the board")
 	}
 }
 
@@ -1471,5 +1477,175 @@ func TestHandleCreateKeyValidation(t *testing.T) {
 	}
 	if m.statusLevel != statusInfo || m.status != "creating feature/foo…" {
 		t.Fatalf("valid name should flash progress, got %q level=%v", m.status, m.statusLevel)
+	}
+}
+
+// TestListNavDialect: the shared list-nav dialect — ctrl+p (up) / ctrl+n (down)
+// — moves the cursor in the ACTIVE and NEW deck lists (called directly, since at
+// the default binding ctrl+n is intercepted upstream to open the board).
+func TestListNavDialect(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	if len(m.active) < 2 {
+		t.Fatalf("precondition: need >=2 active items, got %d", len(m.active))
+	}
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(ctrlKey('n')) // down
+	m = mm.(Model)
+	if m.activeCursor != 1 {
+		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
+	}
+	mm, _ = m.handleActiveKey(ctrlKey('p')) // up
+	m = mm.(Model)
+	if m.activeCursor != 0 {
+		t.Fatalf("ctrl+p should move the ACTIVE cursor up, got %d", m.activeCursor)
+	}
+
+	m2 := sampleModel() // focusNew, filter focused
+	if len(m2.repoMatches) < 2 {
+		t.Fatalf("precondition: need >=2 repo matches, got %d", len(m2.repoMatches))
+	}
+	m2.newCursor = 0
+	mm, _ = m2.handleNewKey(ctrlKey('n'))
+	m2 = mm.(Model)
+	if m2.newCursor != 1 {
+		t.Fatalf("ctrl+n should move the NEW cursor down, got %d", m2.newCursor)
+	}
+	mm, _ = m2.handleNewKey(ctrlKey('p'))
+	m2 = mm.(Model)
+	if m2.newCursor != 0 {
+		t.Fatalf("ctrl+p should move the NEW cursor up, got %d", m2.newCursor)
+	}
+}
+
+// TestDeckCtrlNOpensBoard: at the default keyNotif binding, ctrl+n in the deck
+// opens the agent board (handleKey intercepts it) instead of moving a cursor —
+// the legacy behavior is preserved.
+func TestDeckCtrlNOpensBoard(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	mm, _ := m.handleKey(ctrlKey('n'))
+	m = mm.(Model)
+	if !m.boardOpen {
+		t.Fatal("ctrl+n in the deck should open the board at the default binding")
+	}
+}
+
+// TestBoardCtrlNNavigates: inside an open board ctrl+n/ctrl+p navigate and do not
+// close it (nav wins over the legacy close alias), while ctrl+a and esc still
+// close.
+func TestBoardCtrlNNavigates(t *testing.T) {
+	m := modelWithAgents(3)
+	m.current.ws.ActiveAgent = 0
+	mm, _ := m.openBoard()
+	m = mm.(Model)
+	start := m.boardCursor
+
+	mm, _ = m.handleBoard(ctrlKey('n'))
+	m = mm.(Model)
+	if !m.boardOpen {
+		t.Fatal("ctrl+n should not close the board (nav wins over the close alias)")
+	}
+	if m.boardCursor != start+1 {
+		t.Fatalf("ctrl+n should move the board cursor down, got %d want %d", m.boardCursor, start+1)
+	}
+	mm, _ = m.handleBoard(ctrlKey('p'))
+	m = mm.(Model)
+	if m.boardCursor != start {
+		t.Fatalf("ctrl+p should move the board cursor back up, got %d", m.boardCursor)
+	}
+
+	// ctrl+a (palette) still closes.
+	mm, _ = m.handleBoard(ctrlKey('a'))
+	m = mm.(Model)
+	if m.boardOpen {
+		t.Fatal("ctrl+a should still close the board")
+	}
+
+	// esc still closes.
+	mm, _ = m.openBoard()
+	m = mm.(Model)
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.boardOpen {
+		t.Fatal("esc should still close the board")
+	}
+}
+
+// TestKeyNotifReboundFreesCtrlN: when the user rebinds keyNotif off ctrl+n, the
+// rebound key closes the board and ctrl+n becomes an ordinary list-down key both
+// in the board and in the deck.
+func TestKeyNotifReboundFreesCtrlN(t *testing.T) {
+	m := modelWithAgents(3)
+	m.keyNotif = "ctrl+b"
+	m.current.ws.ActiveAgent = 0
+	mm, _ := m.openBoard()
+	m = mm.(Model)
+	start := m.boardCursor
+
+	mm, _ = m.handleBoard(ctrlKey('n'))
+	m = mm.(Model)
+	if !m.boardOpen || m.boardCursor != start+1 {
+		t.Fatalf("rebound: ctrl+n should navigate the board, open=%v cursor=%d", m.boardOpen, m.boardCursor)
+	}
+	mm, _ = m.handleBoard(ctrlKey('b'))
+	m = mm.(Model)
+	if m.boardOpen {
+		t.Fatal("the rebound keyNotif should close the board")
+	}
+
+	// In the deck ctrl+n is now free and reaches the ACTIVE list as list-down.
+	d := sampleModel()
+	d.keyNotif = "ctrl+b"
+	d.focus = focusActive
+	d.activeCursor = 0
+	mm, _ = d.handleKey(ctrlKey('n'))
+	d = mm.(Model)
+	if d.boardOpen {
+		t.Fatal("rebound: ctrl+n must not open the board")
+	}
+	if d.activeCursor != 1 {
+		t.Fatalf("rebound: ctrl+n should move the ACTIVE cursor, got %d", d.activeCursor)
+	}
+}
+
+// TestHelpReservedKeyReDispatches: a reserved action key pressed while help is
+// open closes the overlay AND performs its action in one press.
+func TestHelpReservedKeyReDispatches(t *testing.T) {
+	m := sampleModel()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w"}
+	m.screen = screenEditor
+	m.helpOpen = true
+
+	mm, _ := m.handleKey(ctrlKey('o')) // default keyCycle == ctrl+o
+	m = mm.(Model)
+	if m.helpOpen {
+		t.Fatal("a reserved key should still close the help overlay")
+	}
+	if m.screen != screenAgent {
+		t.Fatalf("the cycle key should also advance editor→agent, got %v", m.screen)
+	}
+}
+
+// TestHelpPlainKeyDoesNotLeak: a non-reserved key dismissing help must never
+// leak into the embedded session drawn beneath the overlay.
+func TestHelpPlainKeyDoesNotLeak(t *testing.T) {
+	m, sess := pasteModel(t)
+	if sess == nil {
+		t.Fatal("expected an active session")
+	}
+	m.helpOpen = true
+	mm, _ := m.handleKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if m.helpOpen {
+		t.Fatal("a plain key should close the help overlay")
+	}
+	// Once an allowed keystroke sent afterward shows on screen, a leaked 'x'
+	// would already be visible too — its absence proves it was swallowed.
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: 'Z', Text: "Z"})
+	m = mm.(Model)
+	waitForSession(t, sess, "Z")
+	if strings.Contains(sess.Render(), "x") {
+		t.Error("a plain key dismissing help leaked into the session")
 	}
 }
