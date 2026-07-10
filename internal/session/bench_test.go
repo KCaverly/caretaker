@@ -47,6 +47,46 @@ func BenchmarkWindowResize(b *testing.B) {
 	}
 }
 
+// BenchmarkSetVisible measures the per-message cost of SetVisible in the two
+// cases the UI hits. "unchanged" is the overwhelmingly common one: Model.Update
+// calls SetVisible after every message, and the visible set is the same on
+// every dirtyMsg repaint under sustained output — that path must not lock or
+// allocate. "changed" alternates the set each call so every iteration pays the
+// full map rebuild under visMu (the screen/pane switch cost).
+func BenchmarkSetVisible(b *testing.B) {
+	m := NewManager()
+	defer m.CloseAll()
+	sleep := []string{"sleep", "60"}
+	ws, err := m.Activate("r/w", b.TempDir(), []Spec{
+		{Kind: Editor, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+	}, 120, 40)
+	if err != nil {
+		b.Fatal(err)
+	}
+	editor, agent := ws.Editor, ws.Agents[0]
+
+	b.Run("unchanged", func(b *testing.B) {
+		m.SetVisible(editor)
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			m.SetVisible(editor)
+		}
+	})
+	b.Run("changed", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if i%2 == 0 {
+				m.SetVisible(editor)
+			} else {
+				m.SetVisible(agent)
+			}
+		}
+	})
+}
+
 // BenchmarkEmulatorRender measures the cost of serialising a full emulator
 // screen to a styled string — the work every repaint pays per visible session.
 // This is what makes dropping repaints for invisible sessions worthwhile: the

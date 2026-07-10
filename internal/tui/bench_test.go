@@ -116,6 +116,28 @@ func BenchmarkEnsureProjectTrusted(b *testing.B) {
 	}
 }
 
+// BenchmarkViewPicker measures a full Model.View() on the deck/picker screen —
+// the render path with no hosted session, exercising box() frames, the repo
+// finder, and the grouped ACTIVE list (activeRow per worktree). It is the
+// hottest pure-lipgloss render in the app and the main beneficiary of hoisting
+// the box/attention styles out of the per-frame path.
+func BenchmarkViewPicker(b *testing.B) {
+	m := sampleModel()
+	m.screen = screenPicker
+	// Give a couple of worktrees attention so activeRow renders the styled
+	// marker glyphs rather than the blank fast path.
+	if len(m.active) > 0 {
+		m.agentStatus = map[int]AgentStatus{
+			101: {Status: "waiting", Cwd: m.active[0].view.WT.Path},
+		}
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = m.View()
+	}
+}
+
 // BenchmarkViewBarOnlyFrame measures a full Model.View() for a frame where the
 // visible session's screen has NOT changed — the common case behind a status
 // poll tick, a usage poll, or a badge update, all of which redraw the whole

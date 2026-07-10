@@ -43,6 +43,30 @@ var (
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
 	errStyle     = lipgloss.NewStyle().Foreground(cRed)
+
+	// Non-bold accent/purple foregrounds for the bar's volatile context
+	// segments (pane indicator, agent position) and the accent split divider.
+	accentStyle = lipgloss.NewStyle().Foreground(cAccent)
+	purpleStyle = lipgloss.NewStyle().Foreground(cPurple)
+
+	// Bold glyph styles, cached rather than rebuilt per frame: the status-bar
+	// tab icons (a lit accent per tab plus the shared dim/faint states) and the
+	// red/green attention markers reused across the bar, board, and deck.
+	// lipgloss.Style is immutable (each method returns a copy) and View runs
+	// only on the UI goroutine, so sharing these package-level styles is safe.
+	boldDim    = lipgloss.NewStyle().Bold(true).Foreground(cDim)
+	boldFaint  = lipgloss.NewStyle().Bold(true).Foreground(cFaint)
+	boldGreen  = lipgloss.NewStyle().Bold(true).Foreground(cGreen)
+	boldPurple = lipgloss.NewStyle().Bold(true).Foreground(cPurple)
+	boldAccent = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
+	boldYellow = lipgloss.NewStyle().Bold(true).Foreground(cYellow)
+	boldRed    = lipgloss.NewStyle().Bold(true).Foreground(cRed)
+
+	// Bordered box frames for the deck sections and overlays: faint idle,
+	// accent when focused. Rounded border + 0,1 padding match the old per-call
+	// style exactly.
+	boxStyleFaint   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cFaint).Padding(0, 1)
+	boxStyleFocused = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cAccent).Padding(0, 1)
 )
 
 // View implements tea.Model.
@@ -144,11 +168,11 @@ func (m Model) renderNotifZone() string {
 	waiting, done := m.attnSummary()
 	var parts []string
 	if waiting > 0 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("!")+
+		parts = append(parts, boldRed.Render("!")+
 			" "+countStyle.Render(strconv.Itoa(waiting)))
 	}
 	if done > 0 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("*")+
+		parts = append(parts, boldGreen.Render("*")+
 			" "+countStyle.Render(strconv.Itoa(done)))
 	}
 	return strings.Join(parts, "  ")
@@ -170,22 +194,21 @@ func (m Model) barContextLabel() string {
 	if m.current == nil {
 		return ""
 	}
-	s := lipgloss.NewStyle().Foreground(cDim).
-		Render(m.current.repo + " / " + m.current.worktree)
+	s := dimStyle.Render(m.current.repo + " / " + m.current.worktree)
 	ws := m.current.ws
 	if ws == nil {
 		return s
 	}
 	sep := dimStyle.Render(" · ")
 	if seg, ok := m.paneSegment(); ok {
-		s = lipgloss.NewStyle().Foreground(cAccent).Render(seg) + sep + s
+		s = accentStyle.Render(seg) + sep + s
 	}
 	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
 		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
 		if a := ws.ActiveAgentSession(); a != nil {
 			pos += " " + truncateTo(agentTitle(a.Title), 14)
 		}
-		s = lipgloss.NewStyle().Foreground(cPurple).Render(pos) + sep + s
+		s = purpleStyle.Render(pos) + sep + s
 	}
 	if seg, ok := m.usageSegment(); ok {
 		w, _ := m.usageSnap.Binding()
@@ -345,16 +368,17 @@ func (m Model) barZones() []barZone {
 	has := m.current != nil
 
 	// All glyphs are bold (heaviest weight a cell allows); active gets its accent
-	// colour, idle is dim, and disabled is faint until a workspace exists.
-	glyph := func(g string, accent color.Color, active, enabled bool) string {
-		st := lipgloss.NewStyle().Bold(true)
+	// colour (the lit style passed in), idle is dim, and disabled is faint until
+	// a workspace exists. The styles are package-level, cached once, not rebuilt
+	// per icon per frame.
+	glyph := func(g string, lit lipgloss.Style, active, enabled bool) string {
 		switch {
 		case active:
-			return st.Foreground(accent).Render(g)
+			return lit.Render(g)
 		case enabled:
-			return st.Foreground(cDim).Render(g)
+			return boldDim.Render(g)
 		default:
-			return st.Foreground(cFaint).Render(g)
+			return boldFaint.Render(g)
 		}
 	}
 
@@ -362,19 +386,19 @@ func (m Model) barZones() []barZone {
 	// the other tabs — yellow while the deck is active, dim otherwise (never
 	// faint: the deck is always reachable). Agent attention lives in the ! badge
 	// on the right, so the icon never reacts to agent status.
-	ctColor := cDim
+	ctStyle := boldDim
 	if m.screen == screenPicker {
-		ctColor = cYellow
+		ctStyle = boldYellow
 	}
-	ct := lipgloss.NewStyle().Bold(true).Foreground(ctColor).Render(iconDeck)
+	ct := ctStyle.Render(iconDeck)
 
-	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
+	agent := glyph(iconAgent, boldPurple, m.screen == screenAgent, has)
 
 	return []barZone{
 		{screenPicker, ct},
-		{screenEditor, glyph(iconEditor, cGreen, m.screen == screenEditor, has)},
+		{screenEditor, glyph(iconEditor, boldGreen, m.screen == screenEditor, has)},
 		{screenAgent, agent},
-		{screenTerminal, glyph(iconTerm, cAccent, m.screen == screenTerminal, has)},
+		{screenTerminal, glyph(iconTerm, boldAccent, m.screen == screenTerminal, has)},
 	}
 }
 
@@ -487,9 +511,9 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	glyph, glyphSt := " ", dimStyle
 	switch r.attn {
 	case attnWaiting:
-		glyph, glyphSt = "!", lipgloss.NewStyle().Foreground(cRed).Bold(true)
+		glyph, glyphSt = "!", boldRed
 	case attnDone:
-		glyph, glyphSt = "*", lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+		glyph, glyphSt = "*", boldGreen
 	}
 	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + nameStyle.Render(r.label)
 	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
@@ -844,10 +868,10 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	switch m.worktreeAttn(key) {
 	case attnWaiting:
 		notifChar = "!"
-		notifSt = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+		notifSt = boldRed
 	case attnDone:
 		notifChar = "*"
-		notifSt = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+		notifSt = boldGreen
 	}
 
 	dirtyChar := " "
@@ -1198,6 +1222,18 @@ func (m Model) paneAdjacentColor(node *session.PaneNode, activeTerm int) color.C
 	return cFaint
 }
 
+// dividerStyle returns the cached foreground style for a pane divider: lit
+// (accent) when the divider borders the focused pane, faint otherwise. It maps
+// the two colours paneAdjacentColor can return to their package-level styles so
+// the divider style is never rebuilt per split per frame. barSep is exactly a
+// faint foreground, so it doubles as the faint divider style.
+func dividerStyle(c color.Color) lipgloss.Style {
+	if c == cAccent {
+		return accentStyle
+	}
+	return barSep
+}
+
 // joinVerticalSplit interleaves lines from left and right pane bodies with a
 // single-column divider. leftWidth is the pane's column count — every left
 // line is padded to that exact display width so the divider lands on a
@@ -1205,7 +1241,7 @@ func (m Model) paneAdjacentColor(node *session.PaneNode, activeTerm int) color.C
 func joinVerticalSplit(left, right string, divColor color.Color, h, leftWidth int) string {
 	leftLines := splitLines(left)
 	rightLines := splitLines(right)
-	div := lipgloss.NewStyle().Foreground(divColor).Render("│")
+	div := dividerStyle(divColor).Render("│")
 	rows := make([]string, h)
 	for i := range rows {
 		l, r := "", ""
@@ -1235,7 +1271,7 @@ func joinHorizontalSplit(top, bottom string, divColor color.Color, w, topHeight 
 			rows[i] = topLines[i]
 		}
 	}
-	div := lipgloss.NewStyle().Foreground(divColor).Render(strings.Repeat("─", max(1, w)))
+	div := dividerStyle(divColor).Render(strings.Repeat("─", max(1, w)))
 	return strings.Join(rows, "\n") + "\n" + div + "\n" + bottom
 }
 
@@ -1282,15 +1318,11 @@ func box(lines []string, innerW, contentH int, focused bool) string {
 			rows[i] = strings.Repeat(" ", innerW)
 		}
 	}
-	color := cFaint
+	st := boxStyleFaint
 	if focused {
-		color = cAccent
+		st = boxStyleFocused
 	}
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(color).
-		Padding(0, 1).
-		Render(strings.Join(rows, "\n"))
+	return st.Render(strings.Join(rows, "\n"))
 }
 
 // padLine right-pads s with plain spaces to w display columns.

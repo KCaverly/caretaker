@@ -95,6 +95,12 @@ type Manager struct {
 	// hold across ioctls).
 	visMu   sync.RWMutex
 	visible map[*Session]struct{}
+	// visList mirrors the installed visible set (in the order last passed to
+	// SetVisible, nils removed). It exists only so SetVisible can detect an
+	// unchanged set and skip the lock + map rebuild. Touched ONLY by SetVisible,
+	// which the contract restricts to the UI goroutine, so it needs no lock;
+	// signalDirty (pump goroutines) reads visible, never visList.
+	visList []*Session
 }
 
 // NewManager returns an empty Manager.
@@ -147,16 +153,49 @@ func (m *Manager) WaitDirty() {
 // into view repaints it anyway (the switch itself renders), so no frame is
 // ever missed. Call with no arguments when no session is visible (picker,
 // overlays).
+//
+// The UI calls this after EVERY message, but the visible set is unchanged on
+// the overwhelming majority of frames (every dirtyMsg repaint under output).
+// So the common path must be cheap: sameVisible compares the incoming set
+// against the last one installed and, when they match, returns without taking
+// visMu or allocating a map. Only a real change rebuilds the map under the
+// lock. Must be called only from the UI goroutine (see visList).
 func (m *Manager) SetVisible(ss ...*Session) {
+	if m.sameVisible(ss) {
+		return
+	}
 	vis := make(map[*Session]struct{}, len(ss))
+	list := make([]*Session, 0, len(ss))
 	for _, s := range ss {
 		if s != nil {
 			vis[s] = struct{}{}
+			list = append(list, s)
 		}
 	}
 	m.visMu.Lock()
 	m.visible = vis
 	m.visMu.Unlock()
+	m.visList = list
+}
+
+// sameVisible reports whether ss (nils skipped) is element-for-element equal to
+// the last installed visible set. An ordered compare is deliberately
+// conservative: a reordering of the same members reports "changed" and pays one
+// extra rebuild, but equal here always means the set is genuinely unchanged. No
+// lock is taken — visList is UI-goroutine-only, the same goroutine that calls
+// SetVisible.
+func (m *Manager) sameVisible(ss []*Session) bool {
+	i := 0
+	for _, s := range ss {
+		if s == nil {
+			continue
+		}
+		if i >= len(m.visList) || m.visList[i] != s {
+			return false
+		}
+		i++
+	}
+	return i == len(m.visList)
 }
 
 func (m *Manager) signalDirty(s *Session) {

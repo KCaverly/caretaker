@@ -188,6 +188,63 @@ func TestDirtyOnlyForVisibleSessions(t *testing.T) {
 	}
 }
 
+// TestSetVisibleUnchangedSetFastPath verifies the unchanged-set fast path
+// (which skips the lock + map rebuild) never stales the visible set: repeating
+// an identical SetVisible keeps the same session live, and a real change still
+// re-installs the set both ways.
+func TestSetVisibleUnchangedSetFastPath(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	specs := []Spec{
+		{Kind: Terminal, Argv: []string{"cat"}},
+		{Kind: Agent, Argv: []string{"cat"}},
+	}
+	ws, err := m.Activate("r/w", t.TempDir(), specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	term, agent := ws.Terms[0], ws.Agents[0]
+
+	drain := func() {
+		for {
+			select {
+			case <-m.Dirty():
+			default:
+				return
+			}
+		}
+	}
+	wakes := func(s *Session, tag string) bool {
+		drain()
+		_, _ = s.WriteInput([]byte(tag + "\n"))
+		waitFor(t, s, tag)
+		select {
+		case <-m.Dirty():
+			return true
+		case <-time.After(500 * time.Millisecond):
+			return false
+		}
+	}
+
+	// Install the terminal, then install the identical set again — the second
+	// call takes the fast path and must not drop visibility.
+	m.SetVisible(term)
+	m.SetVisible(term)
+	if !wakes(term, "still-visible") {
+		t.Fatal("repeated identical SetVisible dropped the visible session")
+	}
+
+	// A genuine change re-installs: the agent becomes visible, the terminal not.
+	m.SetVisible(agent)
+	if wakes(term, "now-hidden") {
+		t.Fatal("terminal still visible after switching the set to the agent")
+	}
+	if !wakes(agent, "now-visible") {
+		t.Fatal("agent not visible after switching the set to it")
+	}
+}
+
 // TestRenderCacheMatchesEmulator proves the cache is transparent: once the
 // screen has settled, Session.Render() returns exactly what the uncached
 // emu.Render() would, and repeated calls return the identical string.
