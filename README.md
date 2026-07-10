@@ -29,10 +29,37 @@ worktree_path = ".worktrees/{name}"
 branch_name   = "{name}"
 
 # Reserved navigation keys (not forwarded to embedded sessions).
+# Defaults use alt (option-as-meta) chords so they don't collide with the
+# programs running inside the panes (LazyVim, zsh, Claude Code); every key is
+# overridable, and an empty string ("") disables one.
 [keys]
-cycle  = "ctrl+o"   # move one session view to the right
-picker = "ctrl+g"   # return to the CT picker
-help   = "f1"       # toggle the key/legend overlay (also "?" in the deck)
+cycle      = "alt+]"   # next session view (wraps)
+cycle_back = "alt+["   # previous session view (wraps)
+goto_editor = "alt+1"  # jump to the editor view
+goto_agent  = "alt+2"  # jump to the agent view
+goto_term   = "alt+3"  # jump to the terminal view
+picker      = "ctrl+g" # return to the CT picker
+help        = "f1"     # toggle the key/legend overlay (also "?" in the deck)
+
+# Terminal-screen-only pane keys.
+term_split_v    = "alt+v"  # new pane to the right
+term_split_h    = "alt+s"  # new pane below
+term_zoom       = "alt+z"  # zoom / restore the focused pane
+term_close      = "alt+x"  # close the focused pane
+term_focus_left = "alt+h"  # directional pane focus (h/j/k/l)
+term_focus_down = "alt+j"
+term_focus_up   = "alt+k"
+term_focus_right = "alt+l"
+
+# Ambient plasma panel on the right of the deck (defaults shown). It only
+# animates while the deck is on screen, and hides itself on terminals too
+# narrow to split.
+[plasma]
+pattern = "classic" # classic | waves | interference | lava | ripple
+palette = "aurora"  # aurora (blue/purple) | ember (yellow/red) | mono (grayscale)
+charset = "dots"    # dots (braille) | shade | blocks
+speed   = 0.3       # animation rate; 0 freezes the pattern
+width   = 40        # percent of the terminal width; 0 disables the panel
 ```
 
 ## Run
@@ -47,12 +74,13 @@ go build -o ct ./cmd/ct && ./ct
 
 A pinned status bar sits at the top at all times:
 
-The bar is a row of spaced **Nerd Font** glyphs (a Nerd Font is required). The caretaker shows a
-yellow smiley while you tend the deck and a red skull once you drop into a session; the nvim
-(code), claude (robot), and term (terminal) icons glow in their own colour when active and dim
-otherwise (faint until a workspace exists). The active repo / worktree shows on the right.
+The bar is a row of spaced **Nerd Font** glyphs (a Nerd Font is required). The caretaker is a
+seedling, lit yellow while you tend the deck and dim once you drop into a session; the nvim (code),
+claude (robot), and term (terminal) icons glow in their own colour when active and dim otherwise
+(faint until a workspace exists). When an agent is waiting on your input, the `! N` badge on the
+right signals it. The active repo / worktree shows on the right.
 
-- **Picker** (smiley): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
+- **Picker** (seedling): the deck — a `NEW` repo fuzzy-finder and an `ACTIVE` list of your
   worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes). Within each
   repo, worktrees are ordered by when you last opened them in ct (most recent first), falling
   back to git commit time for ones you haven't opened yet. The three most-recently-opened
@@ -62,12 +90,13 @@ otherwise (faint until a workspace exists). The active repo / worktree shows on 
   that worktree and drops you into the nvim view. The session segments light up and the active
   repo / worktree shows on the right. You can also **click** a deck row to select it and click it
   again to open it (or, in `NEW`, to start naming a worktree).
-- **`ctrl+o`** cycles the session views (nvim → claude → terminal → nvim); **`ctrl+g`** returns
-  to the picker — and from the picker, **`ctrl+g`** jumps straight to your most recently opened
-  worktree, so it toggles you between the deck and your latest work. You can also **click** any
-  of the four bar icons to jump straight to that view (the session icons are inert until a
-  workspace is active). Sessions keep running — switching never relaunches them, and they
-  persist for ct's lifetime.
+- **`alt+]`** / **`alt+[`** cycle the session views forward / backward
+  (nvim → claude → terminal → nvim, wrapping), and **`alt+1`/`alt+2`/`alt+3`** jump straight to
+  the editor, agent, or terminal view. **`ctrl+g`** returns to the picker — and from the picker,
+  **`ctrl+g`** jumps straight to your most recently opened worktree, so it toggles you between the
+  deck and your latest work. You can also **click** any of the four bar icons to jump straight to
+  that view (the session icons are inert until a workspace is active). Sessions keep running —
+  switching never relaunches them, and they persist for ct's lifetime.
 
 Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `?` help · `ctrl+c` quit.
 

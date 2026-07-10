@@ -66,6 +66,15 @@ func TestWorktreeLifecycle(t *testing.T) {
 		t.Fatalf("ListWorktrees = %+v", wts)
 	}
 
+	// Branch tip times: one call covers every branch.
+	tips, err := BranchTipTimes(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tips["main"] == 0 || tips["feat"] == 0 {
+		t.Fatalf("expected tip times for main and feat, got %v", tips)
+	}
+
 	// Status: clean, then dirty.
 	st, err := WorktreeStatus(wts[1])
 	if err != nil || st.Dirty {
@@ -84,5 +93,55 @@ func TestWorktreeLifecycle(t *testing.T) {
 	}
 	if wts, _ := ListWorktrees(r); len(wts) != 1 {
 		t.Fatalf("expected only main worktree after remove, got %+v", wts)
+	}
+}
+
+// TestRemoveWorktreeKeepsBranch verifies deleteBranch=false removes the working
+// tree but leaves its branch behind, so the user can re-check it out later.
+func TestRemoveWorktreeKeepsBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "demo")
+	if err := os.Mkdir(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		if _, err := git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	runGit(repoDir, "init", "-b", "main")
+	runGit(repoDir, "config", "user.email", "t@t.t")
+	runGit(repoDir, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repoDir, "README"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repoDir, "add", ".")
+	runGit(repoDir, "commit", "-m", "init")
+
+	r := Repo{Name: "demo", Path: repoDir}
+	wt, err := CreateWorktree(r, ".worktrees/feat", "feat", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove keeping the branch.
+	if err := RemoveWorktree(r, wt, false); err != nil {
+		t.Fatal(err)
+	}
+	if wts, _ := ListWorktrees(r); len(wts) != 1 {
+		t.Fatalf("expected only main worktree after remove, got %+v", wts)
+	}
+	// The branch tip must survive.
+	tips, err := BranchTipTimes(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tips["feat"]; !ok {
+		t.Fatalf("expected branch 'feat' to survive removal, tips=%v", tips)
 	}
 }

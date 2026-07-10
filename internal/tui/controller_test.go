@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -122,6 +123,47 @@ func TestAgentSpecResumeOrFallback(t *testing.T) {
 	wantResume := []string{"claude", "--resume", id, "--teammate-mode", "in-process"}
 	if got := resumed.Argv; !equalStrings(got, wantResume) {
 		t.Errorf("present-transcript argv = %v, want %v", got, wantResume)
+	}
+}
+
+func TestEnsureProjectTrusted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, ".claude.json")
+	home := "/Users/test"
+	other := "/Users/test/other-project"
+	initial := `{"userID":"abc123","projects":{"` + other + `":{"hasTrustDialogAccepted":true,"lastCost":42}}}`
+	if err := os.WriteFile(configPath, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureProjectTrusted(configPath, home); err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	projects := got["projects"].(map[string]any)
+	homeProj := projects[home].(map[string]any)
+	if homeProj["hasTrustDialogAccepted"] != true {
+		t.Errorf("home project hasTrustDialogAccepted = %v, want true", homeProj["hasTrustDialogAccepted"])
+	}
+	if got["userID"] != "abc123" {
+		t.Errorf("unrelated top-level field userID = %v, want abc123", got["userID"])
+	}
+	otherProj := projects[other].(map[string]any)
+	if otherProj["lastCost"] != float64(42) {
+		t.Errorf("unrelated project field lastCost = %v, want 42", otherProj["lastCost"])
+	}
+
+	// Calling again is a no-op: it should not error and the flag stays true.
+	if err := ensureProjectTrusted(configPath, home); err != nil {
+		t.Fatal(err)
 	}
 }
 

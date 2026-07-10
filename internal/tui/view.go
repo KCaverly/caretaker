@@ -5,11 +5,13 @@ import (
 	"image/color"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/usage"
 )
 
 // Palette (gruvbox dark, medium contrast).
@@ -41,6 +43,30 @@ var (
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
 	errStyle     = lipgloss.NewStyle().Foreground(cRed)
+
+	// Non-bold accent/purple foregrounds for the bar's volatile context
+	// segments (pane indicator, agent position) and the accent split divider.
+	accentStyle = lipgloss.NewStyle().Foreground(cAccent)
+	purpleStyle = lipgloss.NewStyle().Foreground(cPurple)
+
+	// Bold glyph styles, cached rather than rebuilt per frame: the status-bar
+	// tab icons (a lit accent per tab plus the shared dim/faint states) and the
+	// red/green attention markers reused across the bar, board, and deck.
+	// lipgloss.Style is immutable (each method returns a copy) and View runs
+	// only on the UI goroutine, so sharing these package-level styles is safe.
+	boldDim    = lipgloss.NewStyle().Bold(true).Foreground(cDim)
+	boldFaint  = lipgloss.NewStyle().Bold(true).Foreground(cFaint)
+	boldGreen  = lipgloss.NewStyle().Bold(true).Foreground(cGreen)
+	boldPurple = lipgloss.NewStyle().Bold(true).Foreground(cPurple)
+	boldAccent = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
+	boldYellow = lipgloss.NewStyle().Bold(true).Foreground(cYellow)
+	boldRed    = lipgloss.NewStyle().Bold(true).Foreground(cRed)
+
+	// Bordered box frames for the deck sections and overlays: faint idle,
+	// accent when focused. Rounded border + 0,1 padding match the old per-call
+	// style exactly.
+	boxStyleFaint   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cFaint).Padding(0, 1)
+	boxStyleFocused = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cAccent).Padding(0, 1)
 )
 
 // View implements tea.Model.
@@ -60,16 +86,22 @@ func (m Model) View() tea.View {
 		body = m.renderSetup(h - barHeight)
 	case m.helpOpen:
 		body = m.renderHelp(h - barHeight)
+	case m.boardOpen:
+		body = m.renderBoard(h - barHeight)
+	case m.usageOpen:
+		body = m.renderUsage(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
-	case m.paletteOpen:
-		body = m.renderPalette(h - barHeight)
+	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
+		body, cursor = m.renderTermPanes(w, h-barHeight-m.sessionFooterH())
+		body = m.appendSessionFooter(body)
 	default:
 		if s := m.activeSession(); s != nil {
 			body = s.Render()
 			if x, y, visible := s.Cursor(); visible {
 				cursor = tea.NewCursor(x, y+barHeight)
 			}
+			body = m.appendSessionFooter(body)
 		}
 	}
 
@@ -82,23 +114,28 @@ func (m Model) View() tea.View {
 
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
-	iconDeck   = "" // fa-smile (U+F118)    — tending the deck (picker)
-	iconAway   = "󰚌" // md-skull (U+F068C)   — away in a session
-	iconEditor = "" // fa-code (U+F121)     — nvim
-	iconAgent  = "󰚩" // md-robot (U+F06A9)   — claude
-	iconTerm   = "" // fa-terminal (U+F120) — term
+	iconDeck   = "\U0000EDA7" // fa-seedling (U+EDA7) — the deck: a grove of worktrees
+	iconEditor = ""          // fa-code (U+F121)     — nvim
+	iconAgent  = "󰚩"          // md-robot (U+F06A9)   — claude
+	iconTerm   = ""          // fa-terminal (U+F120) — term
+	iconPanes  = "\U0000F009" // fa-th-large (U+F009) — the split-pane grid
+	// Zoom toggle shown at the tail of the pane indicator (clickable): diagonal
+	// arrows expanding out to maximize the active pane, collapsing in to restore
+	// the split. Material Design Icons range — the classic Font Awesome
+	// expand/compress glyphs (U+F065/F066) are absent from the bundled Nerd Font
+	// symbols, same as the seedling's pre-v3 codepoint was.
+	iconZoomIn  = "\U000F0616" // md-arrow-expand   (U+F0616) — maximize the active pane
+	iconZoomOut = "\U000F0615" // md-arrow-collapse (U+F0615) — restore the split layout
 )
 
 // renderBar draws the pinned status bar plus a light separator directly
 // beneath it (barHeight rows total). The four left icons (caretaker, nvim,
-// claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker shows a
-// yellow smiley while you tend the deck and a red skull once you drop into a
-// session; the session icons glow in their own colour when active and dim
-// otherwise (faint until a workspace exists). The current repo / worktree sits
-// on the right.
+// claude, term) are bold Nerd Font glyphs evenly spaced: the caretaker is a
+// stable seedling, lit yellow while the deck is active and dim once you drop
+// into a session; the session icons glow in their own colour when active and
+// dim otherwise (faint until a workspace exists). Agent attention lives in the
+// "! N" badge, not the icons. The current repo / worktree sits on the right.
 func (m Model) renderBar() string {
-	has := m.current != nil
-
 	left := "  "
 	for i, z := range m.barZones() {
 		if i > 0 {
@@ -107,18 +144,215 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Repo / worktree, de-emphasised (terminals can't shrink a run of text, so
-	// we reduce its weight and colour instead).
+	// Right side: notification zone (! N  * N) then the workspace context.
 	right := ""
-	if has {
-		right = lipgloss.NewStyle().Foreground(cDim).
-			Render(m.current.repo+" / "+m.current.worktree) + "  "
+	if notif := m.renderNotifZone(); notif != "" {
+		right += notif + "   "
+	}
+	right += m.barContextLabel()
+	if right != "" {
+		right += "  "
 	}
 
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
 	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
 	return bar + "\n" + sep
+}
+
+// renderNotifZone builds the right-side attention summary: "! N" (red) for
+// worktrees where an agent is waiting on input and "* N" (green) for worktrees
+// with unread completions. Returns "" when nothing is pending. Clicking it
+// opens the agent board.
+func (m Model) renderNotifZone() string {
+	waiting, done := m.attnSummary()
+	var parts []string
+	if waiting > 0 {
+		parts = append(parts, boldRed.Render("!")+
+			" "+countStyle.Render(strconv.Itoa(waiting)))
+	}
+	if done > 0 {
+		parts = append(parts, boldGreen.Render("*")+
+			" "+countStyle.Render(strconv.Itoa(done)))
+	}
+	return strings.Join(parts, "  ")
+}
+
+// barContextLabel builds the bar's right-side workspace context: the
+// "repo / worktree" label, preceded by the agent pool position
+// ("2/3 label ·") on the agent screen when the workspace has more than one
+// agent, and the pane position (grid glyph + "2/3" + a clickable zoom toggle)
+// on the terminal screen with splits. Each volatile segment shows only on the
+// screen it steers, so the bar never advertises a position the current keys
+// can't change. Both segments sit to the left because they hot-swap
+// far more often than the worktree — keeping the repo / worktree label
+// anchored at the right edge while agents and panes rotate. It surfaces
+// state that is otherwise invisible — which agent is focused, how many exist,
+// whether a pane is zoomed — and thereby advertises the prev/next-agent and
+// zoom keys.
+func (m Model) barContextLabel() string {
+	if m.current == nil {
+		return ""
+	}
+	s := dimStyle.Render(m.current.repo + " / " + m.current.worktree)
+	ws := m.current.ws
+	if ws == nil {
+		return s
+	}
+	sep := dimStyle.Render(" · ")
+	if seg, ok := m.paneSegment(); ok {
+		s = accentStyle.Render(seg) + sep + s
+	}
+	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
+		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
+		if a := ws.ActiveAgentSession(); a != nil {
+			pos += " " + truncateTo(agentTitle(a.Title), 14)
+		}
+		s = purpleStyle.Render(pos) + sep + s
+	}
+	if seg, ok := m.usageSegment(); ok {
+		w, _ := m.usageSnap.Binding()
+		s = usageSeverity(w.Utilization).Render(seg) + sep + s
+	}
+	return s
+}
+
+// usageSegment returns the plan-usage gauge — pie glyph, the binding window's
+// percent, and when it resets — and whether it applies: agent screen only,
+// snapshot still fresh, and utilization at or past the configured threshold.
+// Shared by barContextLabel (which styles and places it) and usageZoneAt
+// (which measures it), so the drawn text and its click target can never
+// drift. Like the other volatile segments it sits left of the stable
+// repo / worktree label; it leads them because it hot-swaps with every poll.
+func (m Model) usageSegment() (string, bool) {
+	if m.screen != screenAgent || !m.usageFresh() {
+		return "", false
+	}
+	w, limit := m.usageSnap.Binding()
+	if w == nil || w.Utilization < float64(m.usageThreshold) {
+		return "", false
+	}
+	seg := usagePie(w.Utilization)
+	switch limit {
+	case usage.LimitWeek:
+		seg += " wk"
+	case usage.LimitOpus:
+		seg += " opus"
+	}
+	seg += fmt.Sprintf(" %d%%", int(w.Utilization+0.5))
+	if !w.ResetsAt.IsZero() {
+		if limit == usage.LimitSession {
+			seg += " " + humanDur(time.Until(w.ResetsAt))
+		} else {
+			// A week-scale reset lands days out; the weekday says enough.
+			seg += " " + strings.ToLower(w.ResetsAt.Local().Format("Mon"))
+		}
+	}
+	return seg, true
+}
+
+// usageZoneAt reports whether bar coordinates land on the usage segment.
+// It mirrors renderBar's right-side layout: the segment leads
+// barContextLabel, so its left edge is where the context label begins.
+func (m Model) usageZoneAt(x, y int) bool {
+	if y != 0 {
+		return false
+	}
+	seg, ok := m.usageSegment()
+	if !ok {
+		return false
+	}
+	prefix := ""
+	if notif := m.renderNotifZone(); notif != "" {
+		prefix = notif + "   "
+	}
+	right := prefix + m.barContextLabel() + "  "
+	start := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
+	return x >= start && x < start+lipgloss.Width(seg)
+}
+
+// usagePie maps a utilization percent to a pie glyph that fills as the
+// window is consumed. Bands are centered so each glyph covers the quarter it
+// depicts (e.g. ◑ spans 37.5–62.5).
+func usagePie(util float64) string {
+	switch {
+	case util < 12.5:
+		return "○"
+	case util < 37.5:
+		return "◔"
+	case util < 62.5:
+		return "◑"
+	case util < 87.5:
+		return "◕"
+	default:
+		return "●"
+	}
+}
+
+// usageSeverity styles a utilization percent: dim while comfortable, yellow
+// from 70, red and bold from 90. Deliberately independent of the visibility
+// threshold, so a low threshold still colour-codes an urgent window.
+func usageSeverity(util float64) lipgloss.Style {
+	switch {
+	case util >= 90:
+		return lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	case util >= 70:
+		return lipgloss.NewStyle().Foreground(cYellow)
+	default:
+		return dimStyle
+	}
+}
+
+// paneSegment returns the terminal-screen pane indicator — grid glyph, pane
+// position, and a trailing zoom toggle (iconZoomIn to maximize, iconZoomOut to
+// restore) — and whether it applies (only on the terminal screen with more
+// than one pane). Shared by barContextLabel (which styles and places it) and
+// paneZoomAt (which measures it), so the drawn glyph and its click target can
+// never drift. The zoom toggle is always the segment's final glyph.
+func (m Model) paneSegment() (string, bool) {
+	if m.current == nil || m.current.ws == nil {
+		return "", false
+	}
+	ws := m.current.ws
+	if m.screen != screenTerminal || len(ws.Terms) <= 1 {
+		return "", false
+	}
+	pos := clamp(ws.ActiveTerm, 0, len(ws.Terms)-1) + 1
+	return fmt.Sprintf("%s %d/%d %s", iconPanes, pos, len(ws.Terms), m.paneZoomIcon()), true
+}
+
+// paneZoomIcon is the zoom-toggle glyph reflecting the current pane state:
+// inward arrows while a pane is maximized (click to restore), outward arrows
+// otherwise (click to maximize the active pane).
+func (m Model) paneZoomIcon() string {
+	if m.current != nil && m.current.ws != nil && m.current.ws.TermZoomed {
+		return iconZoomOut
+	}
+	return iconZoomIn
+}
+
+// paneZoomAt reports whether bar coordinates land on the pane indicator's zoom
+// toggle. It mirrors renderBar's right-side layout to locate the segment, then
+// targets its trailing icon (the toggle is always the segment's last glyph).
+func (m Model) paneZoomAt(x, y int) bool {
+	if y != 0 {
+		return false
+	}
+	seg, ok := m.paneSegment()
+	if !ok {
+		return false
+	}
+	prefix := ""
+	if notif := m.renderNotifZone(); notif != "" {
+		prefix = notif + "   "
+	}
+	right := prefix + m.barContextLabel() + "  "
+	labelStart := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
+	iconW := lipgloss.Width(m.paneZoomIcon())
+	iconStart := labelStart + lipgloss.Width(seg) - iconW
+	// One column of slack on the left (the space before the icon) so the small
+	// target is easy to hit.
+	return x >= iconStart-1 && x < iconStart+iconW
 }
 
 // barZone is one clickable status-bar icon: its fully-rendered glyph (with any
@@ -134,46 +368,37 @@ func (m Model) barZones() []barZone {
 	has := m.current != nil
 
 	// All glyphs are bold (heaviest weight a cell allows); active gets its accent
-	// colour, idle is dim, and disabled is faint until a workspace exists.
-	glyph := func(g string, accent color.Color, active, enabled bool) string {
-		st := lipgloss.NewStyle().Bold(true)
+	// colour (the lit style passed in), idle is dim, and disabled is faint until
+	// a workspace exists. The styles are package-level, cached once, not rebuilt
+	// per icon per frame.
+	glyph := func(g string, lit lipgloss.Style, active, enabled bool) string {
 		switch {
 		case active:
-			return st.Foreground(accent).Render(g)
+			return lit.Render(g)
 		case enabled:
-			return st.Foreground(cDim).Render(g)
+			return boldDim.Render(g)
 		default:
-			return st.Foreground(cFaint).Render(g)
+			return boldFaint.Render(g)
 		}
 	}
 
-	// Caretaker: smiley (tending the deck) vs skull (away in a session), badged
-	// with a dot when some *other* worktree is waiting on input.
-	ct := lipgloss.NewStyle().Bold(true).Foreground(cYellow).Render(iconDeck)
-	if m.screen != screenPicker {
-		ct = lipgloss.NewStyle().Bold(true).Foreground(cRed).Render(iconAway)
+	// Caretaker: a stable seedling that follows the same lit-when-active rule as
+	// the other tabs — yellow while the deck is active, dim otherwise (never
+	// faint: the deck is always reachable). Agent attention lives in the ! badge
+	// on the right, so the icon never reacts to agent status.
+	ctStyle := boldDim
+	if m.screen == screenPicker {
+		ctStyle = boldYellow
 	}
-	if dot := levelDot(m.otherWorktreesLevel()); dot != "" {
-		ct += dot
-	}
+	ct := ctStyle.Render(iconDeck)
 
-	// Agent icon: badged with the pool size (when >1) and the current worktree's
-	// worst status dot.
-	agent := glyph(iconAgent, cPurple, m.screen == screenAgent, has)
-	if has && m.current.ws != nil {
-		if n := len(m.current.ws.Agents); n > 1 {
-			agent += " " + countStyle.Render(strconv.Itoa(n))
-		}
-		if dot := levelDot(m.worktreeLevel(m.current.path)); dot != "" {
-			agent += dot
-		}
-	}
+	agent := glyph(iconAgent, boldPurple, m.screen == screenAgent, has)
 
 	return []barZone{
 		{screenPicker, ct},
-		{screenEditor, glyph(iconEditor, cGreen, m.screen == screenEditor, has)},
+		{screenEditor, glyph(iconEditor, boldGreen, m.screen == screenEditor, has)},
 		{screenAgent, agent},
-		{screenTerminal, glyph(iconTerm, cAccent, m.screen == screenTerminal, has)},
+		{screenTerminal, glyph(iconTerm, boldAccent, m.screen == screenTerminal, has)},
 	}
 }
 
@@ -197,69 +422,294 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 	return 0, false
 }
 
-// agentLevel ranks an agent/worktree status for badge precedence.
-type agentLevel int
-
-const (
-	levelNone    agentLevel = iota // busy / unknown — no badge
-	levelIdle                      // idle (turn done) — dim dot
-	levelWaiting                   // waiting (blocked) — yellow dot
-)
-
-func statusLevel(status string) agentLevel {
-	switch status {
-	case "waiting":
-		return levelWaiting
-	case "idle":
-		return levelIdle
-	default:
-		return levelNone
+// notifZoneAt reports whether bar coordinates (x, y) land on the notification
+// zone. It mirrors renderBar's right-side layout to locate the zone's x bounds.
+func (m Model) notifZoneAt(x, y int) bool {
+	if y != 0 {
+		return false
 	}
+	notif := m.renderNotifZone()
+	if notif == "" {
+		return false
+	}
+	right := notif + "   " + m.barContextLabel() + "  "
+	start := m.width - lipgloss.Width(right)
+	end := start + lipgloss.Width(notif)
+	return x >= start && x < end
 }
 
-// levelDot renders a notification dot for a level, or "" for levelNone.
-func levelDot(l agentLevel) string {
-	switch l {
-	case levelWaiting:
-		return lipgloss.NewStyle().Foreground(cYellow).Render("●")
-	case levelIdle:
-		return dimStyle.Render("●")
-	default:
+// renderBoard draws the agent board overlay: every open workspace's agents
+// grouped under worktree header rows, attention sorted to the top, plus the
+// trailing "+ new agent" row. Delegates to renderBoardForm in form state.
+func (m Model) renderBoard(h int) string {
+	innerW := clamp(m.width-8, 32, 64)
+	if m.formOpen {
+		return m.renderBoardForm(h, innerW)
+	}
+
+	rows, nav := m.buildBoard()
+	selRow := -1
+	if m.boardCursor >= 0 && m.boardCursor < len(nav) {
+		selRow = nav[m.boardCursor]
+	}
+	agentCount := 0
+	for _, r := range rows {
+		if r.isAgent {
+			agentCount++
+		}
+	}
+
+	lines := []string{header("agents", agentCount), ""}
+	for i, r := range rows {
+		switch {
+		case r.isNew:
+			if agentCount > 0 {
+				lines = append(lines, "")
+			}
+			if i == selRow {
+				lines = append(lines, selBar("  + new agent…", innerW))
+			} else {
+				lines = append(lines, dimStyle.Render("  + new agent…"))
+			}
+		case r.isAgent:
+			content := m.boardAgentLine(r, innerW)
+			if i == selRow {
+				lines = append(lines, selBar(content, innerW))
+			} else {
+				lines = append(lines, content)
+			}
+		default: // worktree group header
+			if i > 0 {
+				lines = append(lines, "")
+			}
+			left := dimStyle.Render("  " + r.key)
+			if m.current != nil && r.key == m.current.key {
+				right := helpKeyStyle.Render("current")
+				gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+				left += strings.Repeat(" ", gap) + right
+			}
+			lines = append(lines, left)
+		}
+	}
+
+	lines = append(lines, "", "  "+strings.Join([]string{
+		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
+		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
+	}, helpStyle.Render("  ·  ")))
+
+	boxStr := box(lines, innerW, len(lines), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// boardAgentLine renders one agent row: quick-jump number, attention glyph,
+// label, and the right-aligned (truncated) status column.
+func (m Model) boardAgentLine(r boardRow, innerW int) string {
+	numCol := " "
+	if r.num > 0 {
+		numCol = strconv.Itoa(r.num)
+	}
+	glyph, glyphSt := " ", dimStyle
+	switch r.attn {
+	case attnWaiting:
+		glyph, glyphSt = "!", boldRed
+	case attnDone:
+		glyph, glyphSt = "*", boldGreen
+	}
+	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + nameStyle.Render(r.label)
+	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
+	right := dimStyle.Render(status)
+	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// renderBoardForm draws the new-agent form: the prompt input plus the
+// where/mode toggles, with the focused field's name highlighted.
+func (m Model) renderBoardForm(h, innerW int) string {
+	fieldName := func(f int, name string) string {
+		st := dimStyle
+		if m.formFocus == f {
+			st = helpKeyStyle
+		}
+		return st.Render(padLine(name, 8))
+	}
+	toggle := func(options [2]string, sel int) string {
+		var parts [2]string
+		for i, o := range options {
+			if i == sel {
+				parts[i] = lipgloss.NewStyle().Bold(true).Foreground(cFg).Render("[" + o + "]")
+			} else {
+				parts[i] = dimStyle.Render(" " + o + " ")
+			}
+		}
+		return parts[0] + " " + parts[1]
+	}
+	bgIdx := 0
+	if m.formBackground {
+		bgIdx = 1
+	}
+	rows := []string{
+		header("new agent", -1),
+		"",
+		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
+		"",
+		"  " + fieldName(formFieldWhere, "where") + toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
+		"  " + fieldName(formFieldMode, "mode") + toggle([2]string{"foreground", "background"}, bgIdx),
+		"",
+		"  " + strings.Join([]string{
+			keyhint("enter", "launch"), keyhint("tab", "field"),
+			keyhint("space", "toggle"), keyhint("esc", "back"),
+		}, helpStyle.Render("  ·  ")),
+	}
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// usageGaugeWidth is the overlay gauge's cell count — wide enough that one
+// cell is a legible ~5.5%, narrow enough to fit the overlay's minimum width.
+const usageGaugeWidth = 18
+
+// usageBurnMinSpan is how much time the sample ring must cover before the
+// overlay shows a burn rate; two adjacent polls would extrapolate noise.
+const usageBurnMinSpan = 5 * time.Minute
+
+// renderUsage draws the plan-usage overlay: one gauge per present limit
+// window with its reset time, plus a burn-rate estimate once the sample ring
+// spans enough time to be meaningful. Unlike the bar segment it ignores the
+// threshold and staleness gates — when the user explicitly asks, they get
+// whatever ct knows.
+func (m Model) renderUsage(h int) string {
+	innerW := clamp(m.width-8, 32, 56)
+	rows := []string{header("usage", -1), ""}
+	if !m.usageHave {
+		rows = append(rows, dimStyle.Render("  no usage data"))
+	} else {
+		rows = append(rows, m.usageWindowRows()...)
+		rows = append(rows, m.usageBurnRows()...)
+	}
+	rows = append(rows, "", "  "+keyhint("esc", "close"))
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// usageWindowRows renders a gauge line (and an indented reset line) per
+// present window; absent windows are skipped outright — a placeholder row
+// would imply a limit the plan doesn't have.
+func (m Model) usageWindowRows() []string {
+	var rows []string
+	add := func(label string, w *usage.Window, session bool) {
+		if w == nil {
+			return
+		}
+		rows = append(rows, "  "+dimStyle.Render(padLine(label, 9))+usageGauge(w.Utilization)+
+			usageSeverity(w.Utilization).Render(fmt.Sprintf(" %3d%%", int(w.Utilization+0.5))))
+		if w.ResetsAt.IsZero() {
+			return
+		}
+		reset := w.ResetsAt.Local()
+		line := "resets " + strings.ToLower(reset.Format("Mon 3:04 PM"))
+		if session {
+			// The session window resets within hours; the countdown matters
+			// more than the weekday.
+			line = fmt.Sprintf("resets %s (%s)",
+				strings.ToLower(reset.Format("3:04 PM")), untilPhrase(time.Until(reset)))
+		}
+		rows = append(rows, "  "+strings.Repeat(" ", 9)+dimStyle.Render(line))
+	}
+	add("session", m.usageSnap.FiveHour, true)
+	add("week", m.usageSnap.SevenDay, false)
+	add("opus", m.usageSnap.SevenDayOpus, false)
+	return rows
+}
+
+// usageBurnRows estimates the five-hour window's burn rate from the sample
+// ring: a sparkline of the between-poll deltas, the hourly rate, and — when
+// the window would cap before it resets — the projected time it caps. Hidden
+// until the ring spans usageBurnMinSpan with a rising trend, so a flat or
+// draining window never shows a scary extrapolation, and the projection line
+// is dropped when the reset lands first (the window frees up before it caps).
+func (m Model) usageBurnRows() []string {
+	hist := m.usageHist
+	if len(hist) < 2 {
+		return nil
+	}
+	first, last := hist[0], hist[len(hist)-1]
+	span := last.at.Sub(first.at)
+	if span < usageBurnMinSpan || last.util <= first.util {
+		return nil
+	}
+	perHour := (last.util - first.util) / span.Hours()
+	rows := []string{"  " + dimStyle.Render(padLine("burn", 9)) + usageSparkline(hist) +
+		dimStyle.Render(fmt.Sprintf(" ~%d%%/hr", int(perHour+0.5)))}
+	if w := m.usageSnap.FiveHour; w != nil && w.Utilization < 100 {
+		caps := time.Now().Add(time.Duration((100 - w.Utilization) / perHour * float64(time.Hour)))
+		if w.ResetsAt.IsZero() || caps.Before(w.ResetsAt) {
+			rows = append(rows, "  "+strings.Repeat(" ", 9)+
+				dimStyle.Render("at this pace: caps ~"+strings.ToLower(caps.Local().Format("3:04 PM"))))
+		}
+	}
+	return rows
+}
+
+// usageSparkline draws the ring's between-sample utilization deltas as a
+// block ramp: flat polls sit on the baseline, the steepest delta tops out.
+// Only the newest deltas are drawn so the line always fits the overlay.
+func usageSparkline(hist []usageSample) string {
+	const maxCells = 24
+	ramp := []rune("▁▂▃▄▅▆▇█")
+	if len(hist) > maxCells+1 {
+		hist = hist[len(hist)-maxCells-1:]
+	}
+	deltas := make([]float64, 0, len(hist)-1)
+	maxD := 0.0
+	for i := 1; i < len(hist); i++ {
+		d := max(0, hist[i].util-hist[i-1].util)
+		deltas = append(deltas, d)
+		maxD = max(maxD, d)
+	}
+	var b strings.Builder
+	for _, d := range deltas {
+		idx := 0
+		if maxD > 0 {
+			idx = int(d / maxD * float64(len(ramp)-1))
+		}
+		b.WriteRune(ramp[idx])
+	}
+	return b.String()
+}
+
+// usageGauge renders a utilization percent as a fixed-width block gauge, the
+// filled span coloured by the same severity ramp as the bar segment.
+func usageGauge(util float64) string {
+	filled := clamp(int(util/100*usageGaugeWidth+0.5), 0, usageGaugeWidth)
+	return usageSeverity(util).Render(strings.Repeat("█", filled)) +
+		dimStyle.Render(strings.Repeat("░", usageGaugeWidth-filled))
+}
+
+// untilPhrase formats a duration as the overlay's parenthetical countdown.
+func untilPhrase(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
+}
+
+// truncateTo shortens s to at most w display columns, appending "…" when it
+// had to cut.
+func truncateTo(s string, w int) string {
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w <= 1 {
 		return ""
 	}
-}
-
-// worktreeLevel is the worst status among the claude sessions running in path.
-func (m Model) worktreeLevel(path string) agentLevel {
-	lvl := levelNone
-	for _, st := range m.agentStatus {
-		if st.Cwd != path {
-			continue
-		}
-		if l := statusLevel(st.Status); l > lvl {
-			lvl = l
-		}
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > w {
+		runes = runes[:len(runes)-1]
 	}
-	return lvl
-}
-
-// otherWorktreesLevel is the worst status across every worktree except the one
-// currently focused — what the caretaker icon badges.
-func (m Model) otherWorktreesLevel() agentLevel {
-	cur := ""
-	if m.current != nil {
-		cur = m.current.path
-	}
-	lvl := levelNone
-	for _, it := range m.active {
-		if it.view.WT.Path == cur {
-			continue
-		}
-		if l := m.worktreeLevel(it.view.WT.Path); l > lvl {
-			lvl = l
-		}
-	}
-	return lvl
+	return string(runes) + "…"
 }
 
 // deckLayout captures the deck's vertical geometry, shared by renderDeck (to
@@ -295,16 +745,42 @@ func (m Model) deckLayout(bodyH int) deckLayout {
 	}
 }
 
-// renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
+// plasmaWidth returns the plasma panel's column count for the current
+// terminal size: the configured percent of the width, or 0 when the panel is
+// disabled or the terminal is too narrow to split — the repo/worktree lists
+// keep priority over ambience.
+func (m Model) plasmaWidth() int {
+	if m.plasma == nil || m.plasmaWidthPct <= 0 {
+		return 0
+	}
+	w := m.width * m.plasmaWidthPct / 100
+	if w < 16 || m.width-w < 48 {
+		return 0
+	}
+	return w
+}
+
+// renderDeck draws the picker into h rows beneath the bar: the NEW + ACTIVE
+// sections stacked on the left, and (given the room) the ambient plasma panel
+// filling a full-height box on the right.
 func (m Model) renderDeck(h int) string {
-	innerW := m.width - 4 // border (2) + horizontal padding (2)
+	plasmaW := m.plasmaWidth()
+	innerW := m.width - plasmaW - 4 // border (2) + horizontal padding (2)
 	footer := m.renderFooter()
 	L := m.deckLayout(h)
 
 	newBox := box(m.renderNew(innerW, L.newRows), innerW, L.newContentH, m.focus == focusNew)
 	activeBox := box(m.renderActive(innerW, L.activeRows), innerW, L.activeContentH, m.focus == focusActive)
+	body := lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox)
 
-	return lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox, footer)
+	if plasmaW > 0 {
+		// Span both left boxes exactly: their outer heights are contentH+2 each.
+		ph := L.newContentH + L.activeContentH + 2
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body,
+			box(m.plasma.Render(plasmaW-4, ph), plasmaW-4, ph, false))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 }
 
 // renderNew builds the top "new" repo finder. In create mode it becomes a
@@ -318,6 +794,11 @@ func (m Model) renderNew(innerW, rows int) []string {
 	lines := []string{header("new", -1), "", m.filter.View(), ""}
 
 	if len(m.repoMatches) == 0 {
+		// Before the first scan lands, an empty list means "still looking",
+		// not "nothing there" — don't claim the root is empty.
+		if !m.groupsLoaded {
+			return append(lines, dimStyle.Render("   scanning repos…"))
+		}
 		return append(lines, dimStyle.Render("   no repos under root"))
 	}
 
@@ -325,7 +806,7 @@ func (m Model) renderNew(innerW, rows int) []string {
 	for i := start; i < end; i++ {
 		name := m.repoMatches[i].Name
 		if i == m.newCursor && m.focus == focusNew {
-			lines = append(lines, selBar(" ▸ "+name, innerW))
+			lines = append(lines, selBar("   "+name, innerW))
 		} else {
 			lines = append(lines, repoStyle.Render("   "+name))
 		}
@@ -384,6 +865,9 @@ func (m Model) renderActive(innerW, rows int) []string {
 	lines := []string{header("active", len(m.active)), ""}
 
 	if len(m.active) == 0 {
+		if !m.groupsLoaded {
+			return append(lines, dimStyle.Render("scanning…"))
+		}
 		return append(lines, dimStyle.Render("no workspaces yet — pick a repo above to create one"))
 	}
 
@@ -393,46 +877,55 @@ func (m Model) renderActive(innerW, rows int) []string {
 }
 
 func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
-	// A single status circle: yellow when an agent is waiting on input, green
-	// when the worktree is live, a hollow ring when inactive.
-	waiting := m.worktreeLevel(it.view.WT.Path) == levelWaiting
-	dotChar := "○"
-	if waiting || it.view.Live {
-		dotChar = "●"
+	key := wsKey(it.repo.Name, it.view.WT.Name)
+
+	// Live/dead indicator: filled circle when sessions are running, hollow otherwise.
+	liveChar := "○"
+	liveSt := dimStyle
+	if it.view.Live {
+		liveChar = "●"
+		liveSt = liveStyle
 	}
+
+	// Attention indicator: matches the right-bar glyphs so the user can
+	// scan the list for the same symbol they saw in the bar.
+	notifChar := " "
+	notifSt := dimStyle
+	switch m.worktreeAttn(key) {
+	case attnWaiting:
+		notifChar = "!"
+		notifSt = boldRed
+	case attnDone:
+		notifChar = "*"
+		notifSt = boldGreen
+	}
+
 	dirtyChar := " "
 	if it.view.Dirty {
 		dirtyChar = "✷"
 	}
 
 	// Leading rank column (1..3) for the worktrees most recently opened in ct,
-	// blank otherwise. A 6-column gutter keeps selected/unselected rows aligned.
-	rank := m.recentRank[wsKey(it.repo.Name, it.view.WT.Name)]
+	// blank otherwise. A fixed-width gutter keeps selected/unselected rows aligned.
+	rank := m.recentRank[key]
 	rankCh := " "
 	if rank > 0 {
 		rankCh = strconv.Itoa(rank)
 	}
 
 	if highlight {
-		return selBar(fmt.Sprintf("  %s ▸ %s %s %s", rankCh, dotChar, dirtyChar, it.view.WT.Name), innerW)
+		return selBar(fmt.Sprintf("  %s   %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, it.view.WT.Name), innerW)
 	}
 
 	rankCol := " "
 	if rank > 0 {
 		rankCol = recentStyle.Render(rankCh)
 	}
-	dotStyle := dimStyle
-	switch {
-	case waiting:
-		dotStyle = lipgloss.NewStyle().Foreground(cYellow)
-	case it.view.Live:
-		dotStyle = liveStyle
-	}
 	dirty := " "
 	if it.view.Dirty {
 		dirty = dirtyStyle.Render(dirtyChar)
 	}
-	return "  " + rankCol + "   " + dotStyle.Render(dotChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+	return "  " + rankCol + "   " + liveSt.Render(liveChar) + " " + notifSt.Render(notifChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
 }
 
 // renderHelp draws the key + legend overlay, centered in the body area. The
@@ -442,26 +935,51 @@ func (m Model) renderHelp(h int) string {
 	innerW := clamp(m.width-8, 28, 72)
 
 	row := func(key, desc string) string {
-		return "  " + helpKeyStyle.Render(padLine(key, 12)) + helpStyle.Render(desc)
+		k := padLine(key, 12)
+		if lipgloss.Width(key) > 12 {
+			k = key + " " // guarantee a gap when the key column overflows
+		}
+		return "  " + helpKeyStyle.Render(k) + helpStyle.Render(desc)
 	}
 
 	rows := []string{header("help", -1), ""}
 	rows = append(rows,
 		repoHdrStyle.Render("  Deck"),
-		row("↑↓ / j k", "move"),
+		row("↑↓ ^p / j k", "move"),
 		row("tab", "switch section"),
 		row("enter", "open / create"),
+		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
-		row("x", "remove worktree"),
+		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
 		"",
 		repoHdrStyle.Render("  Session"),
-		row(m.keyCycle, "cycle view (nvim → claude → term)"),
+		row(m.keyCycle+" / "+m.keyCycleBack, "cycle view (next / prev)"),
+		row(m.keyGotoEditor+" "+m.keyGotoAgent+" "+m.keyGotoTerm, "go to editor / agent / term"),
 		row(m.keyPicker, "back to the deck"),
 		row(m.keyGlobalConfig, "open home workspace (~)"),
-		row(m.keyPalette, "agent switcher"),
+		row(m.keyPrompt, "quick background agent (home)"),
+		row(m.keyPalette, "agent board"),
+	)
+	if m.keyNotif != "" {
+		rows = append(rows, row(m.keyNotif, "agent board (alias)"))
+	}
+	rows = append(rows,
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
+		row(m.keyUsage, "usage limits"),
+		"",
+		repoHdrStyle.Render("  Terminal panes"),
+		row(m.keyTermSplitV, "vertical split"),
+		row(m.keyTermSplitH, "horizontal split"),
+		row(m.keyTermFocusLeft+" "+m.keyTermFocusDown+" "+m.keyTermFocusUp+" "+m.keyTermFocusRight, "focus left / down / up / right"),
+		row(m.keyTermZoom, "zoom / restore pane"),
+		row(m.keyTermClose, "close pane"),
+	)
+	if m.keyTermCycle != "" {
+		rows = append(rows, row(m.keyTermCycle, "cycle pane focus"))
+	}
+	rows = append(rows,
 		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
@@ -479,11 +997,11 @@ func (m Model) renderHelp(h int) string {
 // statusLegend / markLegend explain the deck's status glyphs, split across two
 // lines so they stay within the overlay's width.
 func statusLegend() string {
-	yellow := lipgloss.NewStyle().Foreground(cYellow)
 	return strings.Join([]string{
 		liveStyle.Render("●") + helpStyle.Render(" live"),
-		yellow.Render("●") + helpStyle.Render(" waiting"),
-		dimStyle.Render("○") + helpStyle.Render(" idle/stopped"),
+		dimStyle.Render("○") + helpStyle.Render(" stopped"),
+		lipgloss.NewStyle().Foreground(cRed).Render("!") + helpStyle.Render(" waiting"),
+		lipgloss.NewStyle().Foreground(cGreen).Render("*") + helpStyle.Render(" done"),
 	}, helpStyle.Render("   "))
 }
 
@@ -520,74 +1038,6 @@ func (m Model) renderSetup(h int) string {
 	return centerBlock(boxStr, m.width, h)
 }
 
-// renderPalette draws the agent switcher overlay, centered in the body area.
-func (m Model) renderPalette(h int) string {
-	ws := m.current.ws
-	innerW := clamp(m.width-8, 24, 64)
-
-	rows := []string{
-		header("claude", -1) + "  " + dimStyle.Render(m.current.repo+" / "+m.current.worktree),
-		"",
-	}
-	for i, a := range ws.Agents {
-		rows = append(rows, m.paletteRow(i, a, innerW))
-	}
-	// Trailing "+ new agent" row.
-	if m.paletteCursor == len(ws.Agents) && !m.naming {
-		rows = append(rows, selBar("  + new agent", innerW))
-	} else {
-		rows = append(rows, dimStyle.Render("  + new agent"))
-	}
-	if m.naming {
-		rows = append(rows, "", "  "+m.agentName.View())
-	}
-	rows = append(rows, "", "  "+m.paletteHints())
-
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
-}
-
-// paletteRow renders one agent line with its name and live status.
-func (m Model) paletteRow(i int, a *session.Session, innerW int) string {
-	name := a.Title
-	if name == "" {
-		name = "claude"
-	}
-	dot, label := statusText(m.agentStatus[a.Pid()])
-
-	if i == m.paletteCursor && !m.naming {
-		return selBar(fmt.Sprintf("  %d ▸ %s  %s", i+1, name, label), innerW)
-	}
-	return fmt.Sprintf("  %s   %s %s  %s",
-		dimStyle.Render(strconv.Itoa(i+1)), dot, nameStyle.Render(name), dimStyle.Render(label))
-}
-
-// statusText maps a live status to a dot glyph and a human label.
-func statusText(st AgentStatus) (dot, label string) {
-	switch st.Status {
-	case "busy":
-		return liveStyle.Render("●"), "working"
-	case "waiting":
-		l := "waiting"
-		if st.WaitingFor != "" {
-			l += ": " + st.WaitingFor
-		}
-		yellow := lipgloss.NewStyle().Foreground(cYellow)
-		return yellow.Render("●"), yellow.Render(l)
-	case "idle":
-		return dimStyle.Render("●"), "idle"
-	default:
-		return dimStyle.Render("○"), "—"
-	}
-}
-
-func (m Model) paletteHints() string {
-	return strings.Join([]string{
-		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
-		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
-	}, helpStyle.Render("  ·  "))
-}
-
 // centerBlock centers a rendered block within w×h by padding above and to the
 // left (lines wider/taller than the area are left as-is).
 func centerBlock(block string, w, h int) string {
@@ -614,13 +1064,68 @@ func (m Model) renderFooter() string {
 	return m.centerFooter(m.footerContent())
 }
 
+// sessionFooterH is the number of rows reserved beneath a session body for the
+// one-line help hint: one until the user's first keystroke into a session,
+// zero after (see hintSeen). It is intentionally screen-independent so the
+// reserved size is stable across every session view — sessionSize is queried
+// before the target screen is even set.
+func (m Model) sessionFooterH() int {
+	if m.hintSeen {
+		return 0
+	}
+	return 1
+}
+
+// appendSessionFooter tacks the help hint onto a session body while it is still
+// reserved. The body was already rendered a row shorter (sessionSize subtracts
+// sessionFooterH), so the combined height matches the non-hint case exactly.
+func (m Model) appendSessionFooter(body string) string {
+	if m.sessionFooterH() == 0 {
+		return body
+	}
+	return body + "\n" + m.sessionFooter()
+}
+
+// sessionFooter builds the dim one-line hint shown beneath a session until the
+// user first types. It always leads with the help key (which opens the full
+// overlay) and, on the terminal screen, surfaces the pane-management keys the
+// hint mainly exists to teach. Trailing hints are dropped rather than wrapped
+// so the line always fits the single reserved row.
+func (m Model) sessionFooter() string {
+	hints := []string{keyhint(m.keyHelp, "help")}
+	if m.screen == screenTerminal {
+		hints = append(hints,
+			keyhint(m.keyTermSplitV+" "+m.keyTermSplitH, "split"),
+			keyhint(m.keyTermCycle, "cycle pane"),
+			keyhint(m.keyTermZoom, "zoom"),
+			keyhint(m.keyTermClose, "close"))
+	} else {
+		hints = append(hints,
+			keyhint(m.keyCycle, "cycle view"),
+			keyhint(m.keyPicker, "deck"))
+	}
+	sep := helpStyle.Render("  ·  ")
+	for n := len(hints); n >= 1; n-- {
+		line := "  " + strings.Join(hints[:n], sep)
+		if lipgloss.Width(line) <= m.width {
+			return line
+		}
+	}
+	return "  " + hints[0]
+}
+
 // footerContent builds the two-row footer (status line + help line) before
 // centering.
 func (m Model) footerContent() string {
 	switch m.mode {
 	case modeCreateName:
+		// A rejected name (client-side validation) sets a sticky error status;
+		// style it red here so the hint stands out from ordinary form chrome.
+		if m.statusLevel == statusError {
+			return "\n" + errStyle.Render(m.status)
+		}
 		return "\n" + helpStyle.Render(m.status)
-	case modeConfirmRemove:
+	case modeConfirmRemove, modeConfirmQuit, modeConfirmStop:
 		return "\n" + errStyle.Render(m.status)
 	}
 
@@ -634,7 +1139,7 @@ func (m Model) footerContent() string {
 	} else {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
-			keyhint("d", "stop"), keyhint("x", "remove"),
+			keyhint("1-3", "recent"), keyhint("d", "stop"), keyhint("x", "remove"),
 			keyhint("tab", "new"), keyhint("?", "help"), keyhint("ctrl+c", "quit"),
 		}
 	}
@@ -642,7 +1147,7 @@ func (m Model) footerContent() string {
 
 	if m.status != "" {
 		style := helpStyle
-		if strings.Contains(m.status, "error") {
+		if m.statusLevel == statusError {
 			style = errStyle
 		}
 		return style.Render(m.status) + "\n" + help
@@ -664,6 +1169,161 @@ func (m Model) centerFooter(content string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// --- terminal pane rendering ---
+
+// renderTermPanes renders the terminal screen: either a single full-size pane,
+// a zoomed pane, or a split layout assembled from the pane tree.
+func (m Model) renderTermPanes(w, h int) (string, *tea.Cursor) {
+	ws := m.current.ws
+	if len(ws.Terms) == 0 {
+		return "", nil
+	}
+	if ws.TermZoomed || len(ws.Terms) == 1 || ws.TermLayout == nil {
+		s := ws.Terms[ws.ActiveTerm]
+		body := s.Render()
+		var cursor *tea.Cursor
+		if x, y, visible := s.Cursor(); visible {
+			cursor = tea.NewCursor(x, y+barHeight)
+		}
+		return body, cursor
+	}
+	return m.renderPaneNode(ws.TermLayout, 0, 0, w, h, ws)
+}
+
+// renderPaneNode recursively renders a split subtree into (x, y, w, h) of the
+// body, inserting styled dividers between panes.
+func (m Model) renderPaneNode(node *session.PaneNode, x, y, w, h int, ws *session.Workspace) (string, *tea.Cursor) {
+	if node == nil || w < 1 || h < 1 {
+		return strings.Repeat(" ", w) + strings.Repeat("\n"+strings.Repeat(" ", w), h-1), nil
+	}
+	if node.Dir == session.SplitNone {
+		if node.Idx >= len(ws.Terms) {
+			return "", nil
+		}
+		s := ws.Terms[node.Idx]
+		body := s.Render()
+		var cursor *tea.Cursor
+		if node.Idx == ws.ActiveTerm {
+			if cx, cy, visible := s.Cursor(); visible {
+				cursor = tea.NewCursor(x+cx, y+barHeight+cy)
+			}
+		}
+		return body, cursor
+	}
+
+	if node.Dir == session.SplitV {
+		if w < 3 {
+			return m.renderPaneNode(node.A, x, y, w, h, ws)
+		}
+		aW := max(1, int(node.Ratio*float64(w-1)))
+		bW := w - aW - 1
+		if bW < 1 {
+			bW, aW = 1, w-2
+		}
+		aBody, aCur := m.renderPaneNode(node.A, x, y, aW, h, ws)
+		bBody, bCur := m.renderPaneNode(node.B, x+aW+1, y, bW, h, ws)
+		divColor := m.paneAdjacentColor(node, ws.ActiveTerm)
+		body := joinVerticalSplit(aBody, bBody, divColor, h, aW)
+		if aCur != nil {
+			return body, aCur
+		}
+		return body, bCur
+	}
+
+	// SplitH
+	if h < 3 {
+		return m.renderPaneNode(node.A, x, y, w, h, ws)
+	}
+	aH := max(1, int(node.Ratio*float64(h-1)))
+	bH := h - aH - 1
+	if bH < 1 {
+		bH, aH = 1, h-2
+	}
+	aBody, aCur := m.renderPaneNode(node.A, x, y, w, aH, ws)
+	bBody, bCur := m.renderPaneNode(node.B, x, y+aH+1, w, bH, ws)
+	divColor := m.paneAdjacentColor(node, ws.ActiveTerm)
+	body := joinHorizontalSplit(aBody, bBody, divColor, w, aH)
+	if aCur != nil {
+		return body, aCur
+	}
+	return body, bCur
+}
+
+// paneAdjacentColor returns cAccent if the active pane is a direct child of
+// this split node (i.e., the divider directly borders the focused pane), or
+// cFaint otherwise.
+func (m Model) paneAdjacentColor(node *session.PaneNode, activeTerm int) color.Color {
+	if (node.A.Dir == session.SplitNone && node.A.Idx == activeTerm) ||
+		(node.B.Dir == session.SplitNone && node.B.Idx == activeTerm) {
+		return cAccent
+	}
+	return cFaint
+}
+
+// dividerStyle returns the cached foreground style for a pane divider: lit
+// (accent) when the divider borders the focused pane, faint otherwise. It maps
+// the two colours paneAdjacentColor can return to their package-level styles so
+// the divider style is never rebuilt per split per frame. barSep is exactly a
+// faint foreground, so it doubles as the faint divider style.
+func dividerStyle(c color.Color) lipgloss.Style {
+	if c == cAccent {
+		return accentStyle
+	}
+	return barSep
+}
+
+// joinVerticalSplit interleaves lines from left and right pane bodies with a
+// single-column divider. leftWidth is the pane's column count — every left
+// line is padded to that exact display width so the divider lands on a
+// consistent column regardless of how much content the vt emulator rendered.
+func joinVerticalSplit(left, right string, divColor color.Color, h, leftWidth int) string {
+	leftLines := splitLines(left)
+	rightLines := splitLines(right)
+	div := dividerStyle(divColor).Render("│")
+	rows := make([]string, h)
+	for i := range rows {
+		l, r := "", ""
+		if i < len(leftLines) {
+			l = leftLines[i]
+		}
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		// Pad left line to leftWidth so the divider is always at the same column.
+		if lw := lipgloss.Width(l); lw < leftWidth {
+			l += strings.Repeat(" ", leftWidth-lw)
+		}
+		rows[i] = l + div + r
+	}
+	return strings.Join(rows, "\n")
+}
+
+// joinHorizontalSplit stacks top and bottom pane bodies with a single-row
+// divider. topHeight is the expected row count for the top pane — the block
+// is padded to that many rows so the divider always starts at the right row.
+func joinHorizontalSplit(top, bottom string, divColor color.Color, w, topHeight int) string {
+	topLines := splitLines(top)
+	rows := make([]string, topHeight)
+	for i := range rows {
+		if i < len(topLines) {
+			rows[i] = topLines[i]
+		}
+	}
+	div := dividerStyle(divColor).Render(strings.Repeat("─", max(1, w)))
+	return strings.Join(rows, "\n") + "\n" + div + "\n" + bottom
+}
+
+// splitLines splits a vt-emulator output string into lines, normalising \r\n
+// and stripping any trailing \r so callers get clean line strings.
+func splitLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimRight(ln, "\r")
+	}
+	return lines
 }
 
 // --- helpers ---
@@ -698,15 +1358,11 @@ func box(lines []string, innerW, contentH int, focused bool) string {
 			rows[i] = strings.Repeat(" ", innerW)
 		}
 	}
-	color := cFaint
+	st := boxStyleFaint
 	if focused {
-		color = cAccent
+		st = boxStyleFocused
 	}
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(color).
-		Padding(0, 1).
-		Render(strings.Join(rows, "\n"))
+	return st.Render(strings.Join(rows, "\n"))
 }
 
 // padLine right-pads s with plain spaces to w display columns.

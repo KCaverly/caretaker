@@ -72,31 +72,90 @@ func TestSelectionBarFillsWidth(t *testing.T) {
 	}
 }
 
-func TestBarAgentBadge(t *testing.T) {
+func TestRenderHelpKeys(t *testing.T) {
+	// Defaults: the cycle fwd/back and goto rows show, and the retired notif
+	// alias + pane-cycle rows are omitted.
 	m := sampleModel()
-	m.current = &workspaceRef{
-		repo: "r", worktree: "w", path: "/r/w",
-		ws: &session.Workspace{Agents: []*session.Session{{}, {}}},
+	out := m.renderHelp(m.height - barHeight)
+	for _, want := range []string{"alt+]", "alt+[", "alt+1", "alt+h", "alt+v", "cycle view"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help overlay missing %q:\n%s", want, out)
+		}
 	}
-	m.screen = screenAgent
-	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: "/r/w"}}
+	if strings.Contains(out, "agent board (alias)") {
+		t.Error("retired notif alias row should be hidden when keyNotif is empty")
+	}
+	if strings.Contains(out, "cycle pane focus") {
+		t.Error("retired pane-cycle row should be hidden when keyTermCycle is empty")
+	}
 
-	bar := m.renderBar()
-	if !strings.Contains(bar, "2") {
-		t.Errorf("bar should show the agent count 2:\n%s", bar)
-	}
-	if !strings.Contains(bar, "●") {
-		t.Errorf("bar should show a needs-input dot:\n%s", bar)
+	// When a user re-enables the aliases, their rows reappear.
+	m.keyNotif = "ctrl+n"
+	m.keyTermCycle = "ctrl+w"
+	out = m.renderHelp(m.height - barHeight)
+	if !strings.Contains(out, "agent board (alias)") || !strings.Contains(out, "cycle pane focus") {
+		t.Errorf("rebound alias rows should appear:\n%s", out)
 	}
 }
 
-func TestPaletteRender(t *testing.T) {
+func TestBarNotifZone(t *testing.T) {
+	m := sampleModel()
+	m.current = &workspaceRef{
+		repo: "r", worktree: "w", key: "r/w", path: "/r/w",
+		ws: &session.Workspace{Agents: []*session.Session{{}, {}}},
+	}
+	m.screen = screenAgent
+
+	// No unread: right side shows only the worktree label, no notif zone.
+	bar := m.renderBar()
+	if !strings.Contains(bar, "r / w") {
+		t.Errorf("bar should show worktree label:\n%s", bar)
+	}
+	if strings.Contains(bar, "!") || strings.Contains(bar, "*") {
+		t.Errorf("bar should not show notif glyphs when nothing is unread:\n%s", bar)
+	}
+
+	// A live-waiting agent elsewhere shows "!", a stored unread marker shows "*".
+	// (The waiting agent is in another worktree so it maps via m.active.)
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "other"}, view: WorktreeView{WT: repo.Worktree{Name: "wt", Path: "/other/wt"}}},
+	}
+	m.agentStatus = map[int]AgentStatus{7: {Status: "waiting", Cwd: "/other/wt"}}
+	m.attention[8] = attnEntry{level: attnDone, key: "r/w"}
+	bar = m.renderBar()
+	if !strings.Contains(bar, "!") {
+		t.Errorf("bar should show ! for a live-waiting agent:\n%s", bar)
+	}
+	if !strings.Contains(bar, "*") {
+		t.Errorf("bar should show * for an unread completion:\n%s", bar)
+	}
+
+	// Board header should show the agent count when open.
+	m.boardOpen = true
+	m.boardCursor = 0
+	board := m.renderBoard(m.height - barHeight)
+	if !strings.Contains(board, "2") {
+		t.Errorf("board header should show pool count 2:\n%s", board)
+	}
+}
+
+func TestBoardRender(t *testing.T) {
 	m := modelWithAgents(2)
-	m = m.openPalette().(Model)
-	out := m.renderPalette(m.height - barHeight)
-	for _, want := range []string{"claude", "new agent", "focus"} {
+	mm, _ := m.openBoard()
+	m = mm.(Model)
+	out := m.renderBoard(m.height - barHeight)
+	for _, want := range []string{"AGENTS", "r/w", "claude", "new agent", "focus", "current"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("palette missing %q:\n%s", want, out)
+			t.Errorf("board missing %q:\n%s", want, out)
+		}
+	}
+
+	// The form renders the prompt input and both toggles.
+	m = m.openNewAgentForm().(Model)
+	out = m.renderBoard(m.height - barHeight)
+	for _, want := range []string{"NEW AGENT", "prompt", "active worktree", "background", "launch"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("form missing %q:\n%s", want, out)
 		}
 	}
 }

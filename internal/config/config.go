@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/KCaverly/caretaker/internal/plasma"
 )
 
 // Config holds ct's runtime configuration.
@@ -28,6 +30,34 @@ type Config struct {
 	BranchName string `toml:"branch_name"`
 	// Keys configures the reserved navigation keystrokes.
 	Keys Keys `toml:"keys"`
+	// Usage configures the plan usage-limit gauge.
+	Usage Usage `toml:"usage"`
+	// Plasma configures the deck's ambient plasma panel.
+	Plasma Plasma `toml:"plasma"`
+}
+
+// Plasma configures the ambient animation panel on the right of the deck.
+type Plasma struct {
+	// Pattern picks the field shape: classic, waves, interference, lava,
+	// or ripple.
+	Pattern string `toml:"pattern"`
+	// Palette picks the color ramp: aurora (blue/purple), ember
+	// (yellow/red), or mono (grayscale).
+	Palette string `toml:"palette"`
+	// Charset picks the density ramp: dots (braille), shade, or blocks.
+	Charset string `toml:"charset"`
+	// Speed scales the animation rate (0 freezes the pattern; capped at 3).
+	Speed float64 `toml:"speed"`
+	// Width is the panel's share of the deck as a percent of the terminal
+	// width (0 disables the panel; capped at 70).
+	Width int `toml:"width"`
+}
+
+// Usage configures the plan usage-limit gauge.
+type Usage struct {
+	// Threshold is the utilization percent at/above which the status-bar
+	// usage gauge appears (0 shows it always; values above 100 never show it).
+	Threshold int `toml:"threshold"`
 }
 
 // Keys are the reserved keystrokes ct handles instead of forwarding to an
@@ -35,9 +65,16 @@ type Config struct {
 type Keys struct {
 	// Cycle moves one session view to the right (nvim → claude → term → nvim).
 	Cycle string `toml:"cycle"`
+	// CycleBack moves one session view to the left (the reverse of Cycle).
+	CycleBack string `toml:"cycle_back"`
+	// GotoEditor / GotoAgent / GotoTerm jump straight to that session view.
+	GotoEditor string `toml:"goto_editor"`
+	GotoAgent  string `toml:"goto_agent"`
+	GotoTerm   string `toml:"goto_term"`
 	// Picker returns to the CT picker.
 	Picker string `toml:"picker"`
-	// Palette opens the agent switcher for the current worktree.
+	// Palette opens the agent board: every agent across all open worktrees,
+	// attention first, plus the new-agent launcher.
 	Palette string `toml:"palette"`
 	// NextAgent / PrevAgent cycle the focused agent within the worktree.
 	NextAgent string `toml:"next_agent"`
@@ -46,6 +83,24 @@ type Keys struct {
 	Help string `toml:"help"`
 	// GlobalConfig opens the home-directory workspace for editing global config.
 	GlobalConfig string `toml:"global_config"`
+	// Notif is a legacy alias that also opens the agent board (it used to open
+	// a separate notification overlay).
+	Notif string `toml:"notif"`
+	// Prompt opens the new-agent form pre-set for a background home agent.
+	Prompt string `toml:"prompt"`
+	// Terminal pane management (only intercepted on the terminal screen).
+	TermSplitV string `toml:"term_split_v"` // new pane to the right
+	TermSplitH string `toml:"term_split_h"` // new pane below
+	TermCycle  string `toml:"term_cycle"`   // cycle pane focus (retired by default)
+	TermZoom   string `toml:"term_zoom"`    // toggle full-size
+	TermClose  string `toml:"term_close"`   // close active pane
+	// Directional terminal-pane focus (only intercepted on the terminal screen).
+	TermFocusLeft  string `toml:"term_focus_left"`
+	TermFocusDown  string `toml:"term_focus_down"`
+	TermFocusUp    string `toml:"term_focus_up"`
+	TermFocusRight string `toml:"term_focus_right"`
+	// Usage opens the usage overlay on the claude screen.
+	Usage string `toml:"usage"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -62,9 +117,21 @@ func Default() Config {
 		WorktreePath: ".worktrees/{name}",
 		BranchName:   "{name}",
 		Keys: Keys{
-			Cycle: "ctrl+o", Picker: "ctrl+g",
-			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "f2",
+			Cycle: "alt+]", CycleBack: "alt+[",
+			GotoEditor: "alt+1", GotoAgent: "alt+2", GotoTerm: "alt+3",
+			Picker:  "ctrl+g",
+			Palette: "alt+a", NextAgent: "f4", PrevAgent: "f3",
+			Help: "f1", GlobalConfig: "alt+g", Notif: "", Prompt: "alt+y",
+			TermSplitV: "alt+v", TermSplitH: "alt+s",
+			TermCycle: "", TermZoom: "alt+z", TermClose: "alt+x",
+			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",
+			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
+			Usage: "alt+u",
+		},
+		Usage: Usage{Threshold: 50},
+		Plasma: Plasma{
+			Pattern: "classic", Palette: "aurora", Charset: "dots",
+			Speed: 0.3, Width: 40,
 		},
 	}
 }
@@ -160,6 +227,25 @@ func (c *Config) validate() error {
 		return err
 	}
 	c.Root = abs
+	// A negative threshold is meaningless; treat it as "always show".
+	if c.Usage.Threshold < 0 {
+		c.Usage.Threshold = 0
+	}
+	// Numeric plasma fields clamp quietly; variant names must exist so a
+	// typo fails at startup with the valid options instead of a silent
+	// fallback. Width 0 disables the panel, in which case the names are
+	// irrelevant and skipped.
+	c.Plasma.Speed = min(max(c.Plasma.Speed, 0), 3)
+	c.Plasma.Width = min(max(c.Plasma.Width, 0), 70)
+	if c.Plasma.Width > 0 {
+		if err := plasma.Validate(plasma.Options{
+			Pattern: c.Plasma.Pattern,
+			Palette: c.Plasma.Palette,
+			Charset: c.Plasma.Charset,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -58,6 +58,30 @@ func TestAgentsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStaleSnapshotSkipped(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	s := Load()
+	s.Touch("a/b")
+	older, ok := s.Snapshot()
+	if !ok {
+		t.Fatal("snapshot should be available")
+	}
+	s.Touch("c/d")
+	newer, _ := s.Snapshot()
+
+	// The newer snapshot lands first; the stale one must not roll it back.
+	if err := newer.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := older.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load(); got.Opened("c/d") == 0 {
+		t.Fatal("stale snapshot write rolled back newer state")
+	}
+}
+
 func TestLoadMissingFileIsEmpty(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	s := Load()

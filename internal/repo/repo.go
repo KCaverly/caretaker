@@ -3,6 +3,7 @@
 package repo
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Repo is a git repository discovered directly under the config root.
@@ -29,8 +31,7 @@ type Worktree struct {
 
 // Status is the coarse git state of a worktree.
 type Status struct {
-	Dirty      bool  // uncommitted changes present
-	CommitTime int64 // HEAD commit time (unix seconds), 0 if unknown
+	Dirty bool // uncommitted changes present
 }
 
 // DiscoverRepos returns the git repositories that are immediate children of root,
@@ -113,19 +114,94 @@ func parseWorktreeList(out string) []Worktree {
 	return wts
 }
 
-// WorktreeStatus returns the coarse git state of a worktree.
+// WorktreeStatus returns the coarse git state of a worktree — one `git status`
+// subprocess. Commit times come separately from BranchTipTimes, which covers a
+// whole repo in a single call.
 func WorktreeStatus(wt Worktree) (Status, error) {
 	out, err := git(wt.Path, "status", "--porcelain")
 	if err != nil {
 		return Status{}, err
 	}
-	st := Status{Dirty: strings.TrimSpace(out) != ""}
-	if ct, err := git(wt.Path, "log", "-1", "--format=%ct"); err == nil {
-		if t, err := strconv.ParseInt(strings.TrimSpace(ct), 10, 64); err == nil {
-			st.CommitTime = t
+	return Status{Dirty: strings.TrimSpace(out) != ""}, nil
+}
+
+// BranchTipTimes returns the committer time (unix seconds) of every local
+// branch tip in r, keyed by short branch name — one subprocess for the whole
+// repo, replacing a per-worktree `git log -1`. Worktree HEADs equal their
+// branch tips in ct's branch-per-worktree model; detached worktrees simply
+// miss the map (time 0).
+func BranchTipTimes(r Repo) (map[string]int64, error) {
+	// %00 expands to a NUL in the output, an unambiguous separator no branch
+	// name can contain (a raw NUL can't be passed as an exec argument).
+	out, err := git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	tips := make(map[string]int64)
+	for _, line := range strings.Split(out, "\n") {
+		name, ts, ok := strings.Cut(strings.TrimRight(line, "\r"), "\x00")
+		if !ok {
+			continue
+		}
+		if t, err := strconv.ParseInt(strings.TrimSpace(ts), 10, 64); err == nil {
+			tips[name] = t
 		}
 	}
-	return st, nil
+	return tips, nil
+}
+
+// worktreeNameForbidden lists the punctuation git forbids inside a ref name
+// (git-check-ref-format). A new-worktree name is substituted verbatim into both
+// the branch name and the worktree path, so any of these would otherwise fail
+// deep inside `git worktree add` with raw stderr. Space and control characters
+// are checked separately (as a range), and '/' is deliberately absent — interior
+// slashes are allowed for branch namespacing.
+const worktreeNameForbidden = "~^:?*[\\"
+
+// ValidateWorktreeName rejects new-worktree names before ct runs `git worktree
+// add`, so bad input yields an inline hint instead of raw git stderr — and so a
+// name containing ".." can never place the worktree outside the repo when it is
+// filepath.Join'd into the worktree_path template.
+//
+// It lives in repo (next to CreateWorktree, the consumer of the name) rather
+// than tui because it guards a git/filesystem operation, not UI state, and is
+// reusable as a defense-in-depth check by any future caller of CreateWorktree.
+//
+// Interior "/" is intentionally allowed: branch namespacing like "feature/foo"
+// is legitimate and the worktree_path template nests it as a subdirectory. Path
+// traversal stays impossible because ".." (in any component) is rejected, so no
+// join can climb out of the repo.
+func ValidateWorktreeName(name string) error {
+	switch {
+	case strings.TrimSpace(name) == "":
+		return fmt.Errorf("name cannot be empty")
+	case strings.HasPrefix(name, "-"):
+		return fmt.Errorf("name cannot start with '-'")
+	case strings.HasPrefix(name, "/"):
+		return fmt.Errorf("name cannot start with '/'")
+	case strings.HasSuffix(name, "/"):
+		return fmt.Errorf("name cannot end with '/'")
+	case strings.HasSuffix(name, ".lock"):
+		return fmt.Errorf("name cannot end with '.lock'")
+	case strings.Contains(name, ".."):
+		return fmt.Errorf("name cannot contain '..'")
+	// No slash-separated component may begin with '.' (a git ref rule; it also
+	// keeps the worktree directory out of hidden-file territory). This covers a
+	// leading '.' and any "/." sequence.
+	case strings.HasPrefix(name, "."), strings.Contains(name, "/."):
+		return fmt.Errorf("name component cannot start with '.'")
+	}
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("name cannot contain control characters")
+		case r == ' ':
+			return fmt.Errorf("name cannot contain spaces")
+		case strings.ContainsRune(worktreeNameForbidden, r):
+			return fmt.Errorf("name cannot contain %q", r)
+		}
+	}
+	return nil
 }
 
 // CreateWorktree adds a new worktree at relPath (relative to the repo) on a new
@@ -171,10 +247,18 @@ func RemoveWorktree(r Repo, wt Worktree, deleteBranch bool) error {
 	return nil
 }
 
+// gitTimeout bounds every git subprocess so a hung call — a credential helper
+// waiting on a TTY it doesn't have, index lock contention, a dead network
+// mount — fails visibly instead of stranding its goroutine (and the deck
+// refresh it belongs to) forever.
+const gitTimeout = 30 * time.Second
+
 // git runs a git command in dir and returns combined stdout, or an error that
 // includes stderr.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

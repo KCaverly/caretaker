@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
@@ -22,6 +24,13 @@ type Controller struct {
 	// deciding whether a persisted agent can be resumed. Empty means the default
 	// ~/.claude/projects; tests point it at a temp dir.
 	projectsDir string
+	// homeTrusted records that EnsureHomeDirTrusted has already verified (or
+	// set) the trust flag, so subsequent agent launches skip re-reading
+	// ~/.claude.json. Only touched from the UI goroutine.
+	homeTrusted bool
+	// loadSeq stamps each issued Load so the loadedMsg handler can drop
+	// results superseded by a newer in-flight load.
+	loadSeq atomic.Uint64
 }
 
 // NewController builds a Controller from config.
@@ -48,26 +57,58 @@ type Group struct {
 	Worktrees []WorktreeView
 }
 
+// loadConcurrency bounds how many git subprocesses one Load runs at a time.
+const loadConcurrency = 8
+
 // Load discovers repos and their worktrees with git status. Live status is
-// filled in by the model from the session manager.
+// filled in by the model from the session manager. Repos and their worktree
+// status checks run concurrently (bounded by loadConcurrency); result order
+// stays deterministic because each repo writes into its own slot.
 func (c *Controller) Load() ([]Group, error) {
 	repos, err := repo.DiscoverRepos(c.cfg.Root)
 	if err != nil {
 		return nil, err
 	}
 
+	sem := make(chan struct{}, loadConcurrency)
+	results := make([]*Group, len(repos))
+	var wg sync.WaitGroup
+	for i, r := range repos {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			wts, err := repo.ListWorktrees(r)
+			if err != nil {
+				<-sem
+				return // skip repos that fail to list, as before
+			}
+			tips, _ := repo.BranchTipTimes(r)
+			<-sem
+
+			views := make([]WorktreeView, len(wts))
+			var wtWG sync.WaitGroup
+			for j, wt := range wts {
+				wtWG.Add(1)
+				go func() {
+					defer wtWG.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					st, _ := repo.WorktreeStatus(wt)
+					views[j] = WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: tips[wt.Branch]}
+				}()
+			}
+			wtWG.Wait()
+			results[i] = &Group{Repo: r, Worktrees: views}
+		}()
+	}
+	wg.Wait()
+
 	groups := make([]Group, 0, len(repos))
-	for _, r := range repos {
-		wts, err := repo.ListWorktrees(r)
-		if err != nil {
-			continue
+	for _, g := range results {
+		if g != nil {
+			groups = append(groups, *g)
 		}
-		g := Group{Repo: r, Worktrees: make([]WorktreeView, 0, len(wts))}
-		for _, wt := range wts {
-			st, _ := repo.WorktreeStatus(wt)
-			g.Worktrees = append(g.Worktrees, WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: st.CommitTime})
-		}
-		groups = append(groups, g)
 	}
 	return groups, nil
 }
@@ -80,14 +121,24 @@ func (c *Controller) Create(r repo.Repo, name, baseRef string) (repo.Worktree, e
 	return repo.CreateWorktree(r, relPath, branch, baseRef)
 }
 
-// Remove deletes a worktree and its branch.
-func (c *Controller) Remove(r repo.Repo, wt repo.Worktree) error {
-	return repo.RemoveWorktree(r, wt, true)
+// Remove deletes a worktree, and its branch when deleteBranch is set.
+func (c *Controller) Remove(r repo.Repo, wt repo.Worktree, deleteBranch bool) error {
+	return repo.RemoveWorktree(r, wt, deleteBranch)
 }
 
 // Keys returns the reserved navigation keystrokes (cycle, return-to-picker).
 func (c *Controller) Keys() (cycle, picker string) {
 	return c.cfg.Keys.Cycle, c.cfg.Keys.Picker
+}
+
+// CycleBackKey returns the key that cycles to the previous session view.
+func (c *Controller) CycleBackKey() string { return c.cfg.Keys.CycleBack }
+
+// GotoKeys returns the keys that jump straight to the editor, agent, and
+// terminal views.
+func (c *Controller) GotoKeys() (editor, agent, term string) {
+	k := c.cfg.Keys
+	return k.GotoEditor, k.GotoAgent, k.GotoTerm
 }
 
 // AgentKeys returns the reserved agent-pool keystrokes (open palette, next
@@ -102,8 +153,111 @@ func (c *Controller) HelpKey() string { return c.cfg.Keys.Help }
 // GlobalConfigKey returns the key that opens the home-directory workspace.
 func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
 
+// NotifKey returns the key that opens the notification overlay.
+func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
+
+// PromptKey returns the key that opens the quick-prompt overlay.
+func (c *Controller) PromptKey() string { return c.cfg.Keys.Prompt }
+
+// UsageKey returns the key that opens the usage overlay on the agent screen.
+func (c *Controller) UsageKey() string { return c.cfg.Keys.Usage }
+
+// UsageThreshold returns the utilization percent at/above which the bar's
+// usage gauge appears (0 = always, >100 = never).
+func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
+
+// PlasmaConfig returns the deck plasma-panel settings.
+func (c *Controller) PlasmaConfig() config.Plasma { return c.cfg.Plasma }
+
+// TermPaneKeys returns the reserved keys for terminal pane management. These
+// are only intercepted when the terminal screen is active.
+func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {
+	k := c.cfg.Keys
+	return k.TermSplitV, k.TermSplitH, k.TermCycle, k.TermZoom, k.TermClose
+}
+
+// TermFocusKeys returns the directional terminal-pane focus keys (left, down,
+// up, right). These are only intercepted when the terminal screen is active.
+func (c *Controller) TermFocusKeys() (left, down, up, right string) {
+	k := c.cfg.Keys
+	return k.TermFocusLeft, k.TermFocusDown, k.TermFocusUp, k.TermFocusRight
+}
+
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
+
+// EnsureHomeDirTrusted marks the home directory as trusted in Claude's global
+// config (~/.claude.json, under projects[home].hasTrustDialogAccepted) so that
+// interactive sessions started there (e.g. background agents) don't pause to
+// show the workspace trust dialog. It is idempotent and safe to call before
+// every spawn: it only rewrites the file when the flag isn't already true, and
+// preserves every other field byte-for-byte.
+func (c *Controller) EnsureHomeDirTrusted() error {
+	if c.homeTrusted {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	if err := ensureProjectTrusted(filepath.Join(home, ".claude.json"), home); err != nil {
+		return err
+	}
+	c.homeTrusted = true
+	return nil
+}
+
+// ensureProjectTrusted sets projects[projectPath].hasTrustDialogAccepted to
+// true inside the Claude config at configPath. It round-trips unrelated
+// fields as raw JSON so it never clobbers data it doesn't understand.
+func ensureProjectTrusted(configPath, projectPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	projects := map[string]json.RawMessage{}
+	if raw, ok := root["projects"]; ok {
+		if err := json.Unmarshal(raw, &projects); err != nil {
+			return err
+		}
+	}
+	proj := map[string]json.RawMessage{}
+	if raw, ok := projects[projectPath]; ok {
+		if err := json.Unmarshal(raw, &proj); err != nil {
+			return err
+		}
+	}
+	if raw, ok := proj["hasTrustDialogAccepted"]; ok {
+		var accepted bool
+		if err := json.Unmarshal(raw, &accepted); err == nil && accepted {
+			return nil // already trusted
+		}
+	}
+	proj["hasTrustDialogAccepted"] = json.RawMessage("true")
+	projBytes, err := json.Marshal(proj)
+	if err != nil {
+		return err
+	}
+	projects[projectPath] = projBytes
+	projectsBytes, err := json.Marshal(projects)
+	if err != nil {
+		return err
+	}
+	root["projects"] = projectsBytes
+	out, err := json.Marshal(root)
+	if err != nil {
+		return err
+	}
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, configPath)
+}
 
 // EditorSpec returns the spec for a workspace's nvim session.
 func (c *Controller) EditorSpec() session.Spec {
@@ -115,12 +269,24 @@ func (c *Controller) TermSpec() session.Spec {
 	return session.Spec{Kind: session.Terminal, Title: "term", Argv: []string{c.cfg.Shell}}
 }
 
-// agentTitle is the palette/display title for an agent with the given label.
+// agentTitle is the palette/display title for an agent with the given label,
+// falling back to a plain "claude" when it has none.
 func agentTitle(label string) string {
 	if label == "" {
 		return "claude"
 	}
 	return label
+}
+
+// PromptAgentSpec returns a spec for a brand-new Claude agent session with
+// --dangerously-skip-permissions set, for autonomous background execution.
+func (c *Controller) PromptAgentSpec(label string) session.Spec {
+	id := newSessionID()
+	argv := []string{c.cfg.Agent, "--session-id", id, "--teammate-mode", "in-process", "--dangerously-skip-permissions"}
+	if label != "" {
+		argv = append(argv, "-n", label)
+	}
+	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
 }
 
 // NewAgentSpec returns the spec for a brand-new Claude agent session, optionally
