@@ -168,6 +168,103 @@ func NextPaneIdx(root *PaneNode, activeIdx int) int {
 	return leaves[0]
 }
 
+// FocusDir is a travel direction for directional terminal-pane focus.
+type FocusDir int
+
+const (
+	FocusLeft FocusDir = iota
+	FocusDown
+	FocusUp
+	FocusRight
+)
+
+// FocusPaneDir returns the Idx of the pane focus should move to from the pane
+// with Idx==activeIdx, travelling in dir, given the resolved leaf rectangles.
+// It returns -1 when the active pane is unknown or sits at the layout edge in
+// that direction (no candidate). Candidates are panes lying strictly beyond the
+// active pane's edge in the travel direction (a single 1-cell divider counts as
+// adjacent); among them the one with the greatest perpendicular overlap wins,
+// tie-broken by nearest edge distance and then lowest Idx.
+func FocusPaneDir(bounds []PaneBounds, activeIdx int, dir FocusDir) int {
+	var active PaneBounds
+	found := false
+	for _, b := range bounds {
+		if b.Idx == activeIdx {
+			active, found = b, true
+			break
+		}
+	}
+	if !found {
+		return -1
+	}
+	best := -1
+	var bestOverlap, bestDist int
+	for _, c := range bounds {
+		if c.Idx == activeIdx || !paneBeyond(active, c, dir) {
+			continue
+		}
+		overlap, dist := focusMetrics(active, c, dir)
+		if best == -1 || overlap > bestOverlap ||
+			(overlap == bestOverlap && dist < bestDist) ||
+			(overlap == bestOverlap && dist == bestDist && c.Idx < best) {
+			best, bestOverlap, bestDist = c.Idx, overlap, dist
+		}
+	}
+	return best
+}
+
+// paneBeyond reports whether candidate c lies strictly beyond active a's edge in
+// direction dir. Using >= / <= on the far edge treats a pane one divider cell
+// away as adjacent.
+func paneBeyond(a, c PaneBounds, dir FocusDir) bool {
+	switch dir {
+	case FocusRight:
+		return c.X >= a.X+a.W
+	case FocusLeft:
+		return c.X+c.W <= a.X
+	case FocusDown:
+		return c.Y >= a.Y+a.H
+	case FocusUp:
+		return c.Y+c.H <= a.Y
+	}
+	return false
+}
+
+// focusMetrics returns the perpendicular overlap between a and c and the
+// distance between their facing edges along the travel axis of dir.
+func focusMetrics(a, c PaneBounds, dir FocusDir) (overlap, dist int) {
+	switch dir {
+	case FocusLeft, FocusRight:
+		overlap = overlapLen(a.Y, a.Y+a.H, c.Y, c.Y+c.H)
+		if dir == FocusRight {
+			dist = c.X - (a.X + a.W)
+		} else {
+			dist = a.X - (c.X + c.W)
+		}
+	case FocusUp, FocusDown:
+		overlap = overlapLen(a.X, a.X+a.W, c.X, c.X+c.W)
+		if dir == FocusDown {
+			dist = c.Y - (a.Y + a.H)
+		} else {
+			dist = a.Y - (c.Y + c.H)
+		}
+	}
+	if dist < 0 {
+		dist = -dist
+	}
+	return overlap, dist
+}
+
+// overlapLen returns the length of the overlap between intervals [a0,a1) and
+// [b0,b1), or 0 when they don't overlap.
+func overlapLen(a0, a1, b0, b1 int) int {
+	lo, hi := max(a0, b0), min(a1, b1)
+	if hi <= lo {
+		return 0
+	}
+	return hi - lo
+}
+
 // paneContains reports whether any leaf in the subtree has Idx==target.
 func paneContains(node *PaneNode, target int) bool {
 	if node == nil {

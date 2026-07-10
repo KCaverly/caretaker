@@ -30,23 +30,29 @@ const barHeight = 2
 
 // Default reserved keys (not forwarded to embedded sessions); overridable via config.
 const (
-	defaultKeyCycle        = "ctrl+o" // cycle to the next session view
+	defaultKeyCycle        = "alt+]"  // cycle to the next session view
+	defaultKeyCycleBack    = "alt+["  // cycle to the previous session view
+	defaultKeyGotoEditor   = "alt+1"  // jump to the editor view
+	defaultKeyGotoAgent    = "alt+2"  // jump to the agent view
+	defaultKeyGotoTerm     = "alt+3"  // jump to the terminal view
 	defaultKeyPicker       = "ctrl+g" // return to the CT picker
-	defaultKeyPalette      = "ctrl+a" // open the agent board
+	defaultKeyPalette      = "alt+a"  // open the agent board
 	defaultKeyNextAgent    = "f4"     // focus the next agent in the pool
 	defaultKeyPrevAgent    = "f3"     // focus the previous agent in the pool
 	defaultKeyHelp         = "f1"     // toggle the help overlay
-	defaultKeyGlobalConfig = "ctrl+h" // open home-directory workspace
-	defaultKeyNotif        = "ctrl+n" // agent board alias (was the notification overlay)
-	defaultKeyPrompt       = "ctrl+y" // new-agent form pre-set for a background home agent
-	defaultKeyUsage        = "ctrl+u" // usage overlay (agent screen only)
+	defaultKeyGlobalConfig = "alt+g"  // open home-directory workspace
+	defaultKeyPrompt       = "alt+y"  // new-agent form pre-set for a background home agent
+	defaultKeyUsage        = "alt+u"  // usage overlay (agent screen only)
 
 	// Terminal pane management — only intercepted when the terminal screen is active.
-	defaultKeyTermSplitV = "ctrl+\\" // new pane to the right
-	defaultKeyTermSplitH = "ctrl+-"  // new pane below
-	defaultKeyTermCycle  = "ctrl+w"  // cycle pane focus
-	defaultKeyTermZoom   = "ctrl+f"  // toggle full-size
-	defaultKeyTermClose  = "ctrl+x"  // close active pane
+	defaultKeyTermSplitV     = "alt+v" // new pane to the right
+	defaultKeyTermSplitH     = "alt+s" // new pane below
+	defaultKeyTermZoom       = "alt+z" // toggle full-size
+	defaultKeyTermClose      = "alt+x" // close active pane
+	defaultKeyTermFocusLeft  = "alt+h" // focus the pane to the left
+	defaultKeyTermFocusDown  = "alt+j" // focus the pane below
+	defaultKeyTermFocusUp    = "alt+k" // focus the pane above
+	defaultKeyTermFocusRight = "alt+l" // focus the pane to the right
 )
 
 // screen is the active view: the picker, one of the session views, or setup.
@@ -69,6 +75,19 @@ func (s screen) next() screen {
 		return screenTerminal
 	default:
 		return screenEditor
+	}
+}
+
+// prev cycles among the session views in reverse (editor → terminal → agent →
+// editor), mirroring next.
+func (s screen) prev() screen {
+	switch s {
+	case screenTerminal:
+		return screenAgent
+	case screenAgent:
+		return screenEditor
+	default:
+		return screenTerminal
 	}
 }
 
@@ -155,13 +174,17 @@ type Model struct {
 	mgr   *session.Manager
 	state *state.State
 
-	keyCycle, keyPicker                    string
-	keyPalette, keyNextAgent, keyPrevAgent string
-	keyHelp, keyGlobalConfig, keyNotif     string
-	keyPrompt, keyUsage                    string
+	keyCycle, keyCycleBack, keyPicker        string
+	keyGotoEditor, keyGotoAgent, keyGotoTerm string
+	keyPalette, keyNextAgent, keyPrevAgent   string
+	keyHelp, keyGlobalConfig, keyNotif       string
+	keyPrompt, keyUsage                      string
 
 	keyTermSplitV, keyTermSplitH            string
 	keyTermCycle, keyTermZoom, keyTermClose string
+
+	keyTermFocusLeft, keyTermFocusDown string
+	keyTermFocusUp, keyTermFocusRight  string
 
 	screen   screen
 	current  *workspaceRef
@@ -286,6 +309,20 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if picker == "" {
 		picker = defaultKeyPicker
 	}
+	cycleBack := ctrl.CycleBackKey()
+	if cycleBack == "" {
+		cycleBack = defaultKeyCycleBack
+	}
+	gotoEditor, gotoAgent, gotoTerm := ctrl.GotoKeys()
+	if gotoEditor == "" {
+		gotoEditor = defaultKeyGotoEditor
+	}
+	if gotoAgent == "" {
+		gotoAgent = defaultKeyGotoAgent
+	}
+	if gotoTerm == "" {
+		gotoTerm = defaultKeyGotoTerm
+	}
 	palette, next, prev := ctrl.AgentKeys()
 	if palette == "" {
 		palette = defaultKeyPalette
@@ -304,10 +341,9 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if globalConfig == "" {
 		globalConfig = defaultKeyGlobalConfig
 	}
+	// Notif is a legacy board alias, retired by default (empty). A user-set
+	// empty stays empty and never matches — key strings are never empty.
 	notif := ctrl.NotifKey()
-	if notif == "" {
-		notif = defaultKeyNotif
-	}
 	prompt := ctrl.PromptKey()
 	if prompt == "" {
 		prompt = defaultKeyPrompt
@@ -323,25 +359,40 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if termSplitH == "" {
 		termSplitH = defaultKeyTermSplitH
 	}
-	if termCycle == "" {
-		termCycle = defaultKeyTermCycle
-	}
+	// TermCycle is retired by default (empty); directional focus supersedes it.
+	// A user-set empty stays empty, so no default fallback here.
 	if termZoom == "" {
 		termZoom = defaultKeyTermZoom
 	}
 	if termClose == "" {
 		termClose = defaultKeyTermClose
 	}
+	termFocusLeft, termFocusDown, termFocusUp, termFocusRight := ctrl.TermFocusKeys()
+	if termFocusLeft == "" {
+		termFocusLeft = defaultKeyTermFocusLeft
+	}
+	if termFocusDown == "" {
+		termFocusDown = defaultKeyTermFocusDown
+	}
+	if termFocusUp == "" {
+		termFocusUp = defaultKeyTermFocusUp
+	}
+	if termFocusRight == "" {
+		termFocusRight = defaultKeyTermFocusRight
+	}
 
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
-		keyCycle: cycle, keyPicker: picker,
+		keyCycle: cycle, keyCycleBack: cycleBack, keyPicker: picker,
+		keyGotoEditor: gotoEditor, keyGotoAgent: gotoAgent, keyGotoTerm: gotoTerm,
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
 		keyPrompt: prompt, keyUsage: usageKey,
 		usageThreshold: ctrl.UsageThreshold(),
 		keyTermSplitV:  termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
+		keyTermFocusLeft: termFocusLeft, keyTermFocusDown: termFocusDown,
+		keyTermFocusUp: termFocusUp, keyTermFocusRight: termFocusRight,
 		filter: filter, nameInput: name, rootInput: rootInput,
 		promptInput:     promptInput,
 		focus:           focusNew,
@@ -1126,13 +1177,10 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return rows[nav[i]], true
 	}
-	// keyNotif is the legacy board-close alias. At its default (ctrl+n) it is
-	// deliberately shadowed by list-down navigation below: inside an open board
-	// nav wins over the alias, and ctrl+a (palette) plus esc/q still close. Only
-	// honor keyNotif as a close key when the user rebound it off ctrl+n, so it
-	// can't collide with the ctrl+n nav binding. ("ctrl+n" here is the fixed
-	// list-down dialect key, matching the switch case below — not m.keyNotif.)
-	if msg.String() == m.keyNotif && m.keyNotif != "ctrl+n" {
+	// keyNotif is the legacy board alias (retired by default). When a user rebinds
+	// it, it doubles as a board-close key; at its empty default it never matches
+	// (key strings are never empty), so ctrl+n stays pure list-down navigation.
+	if m.keyNotif != "" && msg.String() == m.keyNotif {
 		m.boardOpen = false
 		return m, nil
 	}
@@ -1496,10 +1544,34 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == m.keyGlobalConfig {
 		return m.activateGlobalConfig()
 	}
+	// Direct-jump keys work from session screens and from the picker whenever a
+	// workspace is active; they no-op with none.
+	switch msg.String() {
+	case m.keyGotoEditor:
+		return m.gotoScreen(screenEditor)
+	case m.keyGotoAgent:
+		return m.gotoScreen(screenAgent)
+	case m.keyGotoTerm:
+		return m.gotoScreen(screenTerminal)
+	}
 	if m.screen != screenPicker {
 		return m.handleSessionKey(msg)
 	}
 	return m.handlePicker(msg)
+}
+
+// gotoScreen jumps straight to a session view, mirroring selectTab's semantics:
+// a no-op without an active workspace, and clearing the workspace's attention
+// markers when landing on the agent screen.
+func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	m.screen = s
+	if s == screenAgent {
+		m.clearWorkspaceAttention()
+	}
+	return m, nil
 }
 
 // isReservedActionKey reports whether s is one of ct's own reserved keys that
@@ -1512,8 +1584,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // into the session beneath, exactly the leak the help swallow prevents.
 func (m Model) isReservedActionKey(s string) bool {
 	switch s {
-	case m.keyCycle, m.keyPicker, m.keyPalette, m.keyNotif, m.keyPrompt,
-		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent:
+	case m.keyCycle, m.keyCycleBack, m.keyPicker, m.keyPalette, m.keyNotif, m.keyPrompt,
+		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent,
+		m.keyGotoEditor, m.keyGotoAgent, m.keyGotoTerm:
 		return true
 	}
 	if s == m.keyUsage && m.screen == screenAgent {
@@ -1521,7 +1594,8 @@ func (m Model) isReservedActionKey(s string) bool {
 	}
 	if m.screen == screenTerminal {
 		switch s {
-		case m.keyTermSplitV, m.keyTermSplitH, m.keyTermCycle, m.keyTermZoom, m.keyTermClose:
+		case m.keyTermSplitV, m.keyTermSplitH, m.keyTermCycle, m.keyTermZoom, m.keyTermClose,
+			m.keyTermFocusLeft, m.keyTermFocusDown, m.keyTermFocusUp, m.keyTermFocusRight:
 			return true
 		}
 	}
@@ -1572,6 +1646,12 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.clearWorkspaceAttention()
 		}
 		return m, nil
+	case m.keyCycleBack:
+		m.screen = m.screen.prev()
+		if m.screen == screenAgent && m.current != nil {
+			m.clearWorkspaceAttention()
+		}
+		return m, nil
 	case m.keyPicker:
 		if m.current != nil {
 			if m.lastScreens == nil {
@@ -1605,6 +1685,18 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case m.keyTermCycle:
 			m.mgr.CycleTermPane(key)
+			return m, nil
+		case m.keyTermFocusLeft:
+			m.mgr.FocusTermPaneDir(key, session.FocusLeft, w, h)
+			return m, nil
+		case m.keyTermFocusDown:
+			m.mgr.FocusTermPaneDir(key, session.FocusDown, w, h)
+			return m, nil
+		case m.keyTermFocusUp:
+			m.mgr.FocusTermPaneDir(key, session.FocusUp, w, h)
+			return m, nil
+		case m.keyTermFocusRight:
+			m.mgr.FocusTermPaneDir(key, session.FocusRight, w, h)
 			return m, nil
 		case m.keyTermZoom:
 			return m.toggleZoom()
@@ -1969,9 +2061,8 @@ func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "down", "ctrl+n":
-		// ctrl+n is list-down only when keyNotif was rebound off it; at the
-		// default handleKey catches ctrl+n first to open the board. j/k are left
-		// to fall through to the fuzzy filter, which owns this section's input.
+		// j/k are left to fall through to the fuzzy filter, which owns this
+		// section's input.
 		if m.newCursor < len(m.repoMatches)-1 {
 			m.newCursor++
 		}
@@ -2006,10 +2097,7 @@ func (m Model) beginCreate() (tea.Model, tea.Cmd) {
 func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	// Shared list-nav dialect: arrows and ctrl+p/ctrl+n move, and — because the
-	// ACTIVE list owns no text input — j/k do too. ctrl+n only reaches here when
-	// the user rebound keyNotif off it; at its default ctrl+n is intercepted in
-	// handleKey to open the agent board, so in the deck ctrl+n opens the board
-	// rather than moving the cursor (documented there).
+	// ACTIVE list owns no text input — j/k do too.
 	case "up", "k", "ctrl+p":
 		if m.activeCursor > 0 {
 			m.activeCursor--

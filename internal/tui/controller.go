@@ -131,6 +131,16 @@ func (c *Controller) Keys() (cycle, picker string) {
 	return c.cfg.Keys.Cycle, c.cfg.Keys.Picker
 }
 
+// CycleBackKey returns the key that cycles to the previous session view.
+func (c *Controller) CycleBackKey() string { return c.cfg.Keys.CycleBack }
+
+// GotoKeys returns the keys that jump straight to the editor, agent, and
+// terminal views.
+func (c *Controller) GotoKeys() (editor, agent, term string) {
+	k := c.cfg.Keys
+	return k.GotoEditor, k.GotoAgent, k.GotoTerm
+}
+
 // AgentKeys returns the reserved agent-pool keystrokes (open palette, next
 // agent, previous agent).
 func (c *Controller) AgentKeys() (palette, next, prev string) {
@@ -161,6 +171,13 @@ func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
 func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {
 	k := c.cfg.Keys
 	return k.TermSplitV, k.TermSplitH, k.TermCycle, k.TermZoom, k.TermClose
+}
+
+// TermFocusKeys returns the directional terminal-pane focus keys (left, down,
+// up, right). These are only intercepted when the terminal screen is active.
+func (c *Controller) TermFocusKeys() (left, down, up, right string) {
+	k := c.cfg.Keys
+	return k.TermFocusLeft, k.TermFocusDown, k.TermFocusUp, k.TermFocusRight
 }
 
 // GlobalConfigDir returns the home directory path for the global config workspace.

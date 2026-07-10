@@ -44,6 +44,12 @@ type Usage struct {
 type Keys struct {
 	// Cycle moves one session view to the right (nvim → claude → term → nvim).
 	Cycle string `toml:"cycle"`
+	// CycleBack moves one session view to the left (the reverse of Cycle).
+	CycleBack string `toml:"cycle_back"`
+	// GotoEditor / GotoAgent / GotoTerm jump straight to that session view.
+	GotoEditor string `toml:"goto_editor"`
+	GotoAgent  string `toml:"goto_agent"`
+	GotoTerm   string `toml:"goto_term"`
 	// Picker returns to the CT picker.
 	Picker string `toml:"picker"`
 	// Palette opens the agent board: every agent across all open worktrees,
@@ -64,9 +70,14 @@ type Keys struct {
 	// Terminal pane management (only intercepted on the terminal screen).
 	TermSplitV string `toml:"term_split_v"` // new pane to the right
 	TermSplitH string `toml:"term_split_h"` // new pane below
-	TermCycle  string `toml:"term_cycle"`   // cycle pane focus
+	TermCycle  string `toml:"term_cycle"`   // cycle pane focus (retired by default)
 	TermZoom   string `toml:"term_zoom"`    // toggle full-size
 	TermClose  string `toml:"term_close"`   // close active pane
+	// Directional terminal-pane focus (only intercepted on the terminal screen).
+	TermFocusLeft  string `toml:"term_focus_left"`
+	TermFocusDown  string `toml:"term_focus_down"`
+	TermFocusUp    string `toml:"term_focus_up"`
+	TermFocusRight string `toml:"term_focus_right"`
 	// Usage opens the usage overlay on the claude screen.
 	Usage string `toml:"usage"`
 }
@@ -85,12 +96,16 @@ func Default() Config {
 		WorktreePath: ".worktrees/{name}",
 		BranchName:   "{name}",
 		Keys: Keys{
-			Cycle: "ctrl+o", Picker: "ctrl+g",
-			Palette: "ctrl+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "ctrl+h", Notif: "ctrl+n", Prompt: "ctrl+y",
-			TermSplitV: "ctrl+\\", TermSplitH: "ctrl+-",
-			TermCycle: "ctrl+w", TermZoom: "ctrl+f", TermClose: "ctrl+x",
-			Usage: "ctrl+u",
+			Cycle: "alt+]", CycleBack: "alt+[",
+			GotoEditor: "alt+1", GotoAgent: "alt+2", GotoTerm: "alt+3",
+			Picker:  "ctrl+g",
+			Palette: "alt+a", NextAgent: "f4", PrevAgent: "f3",
+			Help: "f1", GlobalConfig: "alt+g", Notif: "", Prompt: "alt+y",
+			TermSplitV: "alt+v", TermSplitH: "alt+s",
+			TermCycle: "", TermZoom: "alt+z", TermClose: "alt+x",
+			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",
+			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
+			Usage: "alt+u",
 		},
 		Usage: Usage{Threshold: 50},
 	}

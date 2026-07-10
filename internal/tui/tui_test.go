@@ -17,6 +17,11 @@ import (
 
 func ctrlKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl} }
 
+// altKey builds an alt-modified key press. Text is deliberately left empty so
+// Key.String() falls through to the "alt+<r>" keystroke form (a non-empty Text
+// would be returned verbatim instead).
+func altKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Mod: tea.ModAlt} }
+
 func TestScreenCycle(t *testing.T) {
 	if screenEditor.next() != screenAgent {
 		t.Error("editor should cycle to agent")
@@ -26,6 +31,29 @@ func TestScreenCycle(t *testing.T) {
 	}
 	if screenTerminal.next() != screenEditor {
 		t.Error("terminal should wrap to editor")
+	}
+}
+
+// TestScreenCyclePrev checks the reverse cycle wraps the other way and is the
+// inverse of next across the three session views.
+func TestScreenCyclePrev(t *testing.T) {
+	if screenEditor.prev() != screenTerminal {
+		t.Error("editor should wrap back to terminal")
+	}
+	if screenTerminal.prev() != screenAgent {
+		t.Error("terminal should cycle back to agent")
+	}
+	if screenAgent.prev() != screenEditor {
+		t.Error("agent should cycle back to editor")
+	}
+	// prev is the inverse of next over the session views.
+	for _, s := range []screen{screenEditor, screenAgent, screenTerminal} {
+		if got := s.next().prev(); got != s {
+			t.Errorf("next then prev from %v = %v, want %v", s, got, s)
+		}
+		if got := s.prev().next(); got != s {
+			t.Errorf("prev then next from %v = %v, want %v", s, got, s)
+		}
 	}
 }
 
@@ -539,37 +567,37 @@ func TestBoardDigitJump(t *testing.T) {
 func TestBoardOpensFromPicker(t *testing.T) {
 	m := sampleModel() // picker, no current workspace
 
-	mm, _ := m.handleKey(ctrlKey('a'))
+	mm, _ := m.handleKey(altKey('a')) // palette
 	m = mm.(Model)
 	if !m.boardOpen {
-		t.Fatal("ctrl+a should open the board from the picker")
+		t.Fatal("alt+a should open the board from the picker")
 	}
 	// With no open workspaces the board still offers the "+ new agent" row.
 	rows, nav := m.buildBoard()
 	if len(nav) != 1 || !rows[nav[0]].isNew {
 		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
 	}
-	// Inside an open board ctrl+n is list-down, not the close alias: it keeps the
-	// board open (nav wins over the legacy alias). The primary palette key closes.
+	// Inside an open board ctrl+n is list-down (the notif close alias is retired):
+	// it keeps the board open. The primary palette key closes.
 	mm, _ = m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
 		t.Fatal("ctrl+n inside the board should navigate, not close it")
 	}
-	mm, _ = m.handleKey(ctrlKey('a'))
+	mm, _ = m.handleKey(altKey('a'))
 	m = mm.(Model)
 	if m.boardOpen {
-		t.Fatal("ctrl+a should close the board")
+		t.Fatal("alt+a should close the board")
 	}
 }
 
 func TestQuickPromptOpensForm(t *testing.T) {
 	m := sampleModel()
 
-	mm, _ := m.handleKey(ctrlKey('y'))
+	mm, _ := m.handleKey(altKey('y'))
 	m = mm.(Model)
 	if !m.boardOpen || !m.formOpen {
-		t.Fatalf("ctrl+y should open the new-agent form: board=%v form=%v", m.boardOpen, m.formOpen)
+		t.Fatalf("alt+y should open the new-agent form: board=%v form=%v", m.boardOpen, m.formOpen)
 	}
 	if m.formLocation != 1 || !m.formBackground || m.formFocus != formFieldPrompt {
 		t.Fatalf("quick prompt should preselect home+background with prompt focused: loc=%d bg=%v focus=%d",
@@ -738,7 +766,7 @@ func TestAttentionClearedOnAgentView(t *testing.T) {
 	m.screen = screenEditor // start on editor, cycle to agent
 
 	// Cycling to the agent screen (keyCycle) clears markers for the current workspace.
-	result, _ := m.update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	result, _ := m.update(altKey(']'))
 	m2 := result.(Model)
 
 	if m2.screen != screenAgent {
@@ -1518,16 +1546,26 @@ func TestListNavDialect(t *testing.T) {
 	}
 }
 
-// TestDeckCtrlNOpensBoard: at the default keyNotif binding, ctrl+n in the deck
-// opens the agent board (handleKey intercepts it) instead of moving a cursor —
-// the legacy behavior is preserved.
-func TestDeckCtrlNOpensBoard(t *testing.T) {
+// TestDeckCtrlNMovesCursor: with the notif alias retired (empty default), ctrl+n
+// in the deck is a pure list-down key — it moves the ACTIVE cursor and never
+// opens the agent board (handleKey no longer intercepts it).
+func TestDeckCtrlNMovesCursor(t *testing.T) {
 	m := sampleModel()
+	if m.keyNotif != "" {
+		t.Fatalf("precondition: notif should default empty, got %q", m.keyNotif)
+	}
 	m.focus = focusActive
+	if len(m.active) < 2 {
+		t.Fatalf("precondition: need >=2 active items, got %d", len(m.active))
+	}
+	m.activeCursor = 0
 	mm, _ := m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
-	if !m.boardOpen {
-		t.Fatal("ctrl+n in the deck should open the board at the default binding")
+	if m.boardOpen {
+		t.Fatal("ctrl+n in the deck must not open the board once notif is retired")
+	}
+	if m.activeCursor != 1 {
+		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
 	}
 }
 
@@ -1555,11 +1593,11 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 		t.Fatalf("ctrl+p should move the board cursor back up, got %d", m.boardCursor)
 	}
 
-	// ctrl+a (palette) still closes.
-	mm, _ = m.handleBoard(ctrlKey('a'))
+	// alt+a (palette) still closes.
+	mm, _ = m.handleBoard(altKey('a'))
 	m = mm.(Model)
 	if m.boardOpen {
-		t.Fatal("ctrl+a should still close the board")
+		t.Fatal("alt+a should still close the board")
 	}
 
 	// esc still closes.
@@ -1609,6 +1647,60 @@ func TestKeyNotifReboundFreesCtrlN(t *testing.T) {
 	}
 }
 
+// TestGotoScreenKeys: the direct-jump keys (alt+1/2/3) switch straight to the
+// editor/agent/terminal views from a session screen and from the picker when a
+// workspace is active, clear attention on landing on the agent screen, and
+// no-op when no workspace is active.
+func TestGotoScreenKeys(t *testing.T) {
+	ws := &session.Workspace{
+		Editor: &session.Session{},
+		Terms:  []*session.Session{{}},
+		Agents: []*session.Session{{}},
+	}
+
+	// From a session screen: alt+3 jumps to the terminal, alt+1 back to editor.
+	m := sampleModel()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: "/r/w", ws: ws}
+	m.screen = screenEditor
+	mm, _ := m.handleKey(altKey('3'))
+	m = mm.(Model)
+	if m.screen != screenTerminal {
+		t.Fatalf("alt+3 should jump to the terminal, got %v", m.screen)
+	}
+	mm, _ = m.handleKey(altKey('1'))
+	m = mm.(Model)
+	if m.screen != screenEditor {
+		t.Fatalf("alt+1 should jump to the editor, got %v", m.screen)
+	}
+
+	// alt+2 lands on the agent screen and clears the workspace's markers.
+	m.attention = map[int]attnEntry{1: {level: attnDone, key: "r/w"}}
+	mm, _ = m.handleKey(altKey('2'))
+	m = mm.(Model)
+	if m.screen != screenAgent {
+		t.Fatalf("alt+2 should jump to the agent screen, got %v", m.screen)
+	}
+	if _, ok := m.attention[1]; ok {
+		t.Error("landing on the agent screen should clear the workspace's markers")
+	}
+
+	// From the picker with a workspace active: the jump still works.
+	m.screen = screenPicker
+	mm, _ = m.handleKey(altKey('3'))
+	m = mm.(Model)
+	if m.screen != screenTerminal {
+		t.Fatalf("alt+3 should jump from the picker too, got %v", m.screen)
+	}
+
+	// With no active workspace the jump is a swallowed no-op (stays on picker).
+	n := sampleModel() // picker, current == nil
+	mm, _ = n.handleKey(altKey('2'))
+	n = mm.(Model)
+	if n.screen != screenPicker || n.current != nil {
+		t.Fatalf("goto with no workspace should no-op, screen=%v current=%v", n.screen, n.current)
+	}
+}
+
 // TestHelpReservedKeyReDispatches: a reserved action key pressed while help is
 // open closes the overlay AND performs its action in one press.
 func TestHelpReservedKeyReDispatches(t *testing.T) {
@@ -1617,7 +1709,7 @@ func TestHelpReservedKeyReDispatches(t *testing.T) {
 	m.screen = screenEditor
 	m.helpOpen = true
 
-	mm, _ := m.handleKey(ctrlKey('o')) // default keyCycle == ctrl+o
+	mm, _ := m.handleKey(altKey(']')) // default keyCycle == alt+]
 	m = mm.(Model)
 	if m.helpOpen {
 		t.Fatal("a reserved key should still close the help overlay")

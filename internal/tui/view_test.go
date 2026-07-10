@@ -72,6 +72,32 @@ func TestSelectionBarFillsWidth(t *testing.T) {
 	}
 }
 
+func TestRenderHelpKeys(t *testing.T) {
+	// Defaults: the cycle fwd/back and goto rows show, and the retired notif
+	// alias + pane-cycle rows are omitted.
+	m := sampleModel()
+	out := m.renderHelp(m.height - barHeight)
+	for _, want := range []string{"alt+]", "alt+[", "alt+1", "alt+h", "alt+v", "cycle view"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help overlay missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "agent board (alias)") {
+		t.Error("retired notif alias row should be hidden when keyNotif is empty")
+	}
+	if strings.Contains(out, "cycle pane focus") {
+		t.Error("retired pane-cycle row should be hidden when keyTermCycle is empty")
+	}
+
+	// When a user re-enables the aliases, their rows reappear.
+	m.keyNotif = "ctrl+n"
+	m.keyTermCycle = "ctrl+w"
+	out = m.renderHelp(m.height - barHeight)
+	if !strings.Contains(out, "agent board (alias)") || !strings.Contains(out, "cycle pane focus") {
+		t.Errorf("rebound alias rows should appear:\n%s", out)
+	}
+}
+
 func TestBarNotifZone(t *testing.T) {
 	m := sampleModel()
 	m.current = &workspaceRef{

@@ -214,7 +214,128 @@ func TestNextPaneIdxNoMatch(t *testing.T) {
 	}
 }
 
+// --- FocusPaneDir ---
+
+func TestFocusPaneDirVerticalMajor(t *testing.T) {
+	// left=0 spans full height; the right column splits top=1 / bottom=2.
+	root := split(SplitV, 0.5, leaf(0), split(SplitH, 0.5, leaf(1), leaf(2)))
+	b := ComputePaneBounds(root, 0, 0, 81, 25)
+
+	cases := []struct {
+		from int
+		dir  FocusDir
+		want int
+	}{
+		{0, FocusRight, 1}, // across the vertical divider, tie broken to lowest idx
+		{1, FocusLeft, 0},
+		{2, FocusLeft, 0},
+		{1, FocusDown, 2}, // across the horizontal divider
+		{2, FocusUp, 1},
+		{0, FocusLeft, -1},  // at the left edge — no wrap
+		{1, FocusUp, -1},    // at the top edge
+		{2, FocusDown, -1},  // at the bottom edge
+		{1, FocusRight, -1}, // at the right edge
+	}
+	for _, c := range cases {
+		if got := FocusPaneDir(b, c.from, c.dir); got != c.want {
+			t.Errorf("from %d dir %v = %d, want %d", c.from, c.dir, got, c.want)
+		}
+	}
+}
+
+func TestFocusPaneDirHorizontalMajor(t *testing.T) {
+	// top=0 spans full width; the bottom row splits left=1 / right=2.
+	root := split(SplitH, 0.5, leaf(0), split(SplitV, 0.5, leaf(1), leaf(2)))
+	b := ComputePaneBounds(root, 0, 0, 81, 25)
+
+	cases := []struct {
+		from int
+		dir  FocusDir
+		want int
+	}{
+		{0, FocusDown, 1},
+		{1, FocusRight, 2},
+		{2, FocusLeft, 1},
+		{1, FocusUp, 0},
+		{2, FocusUp, 0},
+		{0, FocusUp, -1},
+		{1, FocusDown, -1},
+		{1, FocusLeft, -1},
+		{0, FocusRight, -1},
+	}
+	for _, c := range cases {
+		if got := FocusPaneDir(b, c.from, c.dir); got != c.want {
+			t.Errorf("from %d dir %v = %d, want %d", c.from, c.dir, got, c.want)
+		}
+	}
+}
+
+func TestFocusPaneDirGreatestOverlap(t *testing.T) {
+	// left column split top=0 (tall) / bottom=1 (short); right=2 spans full
+	// height. From 2 moving left must pick the pane with the greater vertical
+	// overlap (0), not merely the nearest or lowest-idx one.
+	root := split(SplitV, 0.5, split(SplitH, 0.75, leaf(0), leaf(1)), leaf(2))
+	b := ComputePaneBounds(root, 0, 0, 81, 25)
+	if got := FocusPaneDir(b, 2, FocusLeft); got != 0 {
+		t.Errorf("from 2 left should pick the taller overlapping pane 0, got %d", got)
+	}
+}
+
+func TestFocusPaneDirUnknownActive(t *testing.T) {
+	root := split(SplitV, 0.5, leaf(0), leaf(1))
+	b := ComputePaneBounds(root, 0, 0, 81, 24)
+	if got := FocusPaneDir(b, 99, FocusRight); got != -1 {
+		t.Errorf("unknown active pane should return -1, got %d", got)
+	}
+}
+
 // --- Manager integration ---
+
+func TestManagerFocusTermPaneDir(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	sleep := []string{"sh", "-c", "sleep 5"}
+	ws, err := m.Activate("r/w", t.TempDir(), []Spec{{Kind: Terminal, Argv: sleep}}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A single pane: directional focus is a no-op.
+	m.FocusTermPaneDir("r/w", FocusRight, 80, 24)
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("single-pane focus should no-op, active=%d", ws.ActiveTerm)
+	}
+
+	// Split vertically → panes 0|1 with the new pane (1) focused.
+	if _, err := m.SplitTermPane("r/w", t.TempDir(), Spec{Kind: Terminal, Argv: sleep}, SplitV, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("after split active=%d, want 1", ws.ActiveTerm)
+	}
+
+	m.FocusTermPaneDir("r/w", FocusLeft, 80, 24)
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("focus left should select pane 0, got %d", ws.ActiveTerm)
+	}
+	// Left again at the layout edge → no wrap, no-op.
+	m.FocusTermPaneDir("r/w", FocusLeft, 80, 24)
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("focus left at the edge should no-op, got %d", ws.ActiveTerm)
+	}
+	m.FocusTermPaneDir("r/w", FocusRight, 80, 24)
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("focus right should select pane 1, got %d", ws.ActiveTerm)
+	}
+
+	// While zoomed, directional focus is suppressed.
+	m.ZoomTermPane("r/w") // TermZoomed = true
+	m.FocusTermPaneDir("r/w", FocusLeft, 80, 24)
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("zoomed focus should no-op, got %d", ws.ActiveTerm)
+	}
+}
 
 func TestManagerSplitAndCloseTermPane(t *testing.T) {
 	m := NewManager()

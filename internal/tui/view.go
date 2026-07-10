@@ -909,7 +909,11 @@ func (m Model) renderHelp(h int) string {
 	innerW := clamp(m.width-8, 28, 72)
 
 	row := func(key, desc string) string {
-		return "  " + helpKeyStyle.Render(padLine(key, 12)) + helpStyle.Render(desc)
+		k := padLine(key, 12)
+		if lipgloss.Width(key) > 12 {
+			k = key + " " // guarantee a gap when the key column overflows
+		}
+		return "  " + helpKeyStyle.Render(k) + helpStyle.Render(desc)
 	}
 
 	rows := []string{header("help", -1), ""}
@@ -925,21 +929,31 @@ func (m Model) renderHelp(h int) string {
 		row("ctrl+c", "quit"),
 		"",
 		repoHdrStyle.Render("  Session"),
-		row(m.keyCycle, "cycle view (nvim → claude → term)"),
+		row(m.keyCycle+" / "+m.keyCycleBack, "cycle view (next / prev)"),
+		row(m.keyGotoEditor+" "+m.keyGotoAgent+" "+m.keyGotoTerm, "go to editor / agent / term"),
 		row(m.keyPicker, "back to the deck"),
 		row(m.keyGlobalConfig, "open home workspace (~)"),
 		row(m.keyPrompt, "quick background agent (home)"),
 		row(m.keyPalette, "agent board"),
-		row(m.keyNotif, "agent board (alias)"),
+	)
+	if m.keyNotif != "" {
+		rows = append(rows, row(m.keyNotif, "agent board (alias)"))
+	}
+	rows = append(rows,
 		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
 		row(m.keyUsage, "usage limits"),
 		"",
 		repoHdrStyle.Render("  Terminal panes"),
 		row(m.keyTermSplitV, "vertical split"),
 		row(m.keyTermSplitH, "horizontal split"),
-		row(m.keyTermCycle, "cycle pane focus"),
+		row(m.keyTermFocusLeft+" "+m.keyTermFocusDown+" "+m.keyTermFocusUp+" "+m.keyTermFocusRight, "focus left / down / up / right"),
 		row(m.keyTermZoom, "zoom / restore pane"),
 		row(m.keyTermClose, "close pane"),
+	)
+	if m.keyTermCycle != "" {
+		rows = append(rows, row(m.keyTermCycle, "cycle pane focus"))
+	}
+	rows = append(rows,
 		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
