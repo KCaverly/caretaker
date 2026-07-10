@@ -168,6 +168,18 @@ func NextPaneIdx(root *PaneNode, activeIdx int) int {
 	return leaves[0]
 }
 
+// PaneAt returns the Idx of the pane whose bounds contain (x, y), or -1 when the
+// point lands on a divider (the 1-cell gaps between panes belong to no pane) or
+// falls outside every resolved rectangle.
+func PaneAt(bounds []PaneBounds, x, y int) int {
+	for _, b := range bounds {
+		if x >= b.X && x < b.X+b.W && y >= b.Y && y < b.Y+b.H {
+			return b.Idx
+		}
+	}
+	return -1
+}
+
 // FocusDir is a travel direction for directional terminal-pane focus.
 type FocusDir int
 

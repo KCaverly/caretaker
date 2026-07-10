@@ -454,6 +454,23 @@ func (m *Manager) FocusTermPaneDir(key string, dir FocusDir, w, h int) {
 	}
 }
 
+// FocusTermPaneAt focuses the terminal pane containing body-local point (x, y),
+// using the pane rectangles resolved for a w×h body. It's a no-op when the
+// workspace is unknown, has fewer than two panes, has no layout, is zoomed, or
+// when the point lands on a divider or outside every pane.
+func (m *Manager) FocusTermPaneAt(key string, x, y, w, h int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok || len(ws.Terms) < 2 || ws.TermLayout == nil || ws.TermZoomed {
+		return
+	}
+	bounds := ComputePaneBounds(ws.TermLayout, 0, 0, w, h)
+	if idx := PaneAt(bounds, x, y); idx >= 0 {
+		ws.ActiveTerm = idx
+	}
+}
+
 // ZoomTermPane toggles the focused terminal pane between its normal split
 // position and a full-size view.
 func (m *Manager) ZoomTermPane(key string) {

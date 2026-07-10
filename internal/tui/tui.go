@@ -1819,8 +1819,9 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	return model, tea.Batch(cmd, model.flashCmd("agent launched"))
 }
 
-// handleMouseClick switches tabs when a left-click lands on a bar icon, and
-// otherwise forwards the click to the active session.
+// handleMouseClick switches tabs when a left-click lands on a bar icon, focuses
+// the terminal pane under a click in a split layout, and otherwise forwards the
+// click to the active session.
 func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	mo := msg.Mouse()
 	if mo.Button == tea.MouseLeft {
@@ -1841,6 +1842,14 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
 				return mm, cmd
 			}
+		}
+		// Focus the terminal pane under the click before the click reaches the
+		// program running in it. Panes aren't drawn while an overlay is up, so a
+		// click then must not steal pane focus.
+		if m.screen == screenTerminal && m.current != nil &&
+			!m.helpOpen && !m.boardOpen && !m.usageOpen && mo.Y >= barHeight {
+			w, h := m.sessionSize()
+			m.mgr.FocusTermPaneAt(m.current.key, mo.X, mo.Y-barHeight, w, h)
 		}
 	}
 	m.forwardMouse(msg)
@@ -1973,18 +1982,48 @@ func (m Model) selectTab(s screen) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// forwardMouse relays a mouse event to the active session (translated below the
-// bar). The emulator only encodes it if the program has enabled mouse reporting.
+// forwardMouse relays a mouse event to the session under the pointer. In an
+// unzoomed split terminal layout it hit-tests the pane rectangles and delivers
+// pane-local coordinates to that pane's program, so a click or wheel scroll acts
+// on the pane it lands on rather than only the focused one; events over a
+// divider or the footer are dropped. Everywhere else it relays to the active
+// session translated below the bar. The emulator only encodes the event if the
+// program has enabled mouse reporting.
 func (m Model) forwardMouse(msg tea.MouseMsg) {
 	if m.screen == screenPicker {
 		return
 	}
-	s := m.activeSession()
-	if s == nil || msg.Mouse().Y < barHeight {
+	mo := msg.Mouse()
+	if mo.Y < barHeight {
 		return
 	}
-	shift := func(mo tea.Mouse) uv.Mouse {
-		return uv.Mouse{X: mo.X, Y: mo.Y - barHeight, Button: mo.Button, Mod: uv.KeyMod(mo.Mod)}
+	// Target session and the pane origin to subtract from the pointer. Default:
+	// the active session, offset only by the bar (bx, by stay 0).
+	s := m.activeSession()
+	bx, by := 0, 0
+	if m.screen == screenTerminal && m.current != nil && m.current.ws != nil {
+		ws := m.current.ws
+		if !ws.TermZoomed && len(ws.Terms) > 1 && ws.TermLayout != nil {
+			w, h := m.sessionSize()
+			bounds := session.ComputePaneBounds(ws.TermLayout, 0, 0, w, h)
+			idx := session.PaneAt(bounds, mo.X, mo.Y-barHeight)
+			if idx < 0 || idx >= len(ws.Terms) || ws.Terms[idx] == nil {
+				return // divider, footer, or outside every pane
+			}
+			for _, b := range bounds {
+				if b.Idx == idx {
+					bx, by = b.X, b.Y
+					break
+				}
+			}
+			s = ws.Terms[idx]
+		}
+	}
+	if s == nil {
+		return
+	}
+	shift := func(p tea.Mouse) uv.Mouse {
+		return uv.Mouse{X: p.X - bx, Y: p.Y - barHeight - by, Button: p.Button, Mod: uv.KeyMod(p.Mod)}
 	}
 	switch e := msg.(type) {
 	case tea.MouseClickMsg:

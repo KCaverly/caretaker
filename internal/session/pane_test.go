@@ -289,6 +289,31 @@ func TestFocusPaneDirUnknownActive(t *testing.T) {
 	}
 }
 
+// --- PaneAt ---
+
+func TestPaneAt(t *testing.T) {
+	// Two-pane vertical split: left 0 at X[0,40), divider at X=40, right 1 at
+	// X[41,81).
+	root := split(SplitV, 0.5, leaf(0), leaf(1))
+	b := ComputePaneBounds(root, 0, 0, 81, 24)
+	cases := []struct {
+		x, y int
+		want int
+	}{
+		{10, 5, 0},    // inside the left pane
+		{50, 5, 1},    // inside the right pane
+		{40, 5, -1},   // on the divider column
+		{-1, 5, -1},   // left of everything
+		{200, 5, -1},  // beyond the width
+		{10, 100, -1}, // below the height
+	}
+	for _, c := range cases {
+		if got := PaneAt(b, c.x, c.y); got != c.want {
+			t.Errorf("PaneAt(%d,%d) = %d, want %d", c.x, c.y, got, c.want)
+		}
+	}
+}
+
 // --- Manager integration ---
 
 func TestManagerFocusTermPaneDir(t *testing.T) {
@@ -334,6 +359,50 @@ func TestManagerFocusTermPaneDir(t *testing.T) {
 	m.FocusTermPaneDir("r/w", FocusLeft, 80, 24)
 	if ws.ActiveTerm != 1 {
 		t.Fatalf("zoomed focus should no-op, got %d", ws.ActiveTerm)
+	}
+}
+
+func TestManagerFocusTermPaneAt(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	sleep := []string{"sh", "-c", "sleep 5"}
+	ws, err := m.Activate("r/w", t.TempDir(), []Spec{{Kind: Terminal, Argv: sleep}}, 81, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Split vertically → panes 0|1 (left|right), the new pane 1 focused.
+	if _, err := m.SplitTermPane("r/w", t.TempDir(), Spec{Kind: Terminal, Argv: sleep}, SplitV, 81, 24); err != nil {
+		t.Fatal(err)
+	}
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("after split active=%d, want 1", ws.ActiveTerm)
+	}
+
+	// Click inside the left (non-active) pane → focus moves to 0.
+	m.FocusTermPaneAt("r/w", 10, 5, 81, 24)
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("click in left pane should focus 0, got %d", ws.ActiveTerm)
+	}
+
+	// Click on the divider column → no-op.
+	m.FocusTermPaneAt("r/w", 40, 5, 81, 24)
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("click on divider should no-op, got %d", ws.ActiveTerm)
+	}
+
+	// Click inside the right pane → focus moves to 1.
+	m.FocusTermPaneAt("r/w", 50, 5, 81, 24)
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("click in right pane should focus 1, got %d", ws.ActiveTerm)
+	}
+
+	// While zoomed, click-to-focus is suppressed.
+	m.ZoomTermPane("r/w") // TermZoomed = true
+	m.FocusTermPaneAt("r/w", 10, 5, 81, 24)
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("zoomed click should no-op, got %d", ws.ActiveTerm)
 	}
 }
 

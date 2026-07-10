@@ -966,6 +966,41 @@ func TestActivateFlow(t *testing.T) {
 	}
 }
 
+// TestMouseClickFocusesTermPane splits a terminal into two panes and verifies a
+// left click over the non-focused pane moves pane focus onto it.
+func TestMouseClickFocusesTermPane(t *testing.T) {
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+
+	mm, _ = m.activate("repo", "wt", t.TempDir())
+	m = mm.(Model)
+	m.screen = screenTerminal
+
+	// Split vertically → left 0 | right 1, with the new pane 1 focused.
+	w, h := m.sessionSize()
+	if _, err := mgr.SplitTermPane("repo/wt", t.TempDir(), ctrl.TermSpec(), session.SplitV, w, h); err != nil {
+		t.Fatal(err)
+	}
+	ws := m.current.ws
+	if ws.ActiveTerm != 1 {
+		t.Fatalf("after split active=%d, want 1", ws.ActiveTerm)
+	}
+
+	// A left click well left of the divider, below the bar, focuses pane 0.
+	m.handleMouseClick(tea.MouseClickMsg{X: 5, Y: barHeight + 3, Button: tea.MouseLeft})
+	if ws.ActiveTerm != 0 {
+		t.Fatalf("click in left pane should focus 0, got %d", ws.ActiveTerm)
+	}
+}
+
 // TestBoardSortsAttentionFirst activates two real workspaces and checks that
 // the one with an unread marker sorts above the current one, and that the
 // board cursor opens on it.
