@@ -50,6 +50,16 @@ term_focus_left = "alt+h"  # directional pane focus (h/j/k/l)
 term_focus_down = "alt+j"
 term_focus_up   = "alt+k"
 term_focus_right = "alt+l"
+
+# Ambient plasma panel on the right of the deck (defaults shown). It only
+# animates while the deck is on screen, and hides itself on terminals too
+# narrow to split.
+[plasma]
+pattern = "classic" # classic | waves | interference | lava | ripple
+palette = "aurora"  # aurora (blue/purple) | ember (yellow/red) | mono (grayscale)
+charset = "dots"    # dots (braille) | shade | blocks
+speed   = 0.3       # animation rate; 0 freezes the pattern
+width   = 40        # percent of the terminal width; 0 disables the panel
 ```
 
 ## Run

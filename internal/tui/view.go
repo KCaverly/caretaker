@@ -745,16 +745,42 @@ func (m Model) deckLayout(bodyH int) deckLayout {
 	}
 }
 
-// renderDeck draws the picker (NEW + ACTIVE sections) into h rows beneath the bar.
+// plasmaWidth returns the plasma panel's column count for the current
+// terminal size: the configured percent of the width, or 0 when the panel is
+// disabled or the terminal is too narrow to split — the repo/worktree lists
+// keep priority over ambience.
+func (m Model) plasmaWidth() int {
+	if m.plasma == nil || m.plasmaWidthPct <= 0 {
+		return 0
+	}
+	w := m.width * m.plasmaWidthPct / 100
+	if w < 16 || m.width-w < 48 {
+		return 0
+	}
+	return w
+}
+
+// renderDeck draws the picker into h rows beneath the bar: the NEW + ACTIVE
+// sections stacked on the left, and (given the room) the ambient plasma panel
+// filling a full-height box on the right.
 func (m Model) renderDeck(h int) string {
-	innerW := m.width - 4 // border (2) + horizontal padding (2)
+	plasmaW := m.plasmaWidth()
+	innerW := m.width - plasmaW - 4 // border (2) + horizontal padding (2)
 	footer := m.renderFooter()
 	L := m.deckLayout(h)
 
 	newBox := box(m.renderNew(innerW, L.newRows), innerW, L.newContentH, m.focus == focusNew)
 	activeBox := box(m.renderActive(innerW, L.activeRows), innerW, L.activeContentH, m.focus == focusActive)
+	body := lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox)
 
-	return lipgloss.JoinVertical(lipgloss.Left, newBox, activeBox, footer)
+	if plasmaW > 0 {
+		// Span both left boxes exactly: their outer heights are contentH+2 each.
+		ph := L.newContentH + L.activeContentH + 2
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body,
+			box(m.plasma.Render(plasmaW-4, ph), plasmaW-4, ph, false))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 }
 
 // renderNew builds the top "new" repo finder. In create mode it becomes a

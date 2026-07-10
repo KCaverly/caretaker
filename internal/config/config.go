@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/KCaverly/caretaker/internal/plasma"
 )
 
 // Config holds ct's runtime configuration.
@@ -30,6 +32,25 @@ type Config struct {
 	Keys Keys `toml:"keys"`
 	// Usage configures the plan usage-limit gauge.
 	Usage Usage `toml:"usage"`
+	// Plasma configures the deck's ambient plasma panel.
+	Plasma Plasma `toml:"plasma"`
+}
+
+// Plasma configures the ambient animation panel on the right of the deck.
+type Plasma struct {
+	// Pattern picks the field shape: classic, waves, interference, lava,
+	// or ripple.
+	Pattern string `toml:"pattern"`
+	// Palette picks the color ramp: aurora (blue/purple), ember
+	// (yellow/red), or mono (grayscale).
+	Palette string `toml:"palette"`
+	// Charset picks the density ramp: dots (braille), shade, or blocks.
+	Charset string `toml:"charset"`
+	// Speed scales the animation rate (0 freezes the pattern; capped at 3).
+	Speed float64 `toml:"speed"`
+	// Width is the panel's share of the deck as a percent of the terminal
+	// width (0 disables the panel; capped at 70).
+	Width int `toml:"width"`
 }
 
 // Usage configures the plan usage-limit gauge.
@@ -108,6 +129,10 @@ func Default() Config {
 			Usage: "alt+u",
 		},
 		Usage: Usage{Threshold: 50},
+		Plasma: Plasma{
+			Pattern: "classic", Palette: "aurora", Charset: "dots",
+			Speed: 0.3, Width: 40,
+		},
 	}
 }
 
@@ -205,6 +230,21 @@ func (c *Config) validate() error {
 	// A negative threshold is meaningless; treat it as "always show".
 	if c.Usage.Threshold < 0 {
 		c.Usage.Threshold = 0
+	}
+	// Numeric plasma fields clamp quietly; variant names must exist so a
+	// typo fails at startup with the valid options instead of a silent
+	// fallback. Width 0 disables the panel, in which case the names are
+	// irrelevant and skipped.
+	c.Plasma.Speed = min(max(c.Plasma.Speed, 0), 3)
+	c.Plasma.Width = min(max(c.Plasma.Width, 0), 70)
+	if c.Plasma.Width > 0 {
+		if err := plasma.Validate(plasma.Options{
+			Pattern: c.Plasma.Pattern,
+			Palette: c.Plasma.Palette,
+			Charset: c.Plasma.Charset,
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

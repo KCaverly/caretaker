@@ -166,6 +166,9 @@ func (c *Controller) UsageKey() string { return c.cfg.Keys.Usage }
 // usage gauge appears (0 = always, >100 = never).
 func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
 
+// PlasmaConfig returns the deck plasma-panel settings.
+func (c *Controller) PlasmaConfig() config.Plasma { return c.cfg.Plasma }
+
 // TermPaneKeys returns the reserved keys for terminal pane management. These
 // are only intercepted when the terminal screen is active.
 func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {

@@ -18,6 +18,7 @@ import (
 	"github.com/sahilm/fuzzy"
 
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/plasma"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/state"
@@ -268,6 +269,16 @@ type Model struct {
 	// groupsLoaded flips on the first applied deck load, so the picker can
 	// show a scanning indicator instead of a wrong "no repos" message.
 	groupsLoaded bool
+
+	// Ambient plasma panel on the right of the deck. plasma is nil when the
+	// panel is disabled; plasmaWidthPct is its configured share of the
+	// terminal width. plasmaTicking tracks whether an animation tick is in
+	// flight: the tick disarms itself whenever the deck stops being drawn
+	// and Update re-arms it on return, so at most one is ever pending and no
+	// timer runs while other screens are up.
+	plasma         *plasma.Field
+	plasmaWidthPct int
+	plasmaTicking  bool
 }
 
 // statusLevel classifies the footer status so styling and expiry don't rely
@@ -381,6 +392,18 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		termFocusRight = defaultKeyTermFocusRight
 	}
 
+	// A nil field simply hides the panel. Construction only fails on variant
+	// names config validation didn't check, i.e. when width is 0 — which
+	// disables the panel anyway.
+	var plasmaField *plasma.Field
+	pc := ctrl.PlasmaConfig()
+	if pc.Width > 0 {
+		plasmaField, _ = plasma.New(plasma.Options{
+			Pattern: pc.Pattern, Palette: pc.Palette, Charset: pc.Charset,
+			Speed: pc.Speed,
+		})
+	}
+
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keyCycle: cycle, keyCycleBack: cycleBack, keyPicker: picker,
@@ -389,7 +412,8 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
 		keyPrompt: prompt, keyUsage: usageKey,
 		usageThreshold: ctrl.UsageThreshold(),
-		keyTermSplitV:  termSplitV, keyTermSplitH: termSplitH,
+		plasma:         plasmaField, plasmaWidthPct: pc.Width,
+		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
 		keyTermFocusLeft: termFocusLeft, keyTermFocusDown: termFocusDown,
 		keyTermFocusUp: termFocusUp, keyTermFocusRight: termFocusRight,
@@ -441,6 +465,22 @@ type statusExpireMsg struct{ at time.Time }
 type statusMsg struct {
 	byPid map[int]AgentStatus
 	err   error
+}
+
+// plasmaTickMsg advances the deck's plasma panel one frame. Purely cosmetic,
+// so unlike the poll ticks it is only kept armed while the deck body is
+// actually being drawn (see Update / deckShown).
+type plasmaTickMsg struct{}
+
+// plasmaTickInterval paces the plasma at ~6–7 fps. The default speed is slow
+// enough that motion between frames stays sub-cell, so this reads as liquid
+// without the redraw cost of a real frame rate; the deck is also the one
+// screen with no PTY content, so each redraw is cheap.
+const plasmaTickInterval = 150 * time.Millisecond
+
+// schedulePlasmaTick arms one plasma frame tick.
+func schedulePlasmaTick() tea.Cmd {
+	return tea.Tick(plasmaTickInterval, func(time.Time) tea.Msg { return plasmaTickMsg{} })
 }
 
 // usageTickMsg fires on the usage-poll timer; usageMsg carries the result of
@@ -616,9 +656,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	mm, cmd := m.update(msg)
 	if model, ok := mm.(Model); ok {
 		model.syncVisible()
+		// Arm the plasma tick whenever the deck panel (re)appears; the tick
+		// disarms itself when it fires off-deck, keeping at most one pending.
+		if !model.plasmaTicking && model.plasmaShown() && model.plasma.Animated() {
+			model.plasmaTicking = true
+			cmd = tea.Batch(cmd, schedulePlasmaTick())
+		}
 		return model, cmd
 	}
 	return mm, cmd
+}
+
+// plasmaShown reports whether the plasma panel is being drawn right now:
+// the deck is the visible body (mirrors View's branch order — overlays win
+// over the picker screen) and the terminal is wide enough for the split.
+func (m Model) plasmaShown() bool {
+	return m.screen == screenPicker && !m.helpOpen && !m.boardOpen && !m.usageOpen &&
+		m.plasmaWidth() > 0
 }
 
 // syncVisible pushes the currently visible session set to the manager.
@@ -660,7 +714,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		inputW := max(10, m.width-12)
+		// The deck inputs live in the left column, which the plasma panel
+		// narrows; size them to that column or they'd overflow the box border.
+		inputW := max(10, m.width-m.plasmaWidth()-12)
 		m.filter.SetWidth(inputW)
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
@@ -703,6 +759,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dirtyMsg:
 		return m, m.repaintCmd()
+
+	case plasmaTickMsg:
+		if !m.plasmaShown() {
+			m.plasmaTicking = false // dormant; Update re-arms on return
+			return m, nil
+		}
+		m.plasma.Advance(plasmaTickInterval.Seconds())
+		return m, schedulePlasmaTick()
 
 	case statusTickMsg:
 		m.maybeExpireStatus()
@@ -1900,6 +1964,11 @@ func (m Model) deckClick(x, y int) (tea.Model, tea.Cmd, bool) {
 	if by < 0 {
 		return m, nil, false
 	}
+	// The NEW/ACTIVE boxes only span the left column; clicks on the plasma
+	// panel to their right select nothing.
+	if x >= m.width-m.plasmaWidth() {
+		return m, nil, false
+	}
 	L := m.deckLayout(m.height - barHeight)
 
 	// NEW box: content rows are body [1, 1+newContentH); the repo list begins at
@@ -1939,7 +2008,7 @@ func (m Model) deckClick(x, y int) (tea.Model, tea.Cmd, bool) {
 		if cl < 2 {
 			return m, nil, false
 		}
-		display, rowItem := m.activeDisplay(m.width - 4)
+		display, rowItem := m.activeDisplay(m.width - m.plasmaWidth() - 4)
 		start, end := activeWindowStart(rowItem, m.activeCursor, L.activeRows)
 		di := start + (cl - 2)
 		if di < start || di >= end || di >= len(display) {
