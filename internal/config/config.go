@@ -101,6 +101,10 @@ type Keys struct {
 	TermFocusRight string `toml:"term_focus_right"`
 	// Usage opens the usage overlay on the claude screen.
 	Usage string `toml:"usage"`
+	// CommandPalette opens the command palette: a fuzzy-searchable list of every
+	// ct action, each row showing its live keybinding. It teaches the chords the
+	// help overlay documents by letting the user run any action without them.
+	CommandPalette string `toml:"command_palette"`
 }
 
 // Default returns a Config populated with defaults (Root left empty).
@@ -126,7 +130,7 @@ func Default() Config {
 			TermCycle: "", TermZoom: "alt+z", TermClose: "alt+x",
 			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",
 			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
-			Usage: "alt+u",
+			Usage: "alt+u", CommandPalette: "alt+p",
 		},
 		Usage: Usage{Threshold: 50},
 		Plasma: Plasma{

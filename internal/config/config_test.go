@@ -102,6 +102,23 @@ func TestDefaultKeymap(t *testing.T) {
 	}
 }
 
+func TestDefaultCommandPalette(t *testing.T) {
+	if d := Default(); d.Keys.CommandPalette != "alt+p" {
+		t.Fatalf("command_palette default = %q, want alt+p", d.Keys.CommandPalette)
+	}
+}
+
+func TestLoadCommandPaletteOverride(t *testing.T) {
+	cfg := loadTOML(t, "[keys]\ncommand_palette = \"ctrl+k\"\n")
+	if cfg.Keys.CommandPalette != "ctrl+k" {
+		t.Fatalf("command_palette = %q, want ctrl+k", cfg.Keys.CommandPalette)
+	}
+	// A field left unset keeps its default.
+	if cfg.Keys.Cycle != "alt+]" {
+		t.Fatalf("unset default clobbered: cycle = %q", cfg.Keys.Cycle)
+	}
+}
+
 func TestLoadDecodesNewKeys(t *testing.T) {
 	cfg := loadTOML(t, `[keys]
 cycle_back = "alt+p"

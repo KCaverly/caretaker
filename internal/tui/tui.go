@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,10 @@ const (
 	defaultKeyGlobalConfig = "alt+g"  // open home-directory workspace
 	defaultKeyPrompt       = "alt+y"  // new-agent form pre-set for a background home agent
 	defaultKeyUsage        = "alt+u"  // usage overlay (agent screen only)
+	// defaultKeyCommandPalette opens the command palette: a fuzzy-searchable list
+	// of every ct action, each row showing its live keybinding. Distinct from
+	// keyPalette, which is the (legacy-named) agent board.
+	defaultKeyCommandPalette = "alt+p"
 
 	// Terminal pane management — only intercepted when the terminal screen is active.
 	defaultKeyTermSplitV     = "alt+v" // new pane to the right
@@ -168,6 +173,46 @@ type activeItem struct {
 	view WorktreeView
 }
 
+// scopeContent is one diff scope's fully-rendered payload: the pre-styled lines
+// (built once at load, not per frame), the indices of the file-header lines
+// within them (for the J/K jumps), and the summary counts the header shows for
+// this scope (file count and +/− line totals).
+type scopeContent struct {
+	lines     []string
+	fileLines []int
+	files     int
+	add, del  int
+}
+
+// diffState backs the read-only diff viewer. It holds the target worktree, the
+// async-fetch state, and both scope renderings — the "full" scope (default)
+// which shows the vs-base section followed by the uncommitted section, and the
+// "uncommitted" scope which narrows to just the latter. Both are built up front
+// on diffMsg arrival so the `u` toggle is instant. The active scope is selected
+// by scopeUncommitted; offset scrolls it (reset to 0 on toggle). ahead/base feed
+// the header summary and the vs-base section rule.
+type diffState struct {
+	repoName, wtName, key string
+	base                  string // primary-worktree branch to diff against ("" when none)
+	ahead                 int    // commits the branch carries beyond base
+
+	loading          bool
+	err              error
+	scopeUncommitted bool // false = full view (the default)
+
+	full        scopeContent
+	uncommitted scopeContent
+	offset      int
+}
+
+// active returns the scope currently on screen.
+func (d diffState) active() scopeContent {
+	if d.scopeUncommitted {
+		return d.uncommitted
+	}
+	return d.full
+}
+
 // Model is the ct UI: a pinned status bar plus the active screen (picker or an
 // embedded nvim/claude/terminal session).
 type Model struct {
@@ -180,6 +225,7 @@ type Model struct {
 	keyPalette, keyNextAgent, keyPrevAgent   string
 	keyHelp, keyGlobalConfig, keyNotif       string
 	keyPrompt, keyUsage                      string
+	keyCommandPalette                        string
 
 	keyTermSplitV, keyTermSplitH            string
 	keyTermCycle, keyTermZoom, keyTermClose string
@@ -225,6 +271,20 @@ type Model struct {
 	boardOpen   bool
 	boardCursor int // index into the board's navigable rows
 	rootInput   textinput.Model
+
+	// command palette overlay: a fuzzy-searchable list of every ct action, each
+	// row showing its live keybinding, built fresh on each keystroke. The cursor
+	// indexes the filtered list; the input holds the fuzzy query.
+	paletteOpen   bool
+	paletteCursor int
+	paletteInput  textinput.Model
+
+	// read-only diff viewer overlay: a full-body scrollable view of everything
+	// the selected worktree's branch carries beyond main — committed and
+	// uncommitted. diffView holds its target, fetch state, and pre-rendered
+	// content; it is the zero value while closed. Opens over the picker only.
+	diffOpen bool
+	diffView diffState
 
 	// live agent statuses from `claude agents --json`, keyed by pid
 	agentStatus     map[int]AgentStatus
@@ -313,6 +373,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	promptInput.Placeholder = "What should Claude do?"
 	promptInput.Prompt = "› "
 
+	paletteInput := textinput.New()
+	paletteInput.Placeholder = "run a command…"
+	paletteInput.Prompt = "› "
+
 	cycle, picker := ctrl.Keys()
 	if cycle == "" {
 		cycle = defaultKeyCycle
@@ -363,6 +427,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	if usageKey == "" {
 		usageKey = defaultKeyUsage
 	}
+	commandPalette := ctrl.CommandPaletteKey()
+	if commandPalette == "" {
+		commandPalette = defaultKeyCommandPalette
+	}
 	termSplitV, termSplitH, termCycle, termZoom, termClose := ctrl.TermPaneKeys()
 	if termSplitV == "" {
 		termSplitV = defaultKeyTermSplitV
@@ -411,14 +479,16 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
 		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
 		keyPrompt: prompt, keyUsage: usageKey,
-		usageThreshold: ctrl.UsageThreshold(),
-		plasma:         plasmaField, plasmaWidthPct: pc.Width,
+		keyCommandPalette: commandPalette,
+		usageThreshold:    ctrl.UsageThreshold(),
+		plasma:            plasmaField, plasmaWidthPct: pc.Width,
 		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
 		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
 		keyTermFocusLeft: termFocusLeft, keyTermFocusDown: termFocusDown,
 		keyTermFocusUp: termFocusUp, keyTermFocusRight: termFocusRight,
 		filter: filter, nameInput: name, rootInput: rootInput,
 		promptInput:     promptInput,
+		paletteInput:    paletteInput,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
 		attention:       map[int]attnEntry{},
@@ -450,6 +520,22 @@ type createdMsg struct {
 type actionDoneMsg struct{ err error }
 
 type dirtyMsg struct{}
+
+// diffMsg carries one diff fetch's results back to the UI goroutine. It stamps
+// the target worktree key so a result that lands after the user closed or
+// switched the diff is dropped (mirrors loadedMsg's seq-guard philosophy; a key
+// match suffices since only one diff is open at a time). It carries both scopes'
+// data — the committed body+numstat are populated only when the branch has a
+// base to diff against — so both scope renderings can be built at once.
+type diffMsg struct {
+	key             string
+	committedBody   string
+	committedStat   []repo.FileStat
+	uncommittedBody string
+	uncommittedStat []repo.FileStat
+	untracked       []string
+	err             error
+}
 
 // statusTickMsg fires on the status-poll timer; statusMsg carries the result of
 // one `claude agents --json` poll.
@@ -672,7 +758,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // over the picker screen) and the terminal is wide enough for the split.
 func (m Model) plasmaShown() bool {
 	return m.screen == screenPicker && !m.helpOpen && !m.boardOpen && !m.usageOpen &&
-		m.plasmaWidth() > 0
+		!m.paletteOpen && !m.diffOpen && m.plasmaWidth() > 0
 }
 
 // syncVisible pushes the currently visible session set to the manager.
@@ -689,7 +775,10 @@ func (m Model) syncVisible() {
 // terminal screen either the focused pane (zoomed/single) or every pane in
 // the split layout. Mirrors the branch structure of View.
 func (m Model) visibleSessions() []*session.Session {
-	if m.helpOpen || m.boardOpen || m.usageOpen || m.screen == screenPicker || m.screen == screenSetup {
+	// m.diffOpen is redundant today (the diff only opens over the picker, which
+	// already returns nil), but it is listed so a future entry point that opens
+	// the diff over a session can't leak that session's output onto the screen.
+	if m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen || m.screen == screenPicker || m.screen == screenSetup {
 		return nil
 	}
 	if m.current == nil || m.current.ws == nil {
@@ -721,6 +810,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
 		m.promptInput.SetWidth(clamp(m.width-16, 20, 52))
+		m.paletteInput.SetWidth(clamp(m.width-16, 20, 52))
 		// Only the current workspace is resized; background ones are brought up
 		// to date by Activate when they next become current.
 		if m.current != nil {
@@ -759,6 +849,22 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dirtyMsg:
 		return m, m.repaintCmd()
+
+	case diffMsg:
+		// Drop a stale result: the diff was closed, or a newer one opened for a
+		// different worktree, before this fetch returned.
+		if !m.diffOpen || msg.key != m.diffView.key {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setError("diff error: " + msg.err.Error())
+			m.diffOpen = false
+			m.diffView = diffState{}
+			return m, nil
+		}
+		m.diffView.loading = false
+		buildDiffContent(&m.diffView, msg, m.width)
+		return m, nil
 
 	case plasmaTickMsg:
 		if !m.plasmaShown() {
@@ -907,7 +1013,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.forwardMouse(msg)
 		return m, nil
 	case tea.MouseWheelMsg:
-		if m.screen == screenPicker && !m.helpOpen && !m.boardOpen {
+		// The diff viewer owns the wheel while open: it scrolls the diff rather
+		// than falling through to the deck lists or a session beneath.
+		if m.diffOpen {
+			return m.diffWheel(msg)
+		}
+		if m.screen == screenPicker && !m.helpOpen && !m.boardOpen && !m.paletteOpen {
 			return m.deckWheel(msg)
 		}
 		m.forwardMouse(msg)
@@ -961,6 +1072,11 @@ func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 		m.promptInput, cmd = m.promptInput.Update(msg)
 		cmds = append(cmds, cmd)
 	}
+	if m.paletteInput.Focused() {
+		var cmd tea.Cmd
+		m.paletteInput, cmd = m.paletteInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 	return m, tea.Batch(cmds...)
 }
 
@@ -978,13 +1094,27 @@ func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 //     bracketed-paste mode.
 func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 	onSession := m.screen != screenPicker && m.screen != screenSetup &&
-		!m.helpOpen && !m.boardOpen && !m.usageOpen
+		!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen
 	if onSession {
 		if s := m.activeSession(); s != nil {
 			m = m.dismissHint() // first input into a session retires the hint
 			s.Paste(msg.Content)
 		}
 		return m, nil
+	}
+	// The diff viewer has no input field, so a paste is swallowed rather than
+	// routed to the deck filter (which stays focused across screens).
+	if m.diffOpen {
+		return m, nil
+	}
+	// The palette owns its input exclusively while open. Routing by focus here
+	// would also hand the paste to the deck filter, which stays focused across
+	// screens — the query must not be duplicated into it.
+	if m.paletteOpen {
+		var cmd tea.Cmd
+		m.paletteInput, cmd = m.paletteInput.Update(msg)
+		m.paletteCursor = 0
+		return m, cmd
 	}
 	mm, cmd := m.routeToFocusedInputs(msg)
 	// Mirror handleNewKey: keep the repo matches in sync when the paste lands
@@ -1324,6 +1454,266 @@ func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 	return model, cmd
 }
 
+// --- command palette ---
+
+// paletteCmd is one executable row of the command palette: a verb-phrase
+// title, the live keybinding shown as a dim right-aligned hint (may be
+// empty), and the action run when the row is chosen.
+type paletteCmd struct {
+	title string
+	hint  string
+	run   func(Model) (tea.Model, tea.Cmd)
+}
+
+// paletteCommands builds the palette's row list fresh on each keystroke (cheap,
+// mirroring buildBoard's philosophy). Rows are availability-filtered at build
+// time: a row appears only when it is executable right now, so the palette never
+// offers an action that would no-op. The order groups related actions: open,
+// create, view navigation, agents, terminal panes, then the misc/global row.
+func (m Model) paletteCommands() []paletteCmd {
+	var cmds []paletteCmd
+
+	// 1. Open an existing workspace — one row per active worktree, hinted with
+	// the deck's 1/2/3 recency jump digit when it has one.
+	for _, it := range m.active {
+		repoName, wtName, path := it.repo.Name, it.view.WT.Name, it.view.WT.Path
+		hint := ""
+		if r := m.recentRank[wsKey(repoName, wtName)]; r >= 1 && r <= 3 {
+			hint = strconv.Itoa(r)
+		}
+		cmds = append(cmds, paletteCmd{
+			title: "open " + repoName + "/" + wtName,
+			hint:  hint,
+			run: func(m Model) (tea.Model, tea.Cmd) {
+				return m.activate(repoName, wtName, path)
+			},
+		})
+	}
+
+	// 1b. View a worktree's diff — one row per active worktree, right after the
+	// open rows. Running it returns to the deck, moves the active cursor onto
+	// that worktree, and opens the diff, so a later `x` from inside the diff
+	// operates on the matching selected row.
+	for _, it := range m.active {
+		key := wsKey(it.repo.Name, it.view.WT.Name)
+		cmds = append(cmds, paletteCmd{
+			title: "view diff: " + it.repo.Name + "/" + it.view.WT.Name,
+			run: func(m Model) (tea.Model, tea.Cmd) {
+				idx := -1
+				for i, a := range m.active {
+					if wsKey(a.repo.Name, a.view.WT.Name) == key {
+						idx = i
+						break
+					}
+				}
+				if idx < 0 {
+					return m, nil // the worktree is gone; no-op
+				}
+				m.screen = screenPicker
+				m.focus = focusActive
+				m.activeCursor = idx
+				return m.openDiff(m.active[idx])
+			},
+		})
+	}
+
+	// 2. Create a new worktree — one row per known repo. Runs from any screen by
+	// returning to the deck first, then entering the same create flow the deck's
+	// enter key uses.
+	for _, g := range m.groups {
+		r := g.Repo
+		cmds = append(cmds, paletteCmd{
+			title: "new worktree in " + r.Name + "…",
+			run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = screenPicker
+				return m.beginCreateFor(r)
+			},
+		})
+	}
+
+	// 3. View navigation — only meaningful with an active workspace.
+	if m.current != nil {
+		cmds = append(cmds,
+			paletteCmd{title: "go to editor", hint: m.keyGotoEditor, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenEditor) }},
+			paletteCmd{title: "go to agent", hint: m.keyGotoAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenAgent) }},
+			paletteCmd{title: "go to terminal", hint: m.keyGotoTerm, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenTerminal) }},
+		)
+		if m.screen != screenPicker {
+			cmds = append(cmds, paletteCmd{title: "back to deck", hint: m.keyPicker, run: func(m Model) (tea.Model, tea.Cmd) {
+				// Replicates the keyPicker branch of handleSessionKey.
+				if m.current != nil {
+					if m.lastScreens == nil {
+						m.lastScreens = map[string]screen{}
+					}
+					m.lastScreens[m.current.key] = m.screen
+				}
+				m.screen = screenPicker
+				if len(m.active) > 0 {
+					m.focus = focusActive
+				}
+				return m, m.loadCmd()
+			}})
+		}
+	}
+
+	// 4. Agents — the board, the new-agent launchers, agent rotation (only with a
+	// pool worth rotating), and the home workspace.
+	cmds = append(cmds,
+		paletteCmd{title: "open agent board", hint: m.keyPalette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
+		paletteCmd{title: "new agent…", run: func(m Model) (tea.Model, tea.Cmd) { return m.openNewAgentForm(), nil }},
+		paletteCmd{title: "new background agent (quick prompt)…", hint: m.keyPrompt, run: func(m Model) (tea.Model, tea.Cmd) { return m.openQuickPrompt() }},
+	)
+	if m.current != nil && m.current.ws != nil && len(m.current.ws.Agents) >= 2 {
+		cmds = append(cmds,
+			paletteCmd{title: "next agent", hint: m.keyNextAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(+1) }},
+			paletteCmd{title: "previous agent", hint: m.keyPrevAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(-1) }},
+		)
+	}
+	cmds = append(cmds, paletteCmd{title: "open home workspace", hint: m.keyGlobalConfig, run: func(m Model) (tea.Model, tea.Cmd) { return m.activateGlobalConfig() }})
+
+	// 5. Terminal panes — each switches to the terminal screen first, so the
+	// palette can split/zoom/close from any screen (strictly more capable than
+	// the chords, which are terminal-screen only).
+	if m.current != nil {
+		cmds = append(cmds,
+			paletteCmd{title: "split terminal right", hint: m.keyTermSplitV, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = screenTerminal
+				key := m.current.key
+				w, h := m.sessionSize()
+				_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitV, w, h)
+				m.mgr.ResizeTermPanes(key, w, h)
+				return m, nil
+			}},
+			paletteCmd{title: "split terminal below", hint: m.keyTermSplitH, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = screenTerminal
+				key := m.current.key
+				w, h := m.sessionSize()
+				_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitH, w, h)
+				m.mgr.ResizeTermPanes(key, w, h)
+				return m, nil
+			}},
+			paletteCmd{title: "zoom terminal pane", hint: m.keyTermZoom, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = screenTerminal
+				return m.toggleZoom()
+			}},
+			paletteCmd{title: "close terminal pane", hint: m.keyTermClose, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = screenTerminal
+				key := m.current.key
+				w, h := m.sessionSize()
+				_ = m.mgr.CloseTermPane(key)
+				m.mgr.ResizeTermPanes(key, w, h)
+				return m, nil
+			}},
+		)
+	}
+
+	// 6. Misc / global — always available. Quit sits last and reuses the picker's
+	// ctrl+c guard: with a busy hosted agent it drops to the deck and asks first.
+	cmds = append(cmds,
+		paletteCmd{title: "show plan usage", hint: m.keyUsage, run: func(m Model) (tea.Model, tea.Cmd) {
+			m.usageOpen = true
+			return m, nil
+		}},
+		paletteCmd{title: "refresh deck", hint: "r", run: func(m Model) (tea.Model, tea.Cmd) {
+			return m, m.loadCmd()
+		}},
+		paletteCmd{title: "help", hint: m.keyHelp, run: func(m Model) (tea.Model, tea.Cmd) {
+			m.helpOpen = true
+			return m, nil
+		}},
+		paletteCmd{title: "quit ct", hint: "ctrl+c", run: func(m Model) (tea.Model, tea.Cmd) {
+			if n := m.busyHostedAgents(""); n > 0 {
+				m.screen = screenPicker
+				m.mode = modeConfirmQuit
+				m.status = fmt.Sprintf("%d busy agent(s) running — quit anyway? (y/n)", n)
+				return m, nil
+			}
+			return m, tea.Quit
+		}},
+	)
+
+	return cmds
+}
+
+// filteredPaletteCommands returns the palette rows matching the current query:
+// the full list in natural order when the query is empty, otherwise the fuzzy
+// matches in score order (best first), mirroring the deck's repo filter.
+func (m Model) filteredPaletteCommands() []paletteCmd {
+	all := m.paletteCommands()
+	q := strings.TrimSpace(m.paletteInput.Value())
+	if q == "" {
+		return all
+	}
+	titles := make([]string, len(all))
+	for i, c := range all {
+		titles[i] = c.title
+	}
+	res := fuzzy.Find(q, titles)
+	out := make([]paletteCmd, 0, len(res))
+	for _, mt := range res {
+		out = append(out, all[mt.Index])
+	}
+	return out
+}
+
+// openPalette shows the command palette with a fresh empty query and the cursor
+// at the top. It closes the board/form/usage overlays first so overlays never
+// stack, and focuses the query input.
+func (m Model) openPalette() (tea.Model, tea.Cmd) {
+	m.paletteOpen = true
+	m.boardOpen = false
+	m.formOpen = false
+	m.usageOpen = false
+	m.paletteCursor = 0
+	m.paletteInput.SetValue("")
+	return m, m.paletteInput.Focus()
+}
+
+// closePalette resets the palette to its dormant state (blurred, cleared input).
+func (m Model) closePalette() Model {
+	m.paletteOpen = false
+	m.paletteInput.Blur()
+	m.paletteInput.SetValue("")
+	return m
+}
+
+// handlePalette routes key events while the command palette is open: esc or the
+// palette key closes it; up/ctrl+p and down/ctrl+n move the cursor (clamped to
+// the filtered list); enter closes the palette and then runs the selected row on
+// the post-close model; every other key is typed into the query, resetting the
+// cursor to the top whenever the query changed. Up/down never fall through to the
+// input.
+func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", m.keyCommandPalette:
+		return m.closePalette(), nil
+	case "up", "ctrl+p":
+		if m.paletteCursor > 0 {
+			m.paletteCursor--
+		}
+		return m, nil
+	case "down", "ctrl+n":
+		if n := len(m.filteredPaletteCommands()); m.paletteCursor < n-1 {
+			m.paletteCursor++
+		}
+		return m, nil
+	case "enter":
+		cmds := m.filteredPaletteCommands()
+		if m.paletteCursor < 0 || m.paletteCursor >= len(cmds) {
+			return m.closePalette(), nil
+		}
+		sel := cmds[m.paletteCursor]
+		return sel.run(m.closePalette())
+	}
+	before := m.paletteInput.Value()
+	var cmd tea.Cmd
+	m.paletteInput, cmd = m.paletteInput.Update(msg)
+	if m.paletteInput.Value() != before {
+		m.paletteCursor = 0
+	}
+	return m, cmd
+}
+
 // activateGlobalConfig opens the home-directory workspace (synthetic key "~/config"),
 // starting it fresh on first use and resuming its agent pool on subsequent presses.
 func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
@@ -1585,6 +1975,25 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.helpOpen = true
 		return m, nil
 	}
+	// The command palette is modal and reachable from anywhere (including over the
+	// usage/board overlays, so alt+p still opens it while those are up). It owns
+	// its own routing while open. Don't open it over a picker modal confirm
+	// (create/remove/quit/stop), whose keys must reach that prompt.
+	if m.paletteOpen {
+		return m.handlePalette(msg)
+	}
+	if msg.String() == m.keyCommandPalette {
+		if m.screen == screenPicker && m.mode != modeNormal {
+			return m, nil
+		}
+		return m.openPalette()
+	}
+	// The diff viewer is modal and owns its own routing while open (scroll,
+	// scope toggle, and the `x` hop into the remove flow); every other key is
+	// swallowed so no deck key leaks through beneath it.
+	if m.diffOpen {
+		return m.handleDiff(msg)
+	}
 	// The usage overlay is modal like the board, but read-only: it only closes
 	// on esc or its own key, and swallows everything else so no keystroke
 	// leaks into the session underneath.
@@ -1649,7 +2058,7 @@ func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
 func (m Model) isReservedActionKey(s string) bool {
 	switch s {
 	case m.keyCycle, m.keyCycleBack, m.keyPicker, m.keyPalette, m.keyNotif, m.keyPrompt,
-		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent,
+		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent, m.keyCommandPalette,
 		m.keyGotoEditor, m.keyGotoAgent, m.keyGotoTerm:
 		return true
 	}
@@ -1902,7 +2311,7 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		if m.paneZoomAt(mo.X, mo.Y) {
 			return m.toggleZoom()
 		}
-		if m.screen == screenPicker && !m.helpOpen {
+		if m.screen == screenPicker && !m.helpOpen && !m.paletteOpen && !m.diffOpen {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
 				return mm, cmd
 			}
@@ -1911,7 +2320,7 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		// program running in it. Panes aren't drawn while an overlay is up, so a
 		// click then must not steal pane focus.
 		if m.screen == screenTerminal && m.current != nil &&
-			!m.helpOpen && !m.boardOpen && !m.usageOpen && mo.Y >= barHeight {
+			!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen && mo.Y >= barHeight {
 			w, h := m.sessionSize()
 			m.mgr.FocusTermPaneAt(m.current.key, mo.X, mo.Y-barHeight, w, h)
 		}
@@ -2062,6 +2471,13 @@ func (m Model) forwardMouse(msg tea.MouseMsg) {
 	if m.screen == screenPicker {
 		return
 	}
+	// A full-body overlay (help/board/usage/palette) covers the session, so no
+	// mouse event may reach it. Only the palette needs the explicit guard here —
+	// help/board/usage are handled by the callers — but returning early keeps
+	// every event out of the session drawn beneath the palette.
+	if m.paletteOpen {
+		return
+	}
 	mo := msg.Mouse()
 	if mo.Y < barHeight {
 		return
@@ -2194,11 +2610,18 @@ func (m Model) beginCreate() (tea.Model, tea.Cmd) {
 	if m.newCursor < 0 || m.newCursor >= len(m.repoMatches) {
 		return m, nil
 	}
-	m.pendingRepo = m.repoMatches[m.newCursor]
+	return m.beginCreateFor(m.repoMatches[m.newCursor])
+}
+
+// beginCreateFor enters the new-worktree naming form for repo r. Shared by
+// beginCreate (which resolves r from newCursor) and the command palette's
+// "new worktree in <repo>…" rows, so both set up identical form state.
+func (m Model) beginCreateFor(r repo.Repo) (tea.Model, tea.Cmd) {
+	m.pendingRepo = r
 	m.mode = modeCreateName
 	m.filter.Blur()
 	m.nameInput.SetValue("")
-	m.status = "new worktree in " + m.pendingRepo.Name
+	m.status = "new worktree in " + r.Name
 	return m, m.nameInput.Focus()
 }
 
@@ -2234,17 +2657,14 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.stopWorkspace(key)
 			return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+it.view.WT.Name))
 		}
+	case "v":
+		// Open the read-only diff of everything this branch carries beyond main.
+		if it, ok := m.selectedActive(); ok {
+			return m.openDiff(it)
+		}
 	case "x":
 		if it, ok := m.selectedActive(); ok && !it.view.WT.IsMain {
-			m.mode = modeConfirmRemove
-			// git worktree remove --force discards uncommitted work silently, so
-			// when the worktree is dirty the prompt must say so. Either way the
-			// user picks whether the branch goes with it.
-			if it.view.Dirty {
-				m.status = fmt.Sprintf("remove worktree %q? UNCOMMITTED CHANGES will be lost. (y = remove + delete branch / b = keep branch / n)", it.view.WT.Name)
-			} else {
-				m.status = fmt.Sprintf("remove worktree %q? (y = remove + delete branch / b = keep branch / n)", it.view.WT.Name)
-			}
+			m = m.beginRemove(it)
 		}
 	case "1", "2", "3":
 		// The deck badges these ranks next to the most recently opened
@@ -2254,6 +2674,22 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// beginRemove enters the remove-worktree confirm prompt for it, with a
+// dirty-aware status line (git worktree remove --force discards uncommitted work
+// silently, so the prompt must warn when the tree is dirty). Both the deck's `x`
+// key and the diff viewer's `x` (the review loop) route through here so the two
+// prompt texts can never drift. The caller guards against the main worktree,
+// which can't be removed.
+func (m Model) beginRemove(it activeItem) Model {
+	m.mode = modeConfirmRemove
+	if it.view.Dirty {
+		m.status = fmt.Sprintf("remove worktree %q? UNCOMMITTED CHANGES will be lost. (y = remove + delete branch / b = keep branch / v = view diff / n)", it.view.WT.Name)
+	} else {
+		m.status = fmt.Sprintf("remove worktree %q? (y = remove + delete branch / b = keep branch / v = view diff / n)", it.view.WT.Name)
+	}
+	return m
 }
 
 // rankedActive returns the active item badged with the given recency rank
@@ -2311,6 +2747,17 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // can't move while the prompt is modal), mirroring the other confirm handlers.
 func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	// "v" exits the prompt and opens the diff for the same worktree; from the
+	// diff, `x` loops back to this prompt (the review loop).
+	if key == "v" {
+		it, ok := m.selectedActive()
+		m.mode = modeNormal
+		m.status = ""
+		if !ok {
+			return m, nil
+		}
+		return m.openDiff(it)
+	}
 	if key == "y" || key == "b" {
 		deleteBranch := key == "y"
 		it, ok := m.selectedActive()
@@ -2363,6 +2810,167 @@ func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.mode = modeNormal
 	m.status = ""
 	return m, nil
+}
+
+// --- diff viewer ---
+
+// openDiff opens the read-only diff overlay for it: it stamps the target,
+// switches into the loading state, and returns the command that runs the git
+// calls off the UI goroutine. The result arrives as a diffMsg keyed to the
+// target so a stale fetch (the diff was closed or reopened elsewhere meanwhile)
+// is dropped on arrival.
+func (m Model) openDiff(it activeItem) (tea.Model, tea.Cmd) {
+	m.diffOpen = true
+	m.diffView = diffState{
+		repoName: it.repo.Name,
+		wtName:   it.view.WT.Name,
+		key:      wsKey(it.repo.Name, it.view.WT.Name),
+		base:     it.view.BaseBranch,
+		ahead:    it.view.Ahead,
+		loading:  true,
+	}
+	return m, m.fetchDiffCmd(it)
+}
+
+// fetchDiffCmd runs one diff fetch off the UI goroutine: the committed diff and
+// numstat versus the base (only when the branch has a base to compare against),
+// the uncommitted diff and numstat, and the untracked-file list. Any git error
+// short-circuits into the message's err, which closes the overlay with a flash.
+func (m Model) fetchDiffCmd(it activeItem) tea.Cmd {
+	wt := it.view.WT
+	base := it.view.BaseBranch
+	key := wsKey(it.repo.Name, it.view.WT.Name)
+	return func() tea.Msg {
+		msg := diffMsg{key: key}
+		if base != "" {
+			body, err := repo.DiffAgainstBase(wt, base)
+			if err != nil {
+				msg.err = err
+				return msg
+			}
+			stat, err := repo.NumstatAgainstBase(wt, base)
+			if err != nil {
+				msg.err = err
+				return msg
+			}
+			msg.committedBody, msg.committedStat = body, stat
+		}
+		body, err := repo.DiffUncommitted(wt)
+		if err != nil {
+			msg.err = err
+			return msg
+		}
+		stat, err := repo.NumstatUncommitted(wt)
+		if err != nil {
+			msg.err = err
+			return msg
+		}
+		msg.uncommittedBody, msg.uncommittedStat = body, stat
+		untracked, err := repo.UntrackedFiles(wt)
+		if err != nil {
+			msg.err = err
+			return msg
+		}
+		msg.untracked = untracked
+		return msg
+	}
+}
+
+// diffChromeRows is the number of fixed rows renderDiff draws around the
+// scrollable body: the header, the faint rule beneath it, and the footer legend.
+const diffChromeRows = 3
+
+// diffBodyHeight is the number of scrollable content rows the diff viewer shows,
+// kept in step with renderDiff's own budget so scroll clamping and rendering
+// agree on the window size.
+func (m Model) diffBodyHeight() int {
+	return max(1, m.height-barHeight-diffChromeRows)
+}
+
+// handleDiff routes key events while the diff viewer is open: esc/q close it,
+// the movement keys scroll (clamped to the content), J/K jump between file
+// headers, u toggles the scope, and x closes the diff and drops into the remove
+// flow for the same worktree. Everything else is swallowed.
+func (m Model) handleDiff(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	sc := m.diffView.active()
+	avail := m.diffBodyHeight()
+	maxOff := max(0, len(sc.lines)-avail)
+	switch msg.String() {
+	case "esc", "q":
+		m.diffOpen = false
+		m.diffView = diffState{}
+	case "j", "down":
+		m.diffView.offset = clamp(m.diffView.offset+1, 0, maxOff)
+	case "k", "up":
+		m.diffView.offset = clamp(m.diffView.offset-1, 0, maxOff)
+	case "ctrl+d":
+		m.diffView.offset = clamp(m.diffView.offset+avail/2, 0, maxOff)
+	case "ctrl+u":
+		m.diffView.offset = clamp(m.diffView.offset-avail/2, 0, maxOff)
+	case "g":
+		m.diffView.offset = 0
+	case "G":
+		m.diffView.offset = maxOff
+	case "J", "]":
+		m.diffView.offset = nextFileLine(sc.fileLines, m.diffView.offset, maxOff)
+	case "K", "[":
+		m.diffView.offset = prevFileLine(sc.fileLines, m.diffView.offset)
+	case "u":
+		m.diffView.scopeUncommitted = !m.diffView.scopeUncommitted
+		m.diffView.offset = 0
+	case "x":
+		// Close the diff and re-enter the remove flow for the same worktree. The
+		// cursor can't have moved while the diff was modal, so selectedActive is
+		// still the diff's target.
+		it, ok := m.selectedActive()
+		m.diffOpen = false
+		m.diffView = diffState{}
+		if ok && !it.view.WT.IsMain {
+			m = m.beginRemove(it)
+		}
+	}
+	return m, nil
+}
+
+// diffWheel scrolls the open diff by three lines per wheel notch, clamped to the
+// content.
+func (m Model) diffWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	mo := msg.Mouse()
+	delta := 3
+	if mo.Button == tea.MouseWheelUp {
+		delta = -3
+	} else if mo.Button != tea.MouseWheelDown {
+		return m, nil
+	}
+	sc := m.diffView.active()
+	maxOff := max(0, len(sc.lines)-m.diffBodyHeight())
+	m.diffView.offset = clamp(m.diffView.offset+delta, 0, maxOff)
+	return m, nil
+}
+
+// nextFileLine returns the offset of the first file-header line strictly past
+// the current offset (clamped so it never scrolls past the bottom), or the
+// bottom itself when there is no later file header.
+func nextFileLine(fileLines []int, offset, maxOff int) int {
+	for _, i := range fileLines {
+		if i > offset {
+			return clamp(i, 0, maxOff)
+		}
+	}
+	return maxOff
+}
+
+// prevFileLine returns the offset of the last file-header line strictly before
+// the current offset, or the top (0) when there is none.
+func prevFileLine(fileLines []int, offset int) int {
+	prev := 0
+	for _, i := range fileLines {
+		if i >= offset {
+			break
+		}
+		prev = i
+	}
+	return prev
 }
 
 // stopWorkspace closes a workspace's sessions (dropping its stale attention

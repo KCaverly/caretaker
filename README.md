@@ -40,6 +40,7 @@ goto_agent  = "alt+2"  # jump to the agent view
 goto_term   = "alt+3"  # jump to the terminal view
 picker      = "ctrl+g" # return to the CT picker
 help        = "f1"     # toggle the key/legend overlay (also "?" in the deck)
+command_palette = "alt+p" # fuzzy-searchable list of every action + its key
 
 # Terminal-screen-only pane keys.
 term_split_v    = "alt+v"  # new pane to the right
@@ -84,7 +85,10 @@ right signals it. The active repo / worktree shows on the right.
   worktrees grouped by repo (`●` running · `○` stopped · `✷` uncommitted changes). Within each
   repo, worktrees are ordered by when you last opened them in ct (most recent first), falling
   back to git commit time for ones you haven't opened yet. The three most-recently-opened
-  worktrees overall get a `1`/`2`/`3` rank in the left column. Last-opened times are persisted to
+  worktrees overall get a `1`/`2`/`3` rank in the left column. Each row also shows how far its
+  branch is ahead/behind the repo's main branch (`↑N ↓M`, right-aligned), and the selected row
+  expands a `└` detail line with the divergence, uncommitted diffstat, last commit subject, and
+  age. Last-opened times are persisted to
   `$XDG_STATE_HOME/ct/state.json` (default `~/.local/state/ct/state.json`).
 - Pressing **enter** on a worktree **activates** it: ct starts nvim + claude + a terminal in
   that worktree and drops you into the nvim view. The session segments light up and the active
@@ -98,10 +102,18 @@ right signals it. The active repo / worktree shows on the right.
   that view (the session icons are inert until a workspace is active). Sessions keep running —
   switching never relaunches them, and they persist for ct's lifetime.
 
-Picker keys: `tab` switch section · `enter` open · `d` stop · `x` remove · `r` refresh · `?` help · `ctrl+c` quit.
+Picker keys: `tab` switch section · `enter` open · `d` stop · `v` view diff · `x` remove · `r` refresh · `?` help · `ctrl+c` quit.
+
+`v` opens a read-only diff of everything the branch carries beyond main (committed + uncommitted;
+`u` narrows it to just the uncommitted changes), also offered from the remove prompt so you can
+review a worktree before deleting it.
 
 Press **`?`** (in the deck) or **`f1`** (anywhere, including inside a session) for a key + legend
 overlay; any key closes it.
+
+Press **`alt+p`** (anywhere) for the **command palette**: a fuzzy-searchable list of every ct action
+with its live key shown alongside, so you can run any action — and passively learn its chord —
+without memorizing the reserved keys; `enter` runs the selected row, `esc` closes.
 
 ## Layout
 

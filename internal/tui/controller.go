@@ -49,6 +49,21 @@ type WorktreeView struct {
 	Live       bool  // has running sessions
 	Dirty      bool  // uncommitted changes
 	CommitTime int64 // HEAD commit time (unix seconds), fallback sort key
+
+	// Git work-state, filled in Load. Ahead/Behind count how far the branch has
+	// diverged from the repo's main branch; HasBase gates whether that
+	// comparison was available at all (false for the main worktree, a detached
+	// primary tree, or on error). Add/Del are the uncommitted diffstat vs HEAD
+	// (only computed when Dirty). Subject is the branch tip's commit subject.
+	Ahead, Behind int
+	HasBase       bool
+	Add, Del      int
+	Subject       string
+
+	// BaseBranch is the repo's primary-worktree branch that Ahead/Behind was
+	// measured against — the base the diff viewer diffs this branch against.
+	// Empty when unavailable (the main worktree, a detached primary tree).
+	BaseBranch string
 }
 
 // Group is a repo and its worktrees.
@@ -83,8 +98,16 @@ func (c *Controller) Load() ([]Group, error) {
 				<-sem
 				return // skip repos that fail to list, as before
 			}
-			tips, _ := repo.BranchTipTimes(r)
+			tips, _ := repo.BranchTips(r)
 			<-sem
+
+			// The primary worktree's branch is the base every other worktree's
+			// ahead/behind is measured against; empty (a detached main) leaves
+			// ahead/behind unavailable everywhere.
+			mainBranch := ""
+			if len(wts) > 0 {
+				mainBranch = wts[0].Branch
+			}
 
 			views := make([]WorktreeView, len(wts))
 			var wtWG sync.WaitGroup
@@ -95,7 +118,25 @@ func (c *Controller) Load() ([]Group, error) {
 					sem <- struct{}{}
 					defer func() { <-sem }()
 					st, _ := repo.WorktreeStatus(wt)
-					views[j] = WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: tips[wt.Branch]}
+					tip := tips[wt.Branch]
+					v := WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: tip.Time, Subject: tip.Subject}
+					// Record the base every non-main worktree's ahead/behind was
+					// measured against, so the diff viewer can diff against it.
+					if !wt.IsMain {
+						v.BaseBranch = mainBranch
+					}
+					if ahead, behind, ok := repo.AheadBehind(wt, mainBranch); ok {
+						v.Ahead, v.Behind, v.HasBase = ahead, behind, true
+					}
+					// The dirty flag already covers untracked-only trees; the
+					// diffstat (staged+unstaged vs HEAD) only adds value when there
+					// are tracked changes, so gate the extra subprocess on Dirty.
+					if st.Dirty {
+						if add, del, err := repo.UncommittedDiffstat(wt); err == nil {
+							v.Add, v.Del = add, del
+						}
+					}
+					views[j] = v
 				}()
 			}
 			wtWG.Wait()
@@ -161,6 +202,9 @@ func (c *Controller) PromptKey() string { return c.cfg.Keys.Prompt }
 
 // UsageKey returns the key that opens the usage overlay on the agent screen.
 func (c *Controller) UsageKey() string { return c.cfg.Keys.Usage }
+
+// CommandPaletteKey returns the key that opens the command palette.
+func (c *Controller) CommandPaletteKey() string { return c.cfg.Keys.CommandPalette }
 
 // UsageThreshold returns the utilization percent at/above which the bar's
 // usage gauge appears (0 = always, >100 = never).

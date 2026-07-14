@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -341,6 +342,45 @@ func TestDeckClickActiveSection(t *testing.T) {
 	}
 }
 
+// TestDeckClickDetailLineMisses proves the └ work-state detail line under the
+// focused worktree row is not a click target: its rowItem entry is -1 (like a
+// repo header), so a click on it neither selects nor activates anything.
+func TestDeckClickDetailLineMisses(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	// Give the cursor row work-state so its detail line actually renders.
+	m.active[0].view.HasBase = true
+	m.active[0].view.Ahead = 2
+
+	L := m.deckLayout(m.height - barHeight)
+	display, rowItem := m.activeDisplay(m.width - 4)
+	start, _ := activeWindowStart(rowItem, m.activeCursor, L.activeRows)
+	// display = [caretaker(-1), feat-login(0), └ detail(-1), bugfix(1), api(-1), spike(2)].
+	if len(rowItem) != 6 || rowItem[2] != -1 || !strings.Contains(display[2], "└") {
+		t.Fatalf("expected the detail line at display index 2 with rowItem -1, got %v", rowItem)
+	}
+	yRow := func(di int) int { return barHeight + L.newOuterH + 1 + 2 + (di - start) }
+
+	// A click on the detail line is a miss: unhandled, cursor and focus intact.
+	mm, _, ok := m.deckClick(5, yRow(2))
+	m = mm.(Model)
+	if ok {
+		t.Error("clicking the detail line should not be handled")
+	}
+	if m.activeCursor != 0 || m.focus != focusActive || m.current != nil {
+		t.Fatalf("detail-line click must not select or activate: cursor=%d focus=%v current=%+v",
+			m.activeCursor, m.focus, m.current)
+	}
+
+	// The row beneath it (bugfix, shifted down by the detail line) still selects.
+	mm, _, ok = m.deckClick(5, yRow(3))
+	m = mm.(Model)
+	if !ok || m.activeCursor != 1 {
+		t.Fatalf("click below the detail line should select bugfix: ok=%v cursor=%d", ok, m.activeCursor)
+	}
+}
+
 func TestDeckClickOpensSelectedWorktree(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	ctrl := &Controller{cfg: config.Config{
@@ -645,6 +685,222 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	}
 }
 
+func TestCommandPaletteToggle(t *testing.T) {
+	m := sampleModel()
+
+	// alt+p opens the palette from the deck.
+	mm, _ := m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if !m.paletteOpen {
+		t.Fatal("alt+p should open the command palette")
+	}
+	// alt+p again closes it.
+	mm, _ = m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("alt+p should close the command palette")
+	}
+	// esc closes it too.
+	mm, _ = m.handleKey(altKey('p'))
+	m = mm.(Model)
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("esc should close the command palette")
+	}
+}
+
+// TestCommandPaletteClosesOtherOverlays: opening the palette must never stack on
+// top of the board or usage overlays.
+func TestCommandPaletteClosesOtherOverlays(t *testing.T) {
+	m := sampleModel()
+	m.boardOpen = true
+	m.usageOpen = true
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	if !m.paletteOpen || m.boardOpen || m.usageOpen {
+		t.Fatalf("opening the palette should close other overlays: palette=%v board=%v usage=%v",
+			m.paletteOpen, m.boardOpen, m.usageOpen)
+	}
+}
+
+// TestCommandPaletteBlockedDuringConfirm: a picker modal confirm owns its keys,
+// so alt+p must not open over it.
+func TestCommandPaletteBlockedDuringConfirm(t *testing.T) {
+	m := sampleModel() // screen is the picker
+	m.mode = modeConfirmRemove
+	mm, _ := m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("alt+p must not open over a picker modal confirm")
+	}
+}
+
+func TestCommandPaletteFilter(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	all := len(m.filteredPaletteCommands())
+	m.paletteInput.SetValue("help")
+	got := m.filteredPaletteCommands()
+	if len(got) == 0 || len(got) >= all {
+		t.Fatalf("query should narrow the list: all=%d got=%d", all, len(got))
+	}
+	found := false
+	for _, c := range got {
+		if c.title == "help" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("query 'help' should still match the help row")
+	}
+}
+
+// TestCommandPaletteCursorResetsOnQueryChange: typing that changes the query
+// snaps the cursor back to the top of the (re-filtered) list.
+func TestCommandPaletteCursorResetsOnQueryChange(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	if m.paletteCursor == 0 {
+		t.Fatal("down should have moved the cursor off the top")
+	}
+
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: 'h', Text: "h"})
+	m = mm.(Model)
+	if m.paletteCursor != 0 {
+		t.Fatalf("cursor should reset to 0 on query change, got %d", m.paletteCursor)
+	}
+}
+
+// TestCommandPaletteCursorClamped: the cursor never runs off either end of the
+// filtered list.
+func TestCommandPaletteCursorClamped(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	n := len(m.filteredPaletteCommands())
+
+	// Up at the top stays at 0.
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = mm.(Model)
+	if m.paletteCursor != 0 {
+		t.Fatalf("up at the top should stay at 0, got %d", m.paletteCursor)
+	}
+	// Down well past the end clamps at n-1.
+	for i := 0; i < n+5; i++ {
+		mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+		m = mm.(Model)
+	}
+	if m.paletteCursor != n-1 {
+		t.Fatalf("down should clamp at %d, got %d", n-1, m.paletteCursor)
+	}
+}
+
+// TestCommandPaletteAvailability: view-navigation rows only appear with an
+// active workspace.
+func TestCommandPaletteAvailability(t *testing.T) {
+	m := sampleModel() // no current workspace
+	for _, c := range m.paletteCommands() {
+		if c.title == "go to editor" {
+			t.Fatal("no workspace should not offer 'go to editor'")
+		}
+	}
+
+	m2 := modelWithAgents(1)
+	found := false
+	for _, c := range m2.paletteCommands() {
+		if c.title == "go to editor" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("an active workspace should offer 'go to editor'")
+	}
+}
+
+// TestCommandPaletteRunGotoEditor: enter on the "go to editor" row closes the
+// palette and switches the screen.
+func TestCommandPaletteRunGotoEditor(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenTerminal
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	m.paletteInput.SetValue("editor") // only "go to editor" matches
+	m.paletteCursor = 0
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Error("enter should close the palette")
+	}
+	if m.screen != screenEditor {
+		t.Fatalf("enter on 'go to editor' should switch to editor, got %v", m.screen)
+	}
+}
+
+// TestCommandPaletteRunOpenWorktree: enter on an "open <repo>/<wt>" row runs
+// activate against a real (cheap-child) manager.
+func TestCommandPaletteRunOpenWorktree(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+	dir := t.TempDir()
+	m.groups = []Group{{Repo: repo.Repo{Name: "repo"}, Worktrees: []WorktreeView{
+		{WT: repo.Worktree{Repo: "repo", Name: "wt", Path: dir}},
+	}}}
+	m.recomputeActive()
+
+	mm, _ = m.openPalette()
+	m = mm.(Model)
+	m.paletteInput.SetValue("open repo/wt")
+	m.paletteCursor = 0
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.current == nil || m.current.key != "repo/wt" {
+		t.Fatalf("enter on the open row should activate repo/wt, got %+v", m.current)
+	}
+	if m.paletteOpen {
+		t.Error("enter should close the palette")
+	}
+}
+
+// TestCommandPaletteSwallowsSessionKeys: while the palette is open no session is
+// visible and a stray letter key lands in the query, never in the session.
+func TestCommandPaletteSwallowsSessionKeys(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenEditor
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	if m.visibleSessions() != nil {
+		t.Error("no session should be visible while the palette is open")
+	}
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	m = mm.(Model)
+	if !m.paletteOpen {
+		t.Error("a letter key should not close the palette")
+	}
+	if m.paletteInput.Value() != "z" {
+		t.Fatalf("letter should type into the query, got %q", m.paletteInput.Value())
+	}
+}
+
 func TestStatusAutoExpires(t *testing.T) {
 	m := sampleModel()
 
@@ -890,6 +1146,28 @@ func TestPasteBlockedByOverlay(t *testing.T) {
 	waitForSession(t, sess, "allowed-after-close")
 	if strings.Contains(sess.Render(), "leaked-through-overlay") {
 		t.Error("paste while an overlay was open leaked into the session")
+	}
+}
+
+// TestPasteIntoPaletteOnly: a paste while the command palette is open lands in
+// the palette's query input and nowhere else — in particular not in the deck
+// filter, which stays focused across screens and would otherwise receive a
+// duplicate through the focus-routed path.
+func TestPasteIntoPaletteOnly(t *testing.T) {
+	m := sampleModel() // picker, NEW section, filter focused
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	m.paletteCursor = 2
+	mm, _ = m.Update(tea.PasteMsg{Content: "usage"})
+	m = mm.(Model)
+	if got := m.paletteInput.Value(); got != "usage" {
+		t.Fatalf("paste should reach the palette input, got %q", got)
+	}
+	if got := m.filter.Value(); got != "" {
+		t.Errorf("paste leaked into the deck filter: %q", got)
+	}
+	if m.paletteCursor != 0 {
+		t.Errorf("paste changed the query, so the cursor should reset to 0, got %d", m.paletteCursor)
 	}
 }
 
@@ -1774,5 +2052,329 @@ func TestHelpPlainKeyDoesNotLeak(t *testing.T) {
 	waitForSession(t, sess, "Z")
 	if strings.Contains(sess.Render(), "x") {
 		t.Error("a plain key dismissing help leaked into the session")
+	}
+}
+
+// --- diff viewer ---
+
+// diffKey builds a KeyPressMsg for a single rune (Text set so Key.String()
+// returns the rune, as the diff routing keys off msg.String()).
+func diffKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Text: string(r)} }
+
+// openSampleDiff opens the diff for active[idx] of a sampleModel and delivers a
+// diffMsg with the given payload, returning the model with content built. The
+// selected worktree is given a base branch (so the vs-base section renders) and
+// marked ahead/dirty per the flags.
+func openSampleDiff(t *testing.T, idx int, committed, uncommitted []repo.FileStat, cbody, ubody string, untracked []string, dirty bool) Model {
+	t.Helper()
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = idx
+	m.active[idx].view.BaseBranch = "main"
+	m.active[idx].view.Ahead = 3
+	m.active[idx].view.Dirty = dirty
+	mm, cmd := m.openDiff(m.active[idx])
+	m = mm.(Model)
+	if !m.diffOpen || !m.diffView.loading || cmd == nil {
+		t.Fatalf("openDiff: open=%v loading=%v cmd=%v", m.diffOpen, m.diffView.loading, cmd != nil)
+	}
+	res, _ := m.update(diffMsg{
+		key:             m.diffView.key,
+		committedBody:   cbody,
+		committedStat:   committed,
+		uncommittedBody: ubody,
+		uncommittedStat: uncommitted,
+		untracked:       untracked,
+	})
+	return res.(Model)
+}
+
+func manyLineDiff(n int) string {
+	var b strings.Builder
+	b.WriteString("diff --git a/f.go b/f.go\n@@ -1,1 +1,")
+	b.WriteString(strconv.Itoa(n))
+	b.WriteString(" @@\n")
+	for i := 0; i < n; i++ {
+		b.WriteString("+line ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func TestDiffOpensFromDeckKey(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	mm, cmd := m.handleActiveKey(diffKey('v'))
+	m = mm.(Model)
+	if !m.diffOpen || !m.diffView.loading {
+		t.Fatalf("v should open the diff in the loading state: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if cmd == nil {
+		t.Error("opening the diff should return a fetch command")
+	}
+	it, _ := m.selectedActive()
+	if m.diffView.key != wsKey(it.repo.Name, it.view.WT.Name) {
+		t.Errorf("diff target key = %q, want %q", m.diffView.key, wsKey(it.repo.Name, it.view.WT.Name))
+	}
+}
+
+func TestDiffMsgRendersAndStaleDropped(t *testing.T) {
+	stat := []repo.FileStat{{Path: "main.go", Add: 4, Del: 2}}
+	m := openSampleDiff(t, 0, stat, nil,
+		"diff --git a/main.go b/main.go\n@@ -1,2 +1,2 @@\n-old\n+new\n", "", nil, false)
+	if m.diffView.loading {
+		t.Fatal("diffMsg arrival should clear the loading state")
+	}
+	if len(m.diffView.full.lines) == 0 {
+		t.Fatal("content should be built on diffMsg arrival")
+	}
+	out := m.renderDiff(m.height - barHeight)
+	for _, want := range []string{"vs main", "main.go", "[all]", "scroll"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered diff missing %q:\n%s", want, out)
+		}
+	}
+
+	// A diffMsg carrying a different (stale) key is dropped: content unchanged.
+	before := len(m.diffView.full.lines)
+	res, _ := m.update(diffMsg{key: "someone/else", committedBody: "junk"})
+	m = res.(Model)
+	if len(m.diffView.full.lines) != before {
+		t.Error("a stale-key diffMsg should be dropped, not applied")
+	}
+}
+
+func TestDiffErrorClosesOverlay(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	mm, _ := m.openDiff(m.active[0])
+	m = mm.(Model)
+	res, _ := m.update(diffMsg{key: m.diffView.key, err: errTest})
+	m = res.(Model)
+	if m.diffOpen {
+		t.Error("a diff error should close the overlay")
+	}
+	if m.statusLevel != statusError || !strings.Contains(m.status, "diff error") {
+		t.Errorf("a diff error should set a sticky error status, got level=%v status=%q", m.statusLevel, m.status)
+	}
+}
+
+var errTest = &testErr{}
+
+type testErr struct{}
+
+func (*testErr) Error() string { return "boom" }
+
+func TestDiffScrollClamping(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	avail := m.diffBodyHeight()
+	maxOff := max(0, len(m.diffView.full.lines)-avail)
+	if maxOff == 0 {
+		t.Fatal("test needs content taller than the viewport")
+	}
+
+	// Up at the top stays at 0.
+	mm, _ := m.handleDiff(diffKey('k'))
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("up at the top should stay at 0, got %d", m.diffView.offset)
+	}
+	// G jumps to the bottom (maxOff); further down clamps there.
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: 'G', Text: "G"})
+	m = mm.(Model)
+	if m.diffView.offset != maxOff {
+		t.Fatalf("G should land on maxOff %d, got %d", maxOff, m.diffView.offset)
+	}
+	for i := 0; i < 5; i++ {
+		mm, _ = m.handleDiff(diffKey('j'))
+		m = mm.(Model)
+	}
+	if m.diffView.offset != maxOff {
+		t.Fatalf("down past the bottom should clamp at %d, got %d", maxOff, m.diffView.offset)
+	}
+	// g returns to the top.
+	mm, _ = m.handleDiff(diffKey('g'))
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("g should return to the top, got %d", m.diffView.offset)
+	}
+}
+
+func TestDiffScopeToggleResetsOffset(t *testing.T) {
+	m := openSampleDiff(t, 0,
+		[]repo.FileStat{{Path: "committed.go", Add: 40}}, []repo.FileStat{{Path: "wip.go", Add: 1}},
+		manyLineDiff(40), "diff --git a/wip.go b/wip.go\n@@ -1,1 +1,1 @@\n+wip\n", nil, true)
+
+	// Scroll down in the full scope, then toggle to uncommitted.
+	mm, _ := m.handleDiff(tea.KeyPressMsg{Code: 'G', Text: "G"})
+	m = mm.(Model)
+	if m.diffView.offset == 0 {
+		t.Fatal("precondition: expected a non-zero offset in the full scope")
+	}
+	mm, _ = m.handleDiff(diffKey('u'))
+	m = mm.(Model)
+	if !m.diffView.scopeUncommitted {
+		t.Fatal("u should switch to the uncommitted scope")
+	}
+	if m.diffView.offset != 0 {
+		t.Fatalf("scope toggle should reset the offset to 0, got %d", m.diffView.offset)
+	}
+	// The uncommitted scope is shorter than the full scope and mentions wip.go.
+	if len(m.diffView.uncommitted.lines) >= len(m.diffView.full.lines) {
+		t.Error("the uncommitted scope should be a subset of the full scope")
+	}
+	out := m.renderDiff(m.height - barHeight)
+	if !strings.Contains(out, "[uncommitted]") || !strings.Contains(out, "wip.go") {
+		t.Errorf("uncommitted scope render missing content:\n%s", out)
+	}
+}
+
+func TestDiffFileJump(t *testing.T) {
+	// Two files, each tall enough that the content overflows the viewport so the
+	// second file's header sits at a scrollable offset (jumps clamp to the
+	// bottom when everything already fits).
+	fileBody := func(name string) string {
+		var b strings.Builder
+		b.WriteString("diff --git a/" + name + " b/" + name + "\n@@ -1,1 +1,30 @@\n")
+		for i := 0; i < 30; i++ {
+			b.WriteString("+line\n")
+		}
+		return b.String()
+	}
+	body := fileBody("one.go") + fileBody("two.go")
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "one.go", Add: 30}, {Path: "two.go", Add: 30}}, nil, body, "", nil, false)
+	fl := m.diffView.full.fileLines
+	if len(fl) < 2 {
+		t.Fatalf("expected at least 2 file-header lines, got %d", len(fl))
+	}
+	// J from the top lands on the first file header past offset 0.
+	mm, _ := m.handleDiff(tea.KeyPressMsg{Code: 'J', Text: "J"})
+	m = mm.(Model)
+	if !contains(fl, m.diffView.offset) {
+		t.Fatalf("J should land on a file-header line, got offset %d (fileLines %v)", m.diffView.offset, fl)
+	}
+	landed := m.diffView.offset
+	// K from there lands on the previous file header (or the top).
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: 'K', Text: "K"})
+	m = mm.(Model)
+	if m.diffView.offset >= landed {
+		t.Fatalf("K should move to an earlier file header, got %d (was %d)", m.diffView.offset, landed)
+	}
+}
+
+func contains(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDiffXEntersRemoveFlow(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 1}}, nil,
+		"diff --git a/f.go b/f.go\n@@ -1,1 +1,1 @@\n+x\n", "", nil, true)
+	mm, _ := m.handleDiff(diffKey('x'))
+	m = mm.(Model)
+	if m.diffOpen {
+		t.Error("x should close the diff")
+	}
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("x should enter the remove confirm, got mode %v", m.mode)
+	}
+	if !strings.Contains(m.status, "UNCOMMITTED CHANGES") || !strings.Contains(m.status, "view diff") {
+		t.Errorf("dirty remove prompt should warn and offer view diff, got %q", m.status)
+	}
+}
+
+func TestDiffFromRemovePrompt(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	m.mode = modeConfirmRemove
+	m.status = "remove worktree …"
+	mm, cmd := m.handleConfirmKey(diffKey('v'))
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Errorf("v should exit the confirm mode, got %v", m.mode)
+	}
+	if !m.diffOpen || !m.diffView.loading {
+		t.Fatalf("v from the remove prompt should open the diff: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if cmd == nil {
+		t.Error("opening the diff should return a fetch command")
+	}
+}
+
+func TestPaletteViewDiffRow(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+
+	// The row exists for a chosen worktree (not active[0]) and moving to it must
+	// move the active cursor onto that worktree.
+	target := m.active[len(m.active)-1]
+	wantTitle := "view diff: " + target.repo.Name + "/" + target.view.WT.Name
+	var run func(Model) (tea.Model, tea.Cmd)
+	for _, c := range m.paletteCommands() {
+		if c.title == wantTitle {
+			run = c.run
+		}
+	}
+	if run == nil {
+		t.Fatalf("palette should contain %q", wantTitle)
+	}
+	mm, cmd := run(m)
+	m = mm.(Model)
+	if !m.diffOpen || m.diffView.loading == false || cmd == nil {
+		t.Fatalf("running the view-diff row should open the diff: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if m.screen != screenPicker || m.focus != focusActive {
+		t.Errorf("view-diff row should return to the picker's active section: screen=%v focus=%v", m.screen, m.focus)
+	}
+	if m.diffView.key != wsKey(target.repo.Name, target.view.WT.Name) {
+		t.Errorf("view-diff row opened the wrong worktree: %q", m.diffView.key)
+	}
+	if it, _ := m.selectedActive(); wsKey(it.repo.Name, it.view.WT.Name) != m.diffView.key {
+		t.Error("active cursor should have moved onto the diff's worktree")
+	}
+}
+
+func TestDiffWheelScrolls(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	mm, _ := m.diffWheel(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	m = mm.(Model)
+	if m.diffView.offset != 3 {
+		t.Fatalf("a wheel-down notch should scroll 3 lines, got %d", m.diffView.offset)
+	}
+	mm, _ = m.diffWheel(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("a wheel-up notch should scroll back, got %d", m.diffView.offset)
+	}
+}
+
+func TestDiffSwallowsUnknownKeys(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	m.diffView.offset = 5
+	mm, _ := m.handleDiff(diffKey('z'))
+	m = mm.(Model)
+	if !m.diffOpen {
+		t.Error("an unknown key should not close the diff")
+	}
+	if m.diffView.offset != 5 {
+		t.Errorf("an unknown key should not move the offset, got %d", m.diffView.offset)
+	}
+	if m.mode != modeNormal {
+		t.Errorf("an unknown key should not change the mode, got %v", m.mode)
+	}
+	// esc / q close.
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.diffOpen {
+		t.Error("esc should close the diff")
 	}
 }
