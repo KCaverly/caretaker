@@ -151,6 +151,8 @@ hidden. Each time the form opens it starts on `agents.default`. Board and status
 the provider so mixed pools remain easy to distinguish.
 
 Caretaker passes the form prompt as the CLI's initial prompt. Foreground agents are interactive.
+The prompt editor supports multiple lines; press `ctrl+enter` to launch the agent (plain `enter`
+adds a new line).
 Background Claude agents use Claude Code's permission-skipping mode; background Codex agents use
 the `workspace-write` sandbox with approvals disabled, so writes outside the workspace still fail
 closed. Codex starts a fresh conversation normally and uses `codex resume <thread-id>` when a known

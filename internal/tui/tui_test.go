@@ -656,6 +656,28 @@ func TestQuickPromptOpensForm(t *testing.T) {
 	}
 }
 
+func TestBoardFormPromptSupportsMultipleLines(t *testing.T) {
+	m := modelWithAgents(1).openNewAgentForm().(Model)
+
+	for _, key := range []tea.KeyPressMsg{
+		{Code: 'f', Text: "f"},
+		{Code: tea.KeyEnter},
+		{Code: 's', Text: "s"},
+	} {
+		mm, _ := m.handleBoardForm(key)
+		m = mm.(Model)
+	}
+	if got, want := m.promptInput.Value(), "f\ns"; got != want {
+		t.Fatalf("prompt = %q, want %q", got, want)
+	}
+	if m.formFocus != formFieldPrompt || !m.formOpen {
+		t.Fatalf("enter should edit the prompt without leaving the form: focus=%d open=%v", m.formFocus, m.formOpen)
+	}
+	if m.promptInput.Height() < 3 {
+		t.Fatalf("multi-line prompt should retain its expanded input area, height=%d", m.promptInput.Height())
+	}
+}
+
 func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m := modelWithAgents(1)
 	m = m.openNewAgentForm().(Model)

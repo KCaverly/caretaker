@@ -619,9 +619,12 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	rows := []string{
 		header("new agent", -1),
 		"",
-		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
-		"",
+		"  " + fieldName(formFieldPrompt, "prompt"),
 	}
+	for _, line := range strings.Split(m.promptInput.View(), "\n") {
+		rows = append(rows, "  "+line)
+	}
+	rows = append(rows, "")
 	if len(m.agentProviders) > 1 {
 		providerIdx := 0
 		for i, provider := range m.agentProviders {
@@ -637,7 +640,7 @@ func (m Model) renderBoardForm(h, innerW int) string {
 		"  "+fieldName(formFieldMode, "mode")+toggle([2]string{"foreground", "background"}, bgIdx),
 		"",
 		"  "+strings.Join([]string{
-			keyhint("enter", "launch"), keyhint("tab", "field"),
+			keyhint("ctrl+enter", "launch"), keyhint("tab", "field"),
 			keyhint("space", "toggle"), keyhint("esc", "back"),
 		}, helpStyle.Render("  ·  ")),
 	)

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	uv "github.com/charmbracelet/ultraviolet"
@@ -276,8 +277,9 @@ type Model struct {
 	codexUsageHist []usageSample
 	usageThreshold int // percent at/above which the bar segment shows
 
-	// prompt input for the board's new-agent form
-	promptInput textinput.Model
+	// prompt input for the board's new-agent form. Unlike the other compact
+	// inputs, this grows with a multi-line task description.
+	promptInput textarea.Model
 
 	// home workspace path/key, cached on first open for pathToKey lookups
 	homeWSPath string
@@ -343,9 +345,14 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	rootInput.Placeholder = "~/repos"
 	rootInput.Prompt = "› "
 
-	promptInput := textinput.New()
+	promptInput := textarea.New()
 	promptInput.Placeholder = "What should Claude do?"
 	promptInput.Prompt = "› "
+	promptInput.ShowLineNumbers = false
+	promptInput.DynamicHeight = true
+	promptInput.MinHeight = 3
+	promptInput.MaxHeight = 8
+	promptInput.SetHeight(promptInput.MinHeight)
 
 	paletteInput := textinput.New()
 	paletteInput.Placeholder = "run a command…"
@@ -844,6 +851,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filter.SetWidth(inputW)
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
+		m.promptInput.MaxHeight = clamp(m.height-barHeight-10, 3, 8)
 		m.promptInput.SetWidth(clamp(m.width-16, 20, 52))
 		m.paletteInput.SetWidth(clamp(m.width-16, 20, 52))
 		// Only the current workspace is resized; background ones are brought up
@@ -1191,13 +1199,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// routeToFocusedInputs forwards msg to every currently-focused textinput and
+// routeToFocusedInputs forwards msg to every currently-focused input and
 // batches their commands. It backs both the default branch (where the
 // cursor-blink tick must reach the focused input so its blink loop re-arms)
 // and the non-session path of the paste router.
 func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	for _, in := range []*textinput.Model{&m.filter, &m.nameInput, &m.rootInput, &m.promptInput, &m.paletteInput} {
+	if m.promptInput.Focused() {
+		var cmd tea.Cmd
+		m.promptInput, cmd = m.promptInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	for _, in := range []*textinput.Model{&m.filter, &m.nameInput, &m.rootInput, &m.paletteInput} {
 		if !in.Focused() {
 			continue
 		}
@@ -1214,7 +1227,7 @@ func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 // focused) the paste silently vanishes — the bug this fixes.
 //
 //   - On overlays (help/board/usage), setup, and the picker the paste behaves
-//     like typed input: it goes to whichever textinput is focused (the picker
+//     like typed input: it goes to whichever input is focused (the picker
 //     filter, the name/root/prompt inputs), and is otherwise swallowed — it
 //     never leaks into a session drawn beneath an overlay.
 //   - On a bare session screen it is handed to the active program through the
@@ -1982,27 +1995,34 @@ func (m *Model) cycleFormProvider(delta int) {
 	m.updatePromptPlaceholder()
 }
 
-// handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓, or the
-// ctrl+n/ctrl+p list-nav dialect — unused by the prompt textinput) move between
-// the prompt, where, and mode fields; space or ←/→ flip the focused toggle;
-// enter launches from any field.
+// handleBoardForm drives the new-agent form. The prompt accepts ordinary
+// multi-line editing; tab changes fields and ctrl+enter launches. On toggles,
+// enter also launches and ↑/↓ (or ctrl+n/ctrl+p) move between fields.
 func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.formOpen = false
 		m.promptInput.Blur()
 		return m, nil
-	case "tab", "down", "ctrl+n":
-		return m.moveFormFocus(1)
-	case "shift+tab", "up", "ctrl+p":
-		return m.moveFormFocus(-1)
-	case "enter":
+	case "ctrl+enter":
 		return m.launchAgent()
+	case "tab":
+		return m.moveFormFocus(1)
+	case "shift+tab":
+		return m.moveFormFocus(-1)
 	}
 	if m.formFocus == formFieldPrompt {
 		var cmd tea.Cmd
 		m.promptInput, cmd = m.promptInput.Update(msg)
 		return m, cmd
+	}
+	switch msg.String() {
+	case "down", "ctrl+n":
+		return m.moveFormFocus(1)
+	case "up", "ctrl+p":
+		return m.moveFormFocus(-1)
+	case "enter":
+		return m.launchAgent()
 	}
 	switch msg.String() {
 	case "left", "right", "h", "l", "space":
