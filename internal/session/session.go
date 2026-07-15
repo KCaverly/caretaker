@@ -51,6 +51,7 @@ type Session struct {
 	closed        atomic.Bool
 	closeOnce     sync.Once
 	companionOnce sync.Once
+	emuMu         sync.Mutex     // keeps a scrollback snapshot coherent with pty output
 	dirty         func(*Session) // signalled when the screen changes
 	companion     io.Closer
 
@@ -74,6 +75,9 @@ type Session struct {
 	// each emu.Write — so it is atomic. See Render for the set/clear ordering.
 	renderCache      string
 	renderCacheDirty atomic.Bool
+	// scrollOffset is the number of rows the rendered viewport sits above the
+	// live bottom. It is owned by the UI goroutine.
+	scrollOffset int
 }
 
 // Start launches argv in dir on a pty sized w×h and returns a running Session.
@@ -169,7 +173,9 @@ func (s *Session) pumpOutput() {
 	for {
 		n, err := s.pty.Read(buf)
 		if n > 0 {
+			s.emuMu.Lock()
 			_, _ = s.emu.Write(buf[:n])
+			s.emuMu.Unlock()
 			// Mark the cache stale BEFORE signalling the repaint, so the frame
 			// this write triggers never serves the pre-write screen.
 			s.renderCacheDirty.Store(true)
@@ -222,6 +228,11 @@ func (s *Session) SendMouse(m uv.MouseEvent) { s.emu.SendMouse(m) }
 // The CompareAndSwap collapses a burst of writes since the last frame into a
 // single re-serialisation.
 func (s *Session) Render() string {
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
+	if s.scrollOffset > 0 {
+		return s.renderScrollbackLocked()
+	}
 	if s.renderCacheDirty.CompareAndSwap(true, false) {
 		s.renderCache = s.emu.Render()
 	}
@@ -230,6 +241,11 @@ func (s *Session) Render() string {
 
 // Cursor returns the program's cursor position and visibility.
 func (s *Session) Cursor() (x, y int, visible bool) {
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
+	if s.scrollOffset > 0 {
+		return 0, 0, false
+	}
 	p := s.emu.CursorPosition()
 	return p.X, p.Y, s.cursorVisible.Load()
 }
@@ -239,10 +255,67 @@ func (s *Session) Resize(w, h int) {
 	if w < 1 || h < 1 {
 		return
 	}
+	s.emuMu.Lock()
 	s.scrollForShrink(h)
 	s.emu.Resize(w, h)
+	s.scrollOffset = min(s.scrollOffset, s.emu.ScrollbackLen())
+	s.emuMu.Unlock()
 	s.renderCacheDirty.Store(true) // resize reshapes the buffer; drop the cache
 	_ = pty.Setsize(s.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
+}
+
+// Scroll moves the rendered viewport through primary-screen scrollback. A
+// positive number moves toward older output; a negative number moves back to
+// the live bottom. It returns false when this session has no scrollback to
+// show (for example an alternate-screen TUI), allowing callers to pass the
+// wheel event on to a program that handles mouse input itself.
+func (s *Session) Scroll(rows int) bool {
+	if rows == 0 {
+		return false
+	}
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
+	if s.emu.IsAltScreen() {
+		return false
+	}
+	maxOffset := s.emu.ScrollbackLen()
+	if maxOffset == 0 {
+		return false
+	}
+	s.scrollOffset = min(max(s.scrollOffset+rows, 0), maxOffset)
+	return true
+}
+
+// renderScrollbackLocked renders one terminal-height window from the combined
+// primary-screen scrollback and live screen. emuMu must be held by the caller.
+func (s *Session) renderScrollbackLocked() string {
+	w, h := s.emu.Width(), s.emu.Height()
+	sb := s.emu.Scrollback()
+	sbLen := 0
+	if sb != nil {
+		sbLen = sb.Len()
+	}
+	total := sbLen + h
+	start := max(total-h-s.scrollOffset, 0)
+	var out strings.Builder
+	for y := range h {
+		if y > 0 {
+			out.WriteByte('\n')
+		}
+		lineIndex := start + y
+		if lineIndex < sbLen {
+			out.WriteString(sb.Line(lineIndex).Render())
+			continue
+		}
+		line := make(uv.Line, w)
+		for x := range w {
+			if cell := s.emu.CellAt(x, lineIndex-sbLen); cell != nil {
+				line[x] = *cell
+			}
+		}
+		out.WriteString(line.Render())
+	}
+	return out.String()
 }
 
 // scrollForShrink keeps the newest output visible when the pane loses rows

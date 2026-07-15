@@ -404,6 +404,31 @@ func TestResizeShrinkKeepsRecentOutput(t *testing.T) {
 	}
 }
 
+func TestScrollRendersPrimaryScreenScrollback(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(),
+		[]string{"sh", "-c", "i=1; while [ $i -le 16 ]; do echo line-$i; i=$((i+1)); done; sleep 5"},
+		80, 4, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	waitFor(t, s, "line-16")
+
+	if !s.Scroll(3) {
+		t.Fatal("Scroll reported no primary-screen scrollback")
+	}
+	if got := s.Render(); strings.Contains(got, "line-16") {
+		t.Fatalf("scrollback viewport still shows the live bottom:\n%s", got)
+	}
+
+	if !s.Scroll(-100) {
+		t.Fatal("Scroll back to the live bottom was not handled")
+	}
+	if got := s.Render(); !strings.Contains(got, "line-16") {
+		t.Fatalf("scrollback viewport did not return to the live bottom:\n%s", got)
+	}
+}
+
 func TestManagerActivateReuses(t *testing.T) {
 	m := NewManager()
 	defer m.CloseAll()

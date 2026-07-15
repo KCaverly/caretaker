@@ -2853,6 +2853,17 @@ func (m Model) forwardMouse(msg tea.MouseMsg) {
 	case tea.MouseReleaseMsg:
 		s.SendMouse(uv.MouseReleaseEvent(shift(e.Mouse())))
 	case tea.MouseWheelMsg:
+		// Most terminal programs that handle the wheel enable mouse reporting,
+		// but Codex's raw-scrollback mode intentionally leaves it to the host
+		// terminal. Let the hosted session consume the wheel when it has primary
+		// screen history; otherwise preserve the program's native mouse handling.
+		rows := 3
+		if e.Mouse().Button == tea.MouseWheelDown {
+			rows = -rows
+		}
+		if s.Scroll(rows) {
+			return
+		}
 		s.SendMouse(uv.MouseWheelEvent(shift(e.Mouse())))
 	case tea.MouseMotionMsg:
 		s.SendMouse(uv.MouseMotionEvent(shift(e.Mouse())))
