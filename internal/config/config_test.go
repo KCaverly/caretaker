@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+
+	"github.com/KCaverly/caretaker/internal/agent"
 )
 
 func TestPath(t *testing.T) {
@@ -40,7 +42,7 @@ func TestPath(t *testing.T) {
 func TestDefault(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	d := Default()
-	if d.Editor != "nvim" || d.Agent != "claude" || d.Backend != "zellij" {
+	if d.Editor != "nvim" || d.Agent != "claude" {
 		t.Fatalf("unexpected defaults: %+v", d)
 	}
 	if d.Shell != "/bin/zsh" {
@@ -49,6 +51,86 @@ func TestDefault(t *testing.T) {
 	if d.WorktreePath != ".worktrees/{name}" || d.BranchName != "{name}" {
 		t.Fatalf("unexpected templates: %+v", d)
 	}
+	if d.Agents.Default != agent.Claude || len(d.Agents.Enabled) != 2 ||
+		d.Agents.Enabled[0] != agent.Claude || d.Agents.Enabled[1] != agent.Codex {
+		t.Fatalf("unexpected agent provider defaults: %+v", d.Agents)
+	}
+	if d.Agents.Claude.Command != "claude" || d.Agents.Codex.Command != "codex" {
+		t.Fatalf("unexpected provider commands: %+v", d.Agents)
+	}
+}
+
+func TestLoadLegacyAgentConfiguresClaudeProvider(t *testing.T) {
+	cfg := loadTOML(t, "agent = \"custom-claude\"\n")
+	if cfg.Agent != "custom-claude" || cfg.Agents.Claude.Command != "custom-claude" {
+		t.Fatalf("legacy agent was not applied to Claude: agent=%q claude=%q", cfg.Agent, cfg.Agents.Claude.Command)
+	}
+	if len(cfg.Agents.Enabled) != 2 || cfg.Agents.Enabled[0] != agent.Claude || cfg.Agents.Enabled[1] != agent.Codex {
+		t.Fatalf("legacy config did not inherit both enabled providers: %v", cfg.Agents.Enabled)
+	}
+}
+
+func TestLoadAgentProviders(t *testing.T) {
+	cfg := loadTOML(t, `agent = "legacy-claude"
+[agents]
+default = "codex"
+enabled = ["claude", "codex"]
+
+[agents.claude]
+command = "modern-claude"
+args = ["--claude-flag"]
+
+[agents.codex]
+command = "custom-codex"
+args = ["--codex-flag", "value"]
+`)
+	if cfg.Agents.Default != agent.Codex {
+		t.Fatalf("default = %q, want codex", cfg.Agents.Default)
+	}
+	if len(cfg.Agents.Enabled) != 2 || cfg.Agents.Enabled[0] != agent.Claude || cfg.Agents.Enabled[1] != agent.Codex {
+		t.Fatalf("enabled = %v, want [claude codex]", cfg.Agents.Enabled)
+	}
+	if cfg.Agent != "modern-claude" || cfg.Agents.Claude.Command != "modern-claude" {
+		t.Fatalf("modern Claude command should win: agent=%q claude=%q", cfg.Agent, cfg.Agents.Claude.Command)
+	}
+	if got := cfg.Agents.Claude.Args; len(got) != 1 || got[0] != "--claude-flag" {
+		t.Fatalf("Claude args = %v", got)
+	}
+	if got := cfg.Agents.Provider(agent.Codex); got.Command != "custom-codex" || len(got.Args) != 2 {
+		t.Fatalf("Codex config = %+v", got)
+	}
+}
+
+func TestValidateAgentProviders(t *testing.T) {
+	t.Run("default must be enabled", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Agents.Default = agent.Codex
+		c.Agents.Enabled = []agent.Provider{agent.Claude}
+		if err := c.validate(); err == nil {
+			t.Fatal("expected disabled default to be rejected")
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Agents.Enabled = []agent.Provider{"other"}
+		if err := c.validate(); err == nil {
+			t.Fatal("expected unknown provider to be rejected")
+		}
+	})
+
+	t.Run("enabled provider needs command", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Agents.Default = agent.Codex
+		c.Agents.Enabled = []agent.Provider{agent.Codex}
+		c.Agents.Codex.Command = ""
+		if err := c.validate(); err == nil {
+			t.Fatal("expected empty provider command to be rejected")
+		}
+	})
 }
 
 func TestDefaultUsage(t *testing.T) {
@@ -93,13 +175,6 @@ func TestDefaultKeymap(t *testing.T) {
 			t.Errorf("default %s = %q, want %q", k, got, want[k])
 		}
 	}
-	// The legacy notif alias and the pane-cycle key are retired by default.
-	if d.Keys.Notif != "" {
-		t.Errorf("default notif = %q, want empty (retired)", d.Keys.Notif)
-	}
-	if d.Keys.TermCycle != "" {
-		t.Errorf("default term_cycle = %q, want empty (retired)", d.Keys.TermCycle)
-	}
 }
 
 func TestDefaultCommandPalette(t *testing.T) {
@@ -127,8 +202,6 @@ goto_agent = "alt+c"
 goto_term = "alt+t"
 term_focus_left = "ctrl+h"
 term_focus_right = "ctrl+l"
-notif = "ctrl+n"
-term_cycle = "ctrl+w"
 `)
 	if cfg.Keys.CycleBack != "alt+p" {
 		t.Errorf("cycle_back = %q", cfg.Keys.CycleBack)
@@ -138,10 +211,6 @@ term_cycle = "ctrl+w"
 	}
 	if cfg.Keys.TermFocusLeft != "ctrl+h" || cfg.Keys.TermFocusRight != "ctrl+l" {
 		t.Errorf("focus keys = %q/%q", cfg.Keys.TermFocusLeft, cfg.Keys.TermFocusRight)
-	}
-	// A user can still re-enable the retired aliases.
-	if cfg.Keys.Notif != "ctrl+n" || cfg.Keys.TermCycle != "ctrl+w" {
-		t.Errorf("retired keys not re-enabled: notif=%q term_cycle=%q", cfg.Keys.Notif, cfg.Keys.TermCycle)
 	}
 	// Fields left unset keep their defaults.
 	if cfg.Keys.Cycle != "alt+]" || cfg.Keys.TermFocusDown != "alt+j" {

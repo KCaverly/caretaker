@@ -18,6 +18,7 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/sahilm/fuzzy"
 
+	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/plasma"
 	"github.com/KCaverly/caretaker/internal/repo"
@@ -29,37 +30,6 @@ import (
 // barHeight is the number of rows the top chrome occupies: the status bar and
 // a light separator line directly beneath it.
 const barHeight = 2
-
-// Default reserved keys (not forwarded to embedded sessions); overridable via config.
-const (
-	defaultKeyCycle        = "alt+]"  // cycle to the next session view
-	defaultKeyCycleBack    = "alt+["  // cycle to the previous session view
-	defaultKeyGotoEditor   = "alt+1"  // jump to the editor view
-	defaultKeyGotoAgent    = "alt+2"  // jump to the agent view
-	defaultKeyGotoTerm     = "alt+3"  // jump to the terminal view
-	defaultKeyPicker       = "ctrl+g" // return to the CT picker
-	defaultKeyPalette      = "alt+a"  // open the agent board
-	defaultKeyNextAgent    = "f4"     // focus the next agent in the pool
-	defaultKeyPrevAgent    = "f3"     // focus the previous agent in the pool
-	defaultKeyHelp         = "f1"     // toggle the help overlay
-	defaultKeyGlobalConfig = "alt+g"  // open home-directory workspace
-	defaultKeyPrompt       = "alt+y"  // new-agent form pre-set for a background home agent
-	defaultKeyUsage        = "alt+u"  // usage overlay (agent screen only)
-	// defaultKeyCommandPalette opens the command palette: a fuzzy-searchable list
-	// of every ct action, each row showing its live keybinding. Distinct from
-	// keyPalette, which is the (legacy-named) agent board.
-	defaultKeyCommandPalette = "alt+p"
-
-	// Terminal pane management — only intercepted when the terminal screen is active.
-	defaultKeyTermSplitV     = "alt+v" // new pane to the right
-	defaultKeyTermSplitH     = "alt+s" // new pane below
-	defaultKeyTermZoom       = "alt+z" // toggle full-size
-	defaultKeyTermClose      = "alt+x" // close active pane
-	defaultKeyTermFocusLeft  = "alt+h" // focus the pane to the left
-	defaultKeyTermFocusDown  = "alt+j" // focus the pane below
-	defaultKeyTermFocusUp    = "alt+k" // focus the pane above
-	defaultKeyTermFocusRight = "alt+l" // focus the pane to the right
-)
 
 // screen is the active view: the picker, one of the session views, or setup.
 type screen int
@@ -153,7 +123,8 @@ type boardRow struct {
 
 	agentIdx int // index in ws.Agents
 	pid      int
-	label    string    // display name
+	label    string // display name
+	provider agent.Provider
 	status   string    // right-hand status column
 	attn     attnLevel // includes derived waiting
 	num      int       // 1-based quick-jump number (first 9 agent rows)
@@ -162,6 +133,7 @@ type boardRow struct {
 // Focus order of the new-agent form's fields.
 const (
 	formFieldPrompt = iota
+	formFieldProvider
 	formFieldWhere
 	formFieldMode
 	formFieldCount
@@ -220,18 +192,9 @@ type Model struct {
 	mgr   *session.Manager
 	state *state.State
 
-	keyCycle, keyCycleBack, keyPicker        string
-	keyGotoEditor, keyGotoAgent, keyGotoTerm string
-	keyPalette, keyNextAgent, keyPrevAgent   string
-	keyHelp, keyGlobalConfig, keyNotif       string
-	keyPrompt, keyUsage                      string
-	keyCommandPalette                        string
-
-	keyTermSplitV, keyTermSplitH            string
-	keyTermCycle, keyTermZoom, keyTermClose string
-
-	keyTermFocusLeft, keyTermFocusDown string
-	keyTermFocusUp, keyTermFocusRight  string
+	// keys are the reserved keystrokes (not forwarded to embedded sessions),
+	// fully defaulted by config.Load before they reach here.
+	keys config.Keys
 
 	screen   screen
 	current  *workspaceRef
@@ -296,16 +259,16 @@ type Model struct {
 	// derived live from agentStatus and never stored here
 	attention map[int]attnEntry
 
-	// plan usage-limit gauge: the latest snapshot, whether one has ever
-	// arrived, and a ring of five-hour utilization samples (trimmed to
-	// usageHistoryWindow) that feeds the overlay's burn-rate row. The gauge
-	// degrades silently — failures only leave the snapshot to go stale, which
-	// hides the bar segment on its own.
+	// Plan usage-limit gauges: one snapshot and session-window sample ring per
+	// provider. The gauges degrade silently — failures only leave that
+	// provider's snapshot to go stale, which hides its bar segment on its own.
 	usageSnap      usage.Snapshot
 	usageHave      bool
+	codexUsageSnap usage.Snapshot
+	codexUsageHave bool
 	usageOpen      bool // usage overlay visibility (agent screen only)
 	usageHist      []usageSample
-	usageFails     int // consecutive poll failures; tracked, never surfaced
+	codexUsageHist []usageSample
 	usageThreshold int // percent at/above which the bar segment shows
 
 	// prompt input for the board's new-agent form
@@ -317,7 +280,8 @@ type Model struct {
 
 	// new-agent form (sub-state of the agent board)
 	formOpen       bool
-	formFocus      int  // formFieldPrompt..formFieldMode
+	formFocus      int // formFieldPrompt..formFieldMode
+	formProvider   agent.Provider
 	formLocation   int  // 0 = active worktree, 1 = home worktree
 	formBackground bool // false = foreground (default), true = background
 
@@ -339,6 +303,11 @@ type Model struct {
 	plasma         *plasma.Field
 	plasmaWidthPct int
 	plasmaTicking  bool
+
+	// agentProviders is the normalized provider palette. Legacy/direct configs
+	// remain Claude-only through the controller's normalization.
+	agentProviders       []agent.Provider
+	defaultAgentProvider agent.Provider
 }
 
 // statusLevel classifies the footer status so styling and expiry don't rely
@@ -377,89 +346,6 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	paletteInput.Placeholder = "run a command…"
 	paletteInput.Prompt = "› "
 
-	cycle, picker := ctrl.Keys()
-	if cycle == "" {
-		cycle = defaultKeyCycle
-	}
-	if picker == "" {
-		picker = defaultKeyPicker
-	}
-	cycleBack := ctrl.CycleBackKey()
-	if cycleBack == "" {
-		cycleBack = defaultKeyCycleBack
-	}
-	gotoEditor, gotoAgent, gotoTerm := ctrl.GotoKeys()
-	if gotoEditor == "" {
-		gotoEditor = defaultKeyGotoEditor
-	}
-	if gotoAgent == "" {
-		gotoAgent = defaultKeyGotoAgent
-	}
-	if gotoTerm == "" {
-		gotoTerm = defaultKeyGotoTerm
-	}
-	palette, next, prev := ctrl.AgentKeys()
-	if palette == "" {
-		palette = defaultKeyPalette
-	}
-	if next == "" {
-		next = defaultKeyNextAgent
-	}
-	if prev == "" {
-		prev = defaultKeyPrevAgent
-	}
-	help := ctrl.HelpKey()
-	if help == "" {
-		help = defaultKeyHelp
-	}
-	globalConfig := ctrl.GlobalConfigKey()
-	if globalConfig == "" {
-		globalConfig = defaultKeyGlobalConfig
-	}
-	// Notif is a legacy board alias, retired by default (empty). A user-set
-	// empty stays empty and never matches — key strings are never empty.
-	notif := ctrl.NotifKey()
-	prompt := ctrl.PromptKey()
-	if prompt == "" {
-		prompt = defaultKeyPrompt
-	}
-	usageKey := ctrl.UsageKey()
-	if usageKey == "" {
-		usageKey = defaultKeyUsage
-	}
-	commandPalette := ctrl.CommandPaletteKey()
-	if commandPalette == "" {
-		commandPalette = defaultKeyCommandPalette
-	}
-	termSplitV, termSplitH, termCycle, termZoom, termClose := ctrl.TermPaneKeys()
-	if termSplitV == "" {
-		termSplitV = defaultKeyTermSplitV
-	}
-	if termSplitH == "" {
-		termSplitH = defaultKeyTermSplitH
-	}
-	// TermCycle is retired by default (empty); directional focus supersedes it.
-	// A user-set empty stays empty, so no default fallback here.
-	if termZoom == "" {
-		termZoom = defaultKeyTermZoom
-	}
-	if termClose == "" {
-		termClose = defaultKeyTermClose
-	}
-	termFocusLeft, termFocusDown, termFocusUp, termFocusRight := ctrl.TermFocusKeys()
-	if termFocusLeft == "" {
-		termFocusLeft = defaultKeyTermFocusLeft
-	}
-	if termFocusDown == "" {
-		termFocusDown = defaultKeyTermFocusDown
-	}
-	if termFocusUp == "" {
-		termFocusUp = defaultKeyTermFocusUp
-	}
-	if termFocusRight == "" {
-		termFocusRight = defaultKeyTermFocusRight
-	}
-
 	// A nil field simply hides the panel. Construction only fails on variant
 	// names config validation didn't check, i.e. when width is 0 — which
 	// disables the panel anyway.
@@ -472,27 +358,64 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		})
 	}
 
+	providers := ctrl.EnabledAgentProviders()
+	defaultProvider := ctrl.DefaultAgentProvider()
+	if !providerIn(defaultProvider, providers) {
+		defaultProvider = providers[0]
+	}
+
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
-		keyCycle: cycle, keyCycleBack: cycleBack, keyPicker: picker,
-		keyGotoEditor: gotoEditor, keyGotoAgent: gotoAgent, keyGotoTerm: gotoTerm,
-		keyPalette: palette, keyNextAgent: next, keyPrevAgent: prev,
-		keyHelp: help, keyGlobalConfig: globalConfig, keyNotif: notif,
-		keyPrompt: prompt, keyUsage: usageKey,
-		keyCommandPalette: commandPalette,
-		usageThreshold:    ctrl.UsageThreshold(),
-		plasma:            plasmaField, plasmaWidthPct: pc.Width,
-		keyTermSplitV: termSplitV, keyTermSplitH: termSplitH,
-		keyTermCycle: termCycle, keyTermZoom: termZoom, keyTermClose: termClose,
-		keyTermFocusLeft: termFocusLeft, keyTermFocusDown: termFocusDown,
-		keyTermFocusUp: termFocusUp, keyTermFocusRight: termFocusRight,
+		keys:           ctrl.Keys(),
+		usageThreshold: ctrl.UsageThreshold(),
+		plasma:         plasmaField, plasmaWidthPct: pc.Width,
 		filter: filter, nameInput: name, rootInput: rootInput,
-		promptInput:     promptInput,
-		paletteInput:    paletteInput,
+		promptInput:    promptInput,
+		paletteInput:   paletteInput,
+		agentProviders: providers, defaultAgentProvider: defaultProvider,
+		formProvider:    defaultProvider,
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
 		attention:       map[int]attnEntry{},
 	}
+}
+
+func providerIn(provider agent.Provider, providers []agent.Provider) bool {
+	for _, candidate := range providers {
+		if candidate == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizedProvider migrates live sessions created by legacy specs (which
+// carry no provider metadata) to Claude at the UI boundary.
+func normalizedProvider(provider agent.Provider) agent.Provider {
+	if provider.Valid() {
+		return provider
+	}
+	return agent.Claude
+}
+
+func providerName(provider agent.Provider) string {
+	name := normalizedProvider(provider).String()
+	if name == "" {
+		return "Agent"
+	}
+	return strings.ToUpper(name[:1]) + name[1:]
+}
+
+func (m Model) claudeEnabled() bool {
+	return providerIn(agent.Claude, m.agentProviders)
+}
+
+func (m Model) codexEnabled() bool {
+	return providerIn(agent.Codex, m.agentProviders)
+}
+
+func (m Model) usageEnabled() bool {
+	return m.claudeEnabled() || m.codexEnabled()
 }
 
 // EnterSetup switches the model into first-run setup mode, prompting the user
@@ -553,6 +476,15 @@ type statusMsg struct {
 	err   error
 }
 
+// agentEventMsg carries one passive provider event for a hosted session. The
+// command is re-armed after each message, leaving Bubble Tea as the sole owner
+// of Model, SessionID persistence, and notification state.
+type agentEventMsg struct {
+	session *session.Session
+	event   agent.Event
+	open    bool
+}
+
 // plasmaTickMsg advances the deck's plasma panel one frame. Purely cosmetic,
 // so unlike the poll ticks it is only kept armed while the deck body is
 // actually being drawn (see Update / deckShown).
@@ -574,8 +506,9 @@ func schedulePlasmaTick() tea.Cmd {
 type usageTickMsg struct{}
 
 type usageMsg struct {
-	snap usage.Snapshot
-	err  error
+	provider agent.Provider
+	snap     usage.Snapshot
+	err      error
 }
 
 // usageSample is one successful poll's five-hour utilization, kept in
@@ -600,7 +533,14 @@ func (m Model) Init() tea.Cmd {
 	if m.screen == screenSetup {
 		return tea.Batch(textinput.Blink, m.repaintCmd())
 	}
-	return tea.Batch(m.loadCmd(), textinput.Blink, m.repaintCmd(), m.pollStatusCmd(), m.pollUsageCmd())
+	cmds := []tea.Cmd{m.loadCmd(), textinput.Blink, m.repaintCmd()}
+	if m.claudeEnabled() {
+		cmds = append(cmds, m.pollStatusCmd())
+	}
+	if m.usageEnabled() {
+		cmds = append(cmds, m.pollUsageCmds(), m.scheduleUsageTick())
+	}
+	return tea.Batch(cmds...)
 }
 
 // pollStatusCmd runs one `claude agents --json` poll off the UI goroutine.
@@ -614,18 +554,69 @@ func (m Model) pollStatusCmd() tea.Cmd {
 	}
 }
 
+func (m Model) watchAgentEvents(s *session.Session) tea.Cmd {
+	if s == nil || s.Events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, ok := <-s.Events
+		return agentEventMsg{session: s, event: event, open: ok}
+	}
+}
+
+func (m Model) watchWorkspaceAgents(ws *session.Workspace) tea.Cmd {
+	if ws == nil {
+		return nil
+	}
+	cmds := make([]tea.Cmd, 0, len(ws.Agents))
+	for _, s := range ws.Agents {
+		if cmd := m.watchAgentEvents(s); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
 // scheduleStatusTick re-arms the poll timer at statusTickInterval.
 func (m Model) scheduleStatusTick() tea.Cmd {
 	return tea.Tick(m.statusTickInterval(), func(time.Time) tea.Msg { return statusTickMsg{} })
 }
 
-// pollUsageCmd runs one plan-usage fetch off the UI goroutine.
-func (m Model) pollUsageCmd() tea.Cmd {
+// pollUsageCmds runs one plan-usage fetch per enabled provider off the UI
+// goroutine. Provider failures are independent: a missing sign-in for one does
+// not suppress the other provider's snapshot.
+func (m Model) pollUsageCmds() tea.Cmd {
+	var cmds []tea.Cmd
+	if m.claudeEnabled() {
+		cmds = append(cmds, m.pollUsageCmd(agent.Claude))
+	}
+	if m.codexEnabled() {
+		cmds = append(cmds, m.pollUsageCmd(agent.Codex))
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m Model) pollUsageCmd(provider agent.Provider) tea.Cmd {
+	ctrl := m.ctrl
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		snap, err := usage.Fetch(ctx)
-		return usageMsg{snap: snap, err: err}
+		var (
+			snap usage.Snapshot
+			err  error
+		)
+		switch provider {
+		case agent.Codex:
+			cfg, cfgErr := ctrl.providerConfig(agent.Codex)
+			if cfgErr != nil {
+				err = cfgErr
+			} else {
+				snap, err = usage.FetchCodex(ctx, cfg.Command, cfg.Args)
+			}
+		default:
+			snap, err = usage.Fetch(ctx)
+		}
+		return usageMsg{provider: provider, snap: snap, err: err}
 	}
 }
 
@@ -636,8 +627,42 @@ func (m Model) scheduleUsageTick() tea.Cmd {
 
 // usageFresh reports whether the latest snapshot is recent enough to steer
 // the bar segment; the overlay keeps showing whatever it has regardless.
-func (m Model) usageFresh() bool {
-	return m.usageHave && time.Since(m.usageSnap.FetchedAt) <= usageStaleAfter
+func (m Model) usageState(provider agent.Provider) (usage.Snapshot, bool, []usageSample) {
+	if normalizedProvider(provider) == agent.Codex {
+		return m.codexUsageSnap, m.codexUsageHave, m.codexUsageHist
+	}
+	return m.usageSnap, m.usageHave, m.usageHist
+}
+
+func (m Model) usageFresh(provider agent.Provider) bool {
+	snap, have, _ := m.usageState(provider)
+	return have && time.Since(snap.FetchedAt) <= usageStaleAfter
+}
+
+func (m *Model) applyUsage(provider agent.Provider, snap usage.Snapshot) {
+	provider = normalizedProvider(provider)
+	_, _, hist := m.usageState(provider)
+	if window := sessionUsageWindow(snap); window != nil {
+		hist = append(hist, usageSample{at: snap.FetchedAt, util: window.Utilization})
+	}
+	cutoff := time.Now().Add(-usageHistoryWindow)
+	for len(hist) > 0 && hist[0].at.Before(cutoff) {
+		hist = hist[1:]
+	}
+	if provider == agent.Codex {
+		m.codexUsageSnap, m.codexUsageHave, m.codexUsageHist = snap, true, hist
+		return
+	}
+	m.usageSnap, m.usageHave, m.usageHist = snap, true, hist
+}
+
+func sessionUsageWindow(snap usage.Snapshot) *usage.Window {
+	for _, named := range snap.Windows() {
+		if named.Session {
+			return named.Window
+		}
+	}
+	return nil
 }
 
 // statusTickInterval picks the agent-poll cadence: 2s while any agent is
@@ -799,6 +824,10 @@ func (m Model) visibleSessions() []*session.Session {
 	return nil
 }
 
+func (m Model) overlayOpen() bool {
+	return m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen
+}
+
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -874,8 +903,101 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.plasma.Advance(plasmaTickInterval.Seconds())
 		return m, schedulePlasmaTick()
 
+	case agentEventMsg:
+		if !msg.open {
+			key, _, ok := m.agentLocation(msg.session)
+			if !ok {
+				return m, nil
+			}
+			pid := msg.session.Pid()
+			if status, tracked := m.agentStatus[pid]; tracked && normalizedProvider(status.Provider) == agent.Codex {
+				previous := status.Status
+				status.Status, status.WaitingFor = "idle", ""
+				m.applyProviderTransition(pid, key, previous, status)
+				m.agentStatus[pid] = status
+				if m.agentPrevStatus == nil {
+					m.agentPrevStatus = map[int]string{}
+				}
+				m.agentPrevStatus[pid] = status.Status
+			}
+			return m, nil
+		}
+		key, path, ok := m.agentLocation(msg.session)
+		if !ok {
+			// A final buffered event from a replaced/closed session must not
+			// mutate the replacement that may now reuse its pid.
+			return m, nil
+		}
+		pid := msg.session.Pid()
+		cmds := []tea.Cmd{m.watchAgentEvents(msg.session)}
+		if msg.event.Kind == agent.ThreadStarted && msg.event.ThreadID != "" && msg.session.SessionID != msg.event.ThreadID {
+			msg.session.SessionID = msg.event.ThreadID
+			cmds = append(cmds, m.saveAgents(key))
+		}
+
+		if m.agentStatus == nil {
+			m.agentStatus = map[int]AgentStatus{}
+		}
+		if m.agentPrevStatus == nil {
+			m.agentPrevStatus = map[int]string{}
+		}
+		previous := m.agentStatus[pid]
+		status := previous
+		status.Provider = agent.Codex
+		status.Cwd = path
+		if status.StartedAt == 0 {
+			status.StartedAt = time.Now().UnixMilli()
+		}
+		if status.Status == "" {
+			status.Status = "idle"
+		}
+		statusChanged := false
+		switch msg.event.Kind {
+		case agent.ThreadStatusChanged:
+			status.WaitingFor = ""
+			switch {
+			case msg.event.WaitingOnApproval:
+				status.Status, status.WaitingFor = "waiting", "permission prompt"
+			case msg.event.WaitingOnUserInput:
+				status.Status, status.WaitingFor = "waiting", "input needed"
+			case msg.event.Status == "active":
+				status.Status = "busy"
+			default:
+				status.Status = "idle"
+			}
+			statusChanged = true
+		case agent.TurnStarted:
+			status.Status, status.WaitingFor = "busy", ""
+			statusChanged = true
+		case agent.TurnCompleted:
+			if msg.event.Status == "inProgress" {
+				status.Status = "busy"
+			} else {
+				status.Status, status.WaitingFor = "idle", ""
+			}
+			statusChanged = true
+		case agent.Error:
+			status.Status, status.WaitingFor = "idle", ""
+			statusChanged = true
+			if msg.event.Message != "" {
+				cmds = append(cmds, m.flashCmd("Codex agent error: "+msg.event.Message))
+			}
+		case agent.Disconnected:
+			status.Status, status.WaitingFor = "idle", ""
+			statusChanged = true
+			cmds = append(cmds, m.flashCmd("Codex status connection lost"))
+		}
+		if statusChanged {
+			m.applyProviderTransition(pid, key, previous.Status, status)
+			m.agentStatus[pid] = status
+			m.agentPrevStatus[pid] = status.Status
+		}
+		return m, tea.Batch(cmds...)
+
 	case statusTickMsg:
-		m.maybeExpireStatus()
+		if !m.claudeEnabled() {
+			return m, nil
+		}
 		return m, m.pollStatusCmd()
 
 	case statusExpireMsg:
@@ -901,6 +1023,19 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err == nil {
 			m.pollFails = 0
+			// Claude polling is a replace-all snapshot for Claude only. Preserve
+			// Codex statuses, which arrive independently from App Server events.
+			nextStatus := make(map[int]AgentStatus, len(m.agentStatus)+len(msg.byPid))
+			for pid, st := range m.agentStatus {
+				if normalizedProvider(st.Provider) == agent.Codex {
+					nextStatus[pid] = st
+				}
+			}
+			for pid, st := range msg.byPid {
+				st.Provider = agent.Claude
+				msg.byPid[pid] = st
+				nextStatus[pid] = st
+			}
 			bell := false
 			for pid, st := range msg.byPid {
 				prev := m.agentPrevStatus[pid]
@@ -927,6 +1062,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if _, stillTracked := msg.byPid[pid]; stillTracked {
 					continue
 				}
+				if last, ok := m.agentStatus[pid]; !ok || normalizedProvider(last.Provider) != agent.Claude {
+					continue
+				}
 				if prev != "busy" {
 					continue
 				}
@@ -945,7 +1083,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.busySince == nil {
 				m.busySince = map[int]time.Time{}
 			}
-			for pid, st := range msg.byPid {
+			for pid, st := range nextStatus {
 				if st.Status == "busy" {
 					if _, ok := m.busySince[pid]; !ok {
 						m.busySince[pid] = time.Now()
@@ -955,7 +1093,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			for pid := range m.busySince {
-				if _, ok := msg.byPid[pid]; !ok {
+				if _, ok := nextStatus[pid]; !ok {
 					delete(m.busySince, pid)
 				}
 			}
@@ -967,21 +1105,23 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if e.startedAt == 0 {
 					continue
 				}
-				if st, ok := msg.byPid[pid]; ok && st.StartedAt != 0 && st.StartedAt != e.startedAt {
+				if st, ok := nextStatus[pid]; ok && st.StartedAt != 0 && st.StartedAt != e.startedAt {
 					delete(m.attention, pid)
 				}
 			}
-			m.agentPrevStatus = make(map[int]string, len(msg.byPid))
-			for pid, st := range msg.byPid {
+			m.agentPrevStatus = make(map[int]string, len(nextStatus))
+			for pid, st := range nextStatus {
 				m.agentPrevStatus[pid] = st.Status
 			}
-			m.agentStatus = msg.byPid
+			m.agentStatus = nextStatus
 		}
-		m.maybeExpireStatus()
 		return m, tea.Batch(m.scheduleStatusTick(), flashTick)
 
 	case usageTickMsg:
-		return m, m.pollUsageCmd()
+		if !m.usageEnabled() {
+			return m, nil
+		}
+		return m, tea.Batch(m.pollUsageCmds(), m.scheduleUsageTick())
 
 	case usageMsg:
 		// Not signed into Claude Code: the feature simply doesn't exist here.
@@ -990,26 +1130,19 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			// Degrade silently: the snapshot goes stale and the bar segment
-			// hides on its own; keep polling at the normal cadence.
-			m.usageFails++
-			return m, m.scheduleUsageTick()
+			// Degrade silently: this provider's snapshot goes stale and its bar
+			// segment hides on its own. The shared timer continues polling both.
+			return m, nil
 		}
-		m.usageFails = 0
-		m.usageSnap = msg.snap
-		m.usageHave = true
-		if w := msg.snap.FiveHour; w != nil {
-			m.usageHist = append(m.usageHist, usageSample{at: msg.snap.FetchedAt, util: w.Utilization})
-		}
-		cutoff := time.Now().Add(-usageHistoryWindow)
-		for len(m.usageHist) > 0 && m.usageHist[0].at.Before(cutoff) {
-			m.usageHist = m.usageHist[1:]
-		}
-		return m, m.scheduleUsageTick()
+		m.applyUsage(msg.provider, msg.snap)
+		return m, nil
 
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
 	case tea.MouseReleaseMsg:
+		if m.overlayOpen() {
+			return m, nil
+		}
 		m.forwardMouse(msg)
 		return m, nil
 	case tea.MouseWheelMsg:
@@ -1018,12 +1151,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.diffOpen {
 			return m.diffWheel(msg)
 		}
-		if m.screen == screenPicker && !m.helpOpen && !m.boardOpen && !m.paletteOpen {
+		if m.overlayOpen() {
+			return m, nil
+		}
+		if m.screen == screenPicker {
 			return m.deckWheel(msg)
 		}
 		m.forwardMouse(msg)
 		return m, nil
 	case tea.MouseMotionMsg:
+		if m.overlayOpen() {
+			return m, nil
+		}
 		m.forwardMouse(msg)
 		return m, nil
 
@@ -1052,29 +1191,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // and the non-session path of the paste router.
 func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	if m.filter.Focused() {
+	for _, in := range []*textinput.Model{&m.filter, &m.nameInput, &m.rootInput, &m.promptInput, &m.paletteInput} {
+		if !in.Focused() {
+			continue
+		}
 		var cmd tea.Cmd
-		m.filter, cmd = m.filter.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.nameInput.Focused() {
-		var cmd tea.Cmd
-		m.nameInput, cmd = m.nameInput.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.rootInput.Focused() {
-		var cmd tea.Cmd
-		m.rootInput, cmd = m.rootInput.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.promptInput.Focused() {
-		var cmd tea.Cmd
-		m.promptInput, cmd = m.promptInput.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.paletteInput.Focused() {
-		var cmd tea.Cmd
-		m.paletteInput, cmd = m.paletteInput.Update(msg)
+		*in, cmd = in.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
@@ -1189,6 +1311,28 @@ func (m Model) worktreeAttn(key string) attnLevel {
 	return level
 }
 
+// applyProviderTransition updates elapsed/attention state for one structured
+// provider event, matching the busy→waiting/idle semantics of Claude polling.
+func (m *Model) applyProviderTransition(pid int, key, previous string, status AgentStatus) {
+	if m.busySince == nil {
+		m.busySince = map[int]time.Time{}
+	}
+	if status.Status == "busy" {
+		if _, ok := m.busySince[pid]; !ok {
+			m.busySince[pid] = time.Now()
+		}
+	} else {
+		delete(m.busySince, pid)
+	}
+	if previous != "busy" || (status.Status != "idle" && status.Status != "waiting") || m.watchingAgent(pid) {
+		return
+	}
+	if status.Status == "idle" {
+		m.recordAttention(pid, attnDone, key, status.StartedAt)
+	}
+	fmt.Fprint(os.Stderr, "\a")
+}
+
 // attnSummary counts, for the bar badge: worktrees with a live-waiting agent
 // and worktrees with unread completions.
 func (m Model) attnSummary() (waiting, done int) {
@@ -1243,9 +1387,10 @@ func (m Model) buildBoard() (rows []boardRow, nav []int) {
 		for i, a := range ws.Agents {
 			pid := a.Pid()
 			attn := m.agentAttn(pid)
+			provider := normalizedProvider(a.Provider)
 			g.agents = append(g.agents, boardRow{
 				isAgent: true, key: key, repo: repoName, worktree: wtName, path: path,
-				agentIdx: i, pid: pid, label: agentTitle(a.Title),
+				agentIdx: i, pid: pid, label: agentTitle(provider, a.Title), provider: provider,
 				status: m.boardStatus(pid, attn), attn: attn,
 			})
 			if attn > g.attn {
@@ -1371,18 +1516,11 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return rows[nav[i]], true
 	}
-	// keyNotif is the legacy board alias (retired by default). When a user rebinds
-	// it, it doubles as a board-close key; at its empty default it never matches
-	// (key strings are never empty), so ctrl+n stays pure list-down navigation.
-	if m.keyNotif != "" && msg.String() == m.keyNotif {
-		m.boardOpen = false
-		return m, nil
-	}
 	switch msg.String() {
-	case "esc", "q", m.keyPalette:
+	case "esc", "q", m.keys.Palette:
 		m.boardOpen = false
 		return m, nil
-	case m.keyPrompt:
+	case m.keys.Prompt:
 		return m.openQuickPrompt()
 	case "up", "k", "ctrl+p":
 		if m.boardCursor > 0 {
@@ -1396,10 +1534,15 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n":
 		return m.openNewAgentForm(), nil
+	case "r":
+		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
+			return m.restartBoardAgent(r)
+		}
+		return m, nil
 	case "d":
 		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
 			m.mgr.CloseAgent(r.key, r.agentIdx)
-			delete(m.attention, r.pid)
+			m.clearAgentTracking(r.pid)
 			save := m.saveAgents(r.key)
 			_, nav = m.buildBoard()
 			m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
@@ -1425,6 +1568,50 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// restartBoardAgent transactionally replaces the selected process in place.
+// Manager.ReplaceAgent starts the replacement before swapping it into the pool,
+// so a bad command leaves the current conversation alive and focused.
+func (m Model) restartBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
+	ws, ok := m.mgr.Workspace(r.key)
+	if !ok || r.agentIdx < 0 || r.agentIdx >= len(ws.Agents) {
+		return m, nil
+	}
+	old := ws.Agents[r.agentIdx]
+	provider := normalizedProvider(old.Provider)
+	if provider == agent.Claude && r.key == "~/config" {
+		if err := m.ctrl.EnsureHomeDirTrusted(); err != nil {
+			m.setError("trust setup error: " + err.Error())
+			return m, nil
+		}
+	}
+	var (
+		spec session.Spec
+		err  error
+	)
+	if old.SessionID == "" {
+		spec, err = m.ctrl.NewProviderAgentSpec(provider, old.Title, "", AgentForeground)
+	} else {
+		spec, err = m.ctrl.RestoreProviderAgentSpec(provider, old.SessionID, old.Title, "", AgentForeground)
+	}
+	if err != nil {
+		m.setError("restart error: " + err.Error())
+		return m, nil
+	}
+	spec, err = m.prepareAgentSpec(r.path, spec)
+	if err != nil {
+		m.setError("restart error: " + err.Error())
+		return m, nil
+	}
+	w, h := m.sessionSize()
+	replacement, err := m.mgr.ReplaceAgent(r.key, r.path, r.agentIdx, spec, w, h)
+	if err != nil {
+		m.setError("restart error: " + err.Error())
+		return m, nil
+	}
+	m.clearAgentTracking(r.pid)
+	return m, tea.Batch(m.saveAgents(r.key), m.watchAgentEvents(replacement), m.flashCmd(providerName(provider)+" agent restarted"))
 }
 
 // focusBoardAgent navigates directly to an agent's pane: it activates the
@@ -1534,24 +1721,13 @@ func (m Model) paletteCommands() []paletteCmd {
 	// 3. View navigation — only meaningful with an active workspace.
 	if m.current != nil {
 		cmds = append(cmds,
-			paletteCmd{title: "go to editor", hint: m.keyGotoEditor, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenEditor) }},
-			paletteCmd{title: "go to agent", hint: m.keyGotoAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenAgent) }},
-			paletteCmd{title: "go to terminal", hint: m.keyGotoTerm, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenTerminal) }},
+			paletteCmd{title: "go to editor", hint: m.keys.GotoEditor, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenEditor) }},
+			paletteCmd{title: "go to agent", hint: m.keys.GotoAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenAgent) }},
+			paletteCmd{title: "go to terminal", hint: m.keys.GotoTerm, run: func(m Model) (tea.Model, tea.Cmd) { return m.gotoScreen(screenTerminal) }},
 		)
 		if m.screen != screenPicker {
-			cmds = append(cmds, paletteCmd{title: "back to deck", hint: m.keyPicker, run: func(m Model) (tea.Model, tea.Cmd) {
-				// Replicates the keyPicker branch of handleSessionKey.
-				if m.current != nil {
-					if m.lastScreens == nil {
-						m.lastScreens = map[string]screen{}
-					}
-					m.lastScreens[m.current.key] = m.screen
-				}
-				m.screen = screenPicker
-				if len(m.active) > 0 {
-					m.focus = focusActive
-				}
-				return m, m.loadCmd()
+			cmds = append(cmds, paletteCmd{title: "back to deck", hint: m.keys.Picker, run: func(m Model) (tea.Model, tea.Cmd) {
+				return m.returnToDeck()
 			}})
 		}
 	}
@@ -1559,65 +1735,55 @@ func (m Model) paletteCommands() []paletteCmd {
 	// 4. Agents — the board, the new-agent launchers, agent rotation (only with a
 	// pool worth rotating), and the home workspace.
 	cmds = append(cmds,
-		paletteCmd{title: "open agent board", hint: m.keyPalette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
+		paletteCmd{title: "open agent board", hint: m.keys.Palette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
 		paletteCmd{title: "new agent…", run: func(m Model) (tea.Model, tea.Cmd) { return m.openNewAgentForm(), nil }},
-		paletteCmd{title: "new background agent (quick prompt)…", hint: m.keyPrompt, run: func(m Model) (tea.Model, tea.Cmd) { return m.openQuickPrompt() }},
+		paletteCmd{title: "new background agent (quick prompt)…", hint: m.keys.Prompt, run: func(m Model) (tea.Model, tea.Cmd) { return m.openQuickPrompt() }},
 	)
 	if m.current != nil && m.current.ws != nil && len(m.current.ws.Agents) >= 2 {
 		cmds = append(cmds,
-			paletteCmd{title: "next agent", hint: m.keyNextAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(+1) }},
-			paletteCmd{title: "previous agent", hint: m.keyPrevAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(-1) }},
+			paletteCmd{title: "next agent", hint: m.keys.NextAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(+1) }},
+			paletteCmd{title: "previous agent", hint: m.keys.PrevAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(-1) }},
 		)
 	}
-	cmds = append(cmds, paletteCmd{title: "open home workspace", hint: m.keyGlobalConfig, run: func(m Model) (tea.Model, tea.Cmd) { return m.activateGlobalConfig() }})
+	cmds = append(cmds, paletteCmd{title: "open home workspace", hint: m.keys.GlobalConfig, run: func(m Model) (tea.Model, tea.Cmd) { return m.activateGlobalConfig() }})
 
 	// 5. Terminal panes — each switches to the terminal screen first, so the
 	// palette can split/zoom/close from any screen (strictly more capable than
 	// the chords, which are terminal-screen only).
 	if m.current != nil {
 		cmds = append(cmds,
-			paletteCmd{title: "split terminal right", hint: m.keyTermSplitV, run: func(m Model) (tea.Model, tea.Cmd) {
+			paletteCmd{title: "split terminal right", hint: m.keys.TermSplitV, run: func(m Model) (tea.Model, tea.Cmd) {
 				m.screen = screenTerminal
-				key := m.current.key
-				w, h := m.sessionSize()
-				_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitV, w, h)
-				m.mgr.ResizeTermPanes(key, w, h)
-				return m, nil
+				return m.splitTerm(session.SplitV)
 			}},
-			paletteCmd{title: "split terminal below", hint: m.keyTermSplitH, run: func(m Model) (tea.Model, tea.Cmd) {
+			paletteCmd{title: "split terminal below", hint: m.keys.TermSplitH, run: func(m Model) (tea.Model, tea.Cmd) {
 				m.screen = screenTerminal
-				key := m.current.key
-				w, h := m.sessionSize()
-				_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitH, w, h)
-				m.mgr.ResizeTermPanes(key, w, h)
-				return m, nil
+				return m.splitTerm(session.SplitH)
 			}},
-			paletteCmd{title: "zoom terminal pane", hint: m.keyTermZoom, run: func(m Model) (tea.Model, tea.Cmd) {
+			paletteCmd{title: "zoom terminal pane", hint: m.keys.TermZoom, run: func(m Model) (tea.Model, tea.Cmd) {
 				m.screen = screenTerminal
 				return m.toggleZoom()
 			}},
-			paletteCmd{title: "close terminal pane", hint: m.keyTermClose, run: func(m Model) (tea.Model, tea.Cmd) {
+			paletteCmd{title: "close terminal pane", hint: m.keys.TermClose, run: func(m Model) (tea.Model, tea.Cmd) {
 				m.screen = screenTerminal
-				key := m.current.key
-				w, h := m.sessionSize()
-				_ = m.mgr.CloseTermPane(key)
-				m.mgr.ResizeTermPanes(key, w, h)
-				return m, nil
+				return m.closeTermPane()
 			}},
 		)
 	}
 
 	// 6. Misc / global — always available. Quit sits last and reuses the picker's
 	// ctrl+c guard: with a busy hosted agent it drops to the deck and asks first.
-	cmds = append(cmds,
-		paletteCmd{title: "show plan usage", hint: m.keyUsage, run: func(m Model) (tea.Model, tea.Cmd) {
+	if m.usageEnabled() {
+		cmds = append(cmds, paletteCmd{title: "show usage limits", hint: m.keys.Usage, run: func(m Model) (tea.Model, tea.Cmd) {
 			m.usageOpen = true
 			return m, nil
-		}},
+		}})
+	}
+	cmds = append(cmds,
 		paletteCmd{title: "refresh deck", hint: "r", run: func(m Model) (tea.Model, tea.Cmd) {
 			return m, m.loadCmd()
 		}},
-		paletteCmd{title: "help", hint: m.keyHelp, run: func(m Model) (tea.Model, tea.Cmd) {
+		paletteCmd{title: "help", hint: m.keys.Help, run: func(m Model) (tea.Model, tea.Cmd) {
 			m.helpOpen = true
 			return m, nil
 		}},
@@ -1685,7 +1851,7 @@ func (m Model) closePalette() Model {
 // input.
 func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc", m.keyCommandPalette:
+	case "esc", m.keys.CommandPalette:
 		return m.closePalette(), nil
 	case "up", "ctrl+p":
 		if m.paletteCursor > 0 {
@@ -1735,12 +1901,17 @@ func (m Model) openNewAgentForm() tea.Model {
 	m.boardOpen = true
 	m.formOpen = true
 	m.formFocus = formFieldPrompt
+	m.formProvider = m.defaultAgentProvider
+	if !providerIn(m.formProvider, m.agentProviders) {
+		m.formProvider = m.agentProviders[0]
+	}
 	m.formLocation = 0
 	if m.current == nil {
 		m.formLocation = 1
 	}
 	m.formBackground = false
 	m.promptInput.SetValue("")
+	m.updatePromptPlaceholder()
 	m.promptInput.Focus()
 	return m
 }
@@ -1754,15 +1925,55 @@ func (m Model) openQuickPrompt() (tea.Model, tea.Cmd) {
 	return mm, mm.promptInput.Focus()
 }
 
-// setFormFocus moves the new-agent form's focus to field f (wrapping), keeping
+// formFields returns the fields in navigation order. The provider row is
+// omitted entirely when there is no choice to make, preserving the legacy
+// prompt → where → mode traversal.
+func (m Model) formFields() []int {
+	fields := []int{formFieldPrompt}
+	if len(m.agentProviders) > 1 {
+		fields = append(fields, formFieldProvider)
+	}
+	return append(fields, formFieldWhere, formFieldMode)
+}
+
+// moveFormFocus moves by delta through the visible fields, wrapping, and keeps
 // the prompt input's focus state in sync.
-func (m Model) setFormFocus(f int) (Model, tea.Cmd) {
-	m.formFocus = ((f % formFieldCount) + formFieldCount) % formFieldCount
+func (m Model) moveFormFocus(delta int) (Model, tea.Cmd) {
+	fields := m.formFields()
+	idx := 0
+	for i, field := range fields {
+		if field == m.formFocus {
+			idx = i
+			break
+		}
+	}
+	idx = ((idx+delta)%len(fields) + len(fields)) % len(fields)
+	m.formFocus = fields[idx]
 	m.promptInput.Blur()
 	if m.formFocus == formFieldPrompt {
 		return m, m.promptInput.Focus()
 	}
 	return m, nil
+}
+
+func (m *Model) updatePromptPlaceholder() {
+	m.promptInput.Placeholder = "What should " + providerName(m.formProvider) + " do?"
+}
+
+func (m *Model) cycleFormProvider(delta int) {
+	if len(m.agentProviders) < 2 {
+		return
+	}
+	idx := 0
+	for i, provider := range m.agentProviders {
+		if provider == m.formProvider {
+			idx = i
+			break
+		}
+	}
+	idx = ((idx+delta)%len(m.agentProviders) + len(m.agentProviders)) % len(m.agentProviders)
+	m.formProvider = m.agentProviders[idx]
+	m.updatePromptPlaceholder()
 }
 
 // handleBoardForm drives the new-agent form: tab/shift+tab (or ↑↓, or the
@@ -1776,9 +1987,9 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.promptInput.Blur()
 		return m, nil
 	case "tab", "down", "ctrl+n":
-		return m.setFormFocus(m.formFocus + 1)
+		return m.moveFormFocus(1)
 	case "shift+tab", "up", "ctrl+p":
-		return m.setFormFocus(m.formFocus - 1)
+		return m.moveFormFocus(-1)
 	case "enter":
 		return m.launchAgent()
 	}
@@ -1789,7 +2000,13 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "left", "right", "h", "l", "space":
-		if m.formFocus == formFieldWhere {
+		if m.formFocus == formFieldProvider {
+			delta := 1
+			if msg.String() == "left" || msg.String() == "h" {
+				delta = -1
+			}
+			m.cycleFormProvider(delta)
+		} else if m.formFocus == formFieldWhere {
 			m.formLocation = 1 - m.formLocation
 		} else {
 			m.formBackground = !m.formBackground
@@ -1828,7 +2045,20 @@ func randomAgentTitle() string {
 func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	key := repoName + "/" + wtName
 	w, h := m.sessionSize()
-	ws, err := m.mgr.Activate(key, dir, m.workspaceSpecs(key), w, h)
+	wasActive := m.mgr.Has(key)
+	var specs []session.Spec
+	if !wasActive {
+		var err error
+		specs, err = m.workspaceSpecs(key, true)
+		if err == nil {
+			specs, err = m.prepareWorkspaceSpecs(dir, specs)
+		}
+		if err != nil {
+			m.setError("open error: " + err.Error())
+			return m, m.loadCmd()
+		}
+	}
+	ws, err := m.mgr.Activate(key, dir, specs, w, h)
 	if err != nil {
 		m.setError("open error: " + err.Error())
 		return m, m.loadCmd()
@@ -1858,26 +2088,73 @@ func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 		m.persistAgents(key)
 		save = m.writeStateCmd()
 	}
-	return m, tea.Batch(m.loadCmd(), save)
+	var watches tea.Cmd
+	if !wasActive {
+		watches = m.watchWorkspaceAgents(ws)
+	}
+	return m, tea.Batch(m.loadCmd(), save, watches)
 }
 
 // workspaceSpecs builds the session set for activating key: nvim and a shell
-// always, plus either the resumed agent pool persisted from key's last run or, if
-// none, a single fresh claude session.
-func (m Model) workspaceSpecs(key string) []session.Spec {
+// always, plus the resumed provider-aware agent pool. When addDefault is true,
+// an empty pool gets one fresh agent from the configured default provider.
+// Launching into an unopened home workspace passes false so the explicitly
+// selected agent is the only one created.
+func (m Model) workspaceSpecs(key string, addDefault bool) ([]session.Spec, error) {
 	specs := []session.Spec{m.ctrl.EditorSpec()}
 	var saved []state.AgentState
 	if m.state != nil {
 		saved, _ = m.state.Agents(key)
 	}
-	if len(saved) == 0 {
-		specs = append(specs, m.ctrl.NewAgentSpec(""))
+	if len(saved) == 0 && addDefault {
+		spec, err := m.ctrl.NewProviderAgentSpec(m.defaultAgentProvider, "", "", AgentForeground)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
 	} else {
 		for _, a := range saved {
-			specs = append(specs, m.ctrl.AgentSpec(a.SessionID, a.Label))
+			provider := normalizedProvider(a.Provider)
+			spec, err := m.ctrl.RestoreProviderAgentSpec(provider, a.SessionID, a.Label, "", AgentForeground)
+			if err != nil {
+				return nil, err
+			}
+			specs = append(specs, spec)
 		}
 	}
-	return append(specs, m.ctrl.TermSpec())
+	return append(specs, m.ctrl.TermSpec()), nil
+}
+
+// prepareWorkspaceSpecs starts provider companions before their interactive
+// sessions. On a partial failure, already-started companions are closed.
+func (m Model) prepareWorkspaceSpecs(dir string, specs []session.Spec) ([]session.Spec, error) {
+	prepared := append([]session.Spec(nil), specs...)
+	for i := range prepared {
+		if prepared[i].Kind != session.Agent {
+			continue
+		}
+		var err error
+		prepared[i], err = m.prepareAgentSpec(dir, prepared[i])
+		if err != nil {
+			closeSpecCompanions(prepared)
+			return nil, err
+		}
+	}
+	return prepared, nil
+}
+
+func (m Model) prepareAgentSpec(dir string, spec session.Spec) (session.Spec, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	return m.ctrl.PrepareAgentSpec(ctx, dir, spec)
+}
+
+func closeSpecCompanions(specs []session.Spec) {
+	for _, spec := range specs {
+		if spec.Companion != nil {
+			_ = spec.Companion.Close()
+		}
+	}
 }
 
 // savedActiveAgent returns the focused-agent index persisted for key, or 0.
@@ -1905,7 +2182,9 @@ func (m *Model) persistAgents(key string) {
 		if s.SessionID == "" {
 			continue // not a ct-managed claude session; nothing to resume
 		}
-		agents = append(agents, state.AgentState{SessionID: s.SessionID, Label: s.Title})
+		agents = append(agents, state.AgentState{
+			Provider: normalizedProvider(s.Provider), SessionID: s.SessionID, Label: s.Title,
+		})
 	}
 	m.state.SetAgents(key, agents, ws.ActiveAgent)
 }
@@ -1971,7 +2250,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	if msg.String() == m.keyHelp {
+	if msg.String() == m.keys.Help {
 		m.helpOpen = true
 		return m, nil
 	}
@@ -1982,7 +2261,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.paletteOpen {
 		return m.handlePalette(msg)
 	}
-	if msg.String() == m.keyCommandPalette {
+	if msg.String() == m.keys.CommandPalette {
 		if m.screen == screenPicker && m.mode != modeNormal {
 			return m, nil
 		}
@@ -1998,7 +2277,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// on esc or its own key, and swallows everything else so no keystroke
 	// leaks into the session underneath.
 	if m.usageOpen {
-		if s := msg.String(); s == "esc" || s == m.keyUsage {
+		if s := msg.String(); s == "esc" || s == m.keys.Usage {
 			m.usageOpen = false
 		}
 		return m, nil
@@ -2006,25 +2285,23 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.boardOpen {
 		return m.handleBoard(msg)
 	}
-	// keyNotif is a legacy alias for the board (it replaced the notification
-	// overlay), kept so existing muscle memory and configs work.
-	if msg.String() == m.keyPalette || msg.String() == m.keyNotif {
+	if msg.String() == m.keys.Palette {
 		return m.openBoard()
 	}
-	if msg.String() == m.keyPrompt {
+	if msg.String() == m.keys.Prompt {
 		return m.openQuickPrompt()
 	}
-	if msg.String() == m.keyGlobalConfig {
+	if msg.String() == m.keys.GlobalConfig {
 		return m.activateGlobalConfig()
 	}
 	// Direct-jump keys work from session screens and from the picker whenever a
 	// workspace is active; they no-op with none.
 	switch msg.String() {
-	case m.keyGotoEditor:
+	case m.keys.GotoEditor:
 		return m.gotoScreen(screenEditor)
-	case m.keyGotoAgent:
+	case m.keys.GotoAgent:
 		return m.gotoScreen(screenAgent)
-	case m.keyGotoTerm:
+	case m.keys.GotoTerm:
 		return m.gotoScreen(screenTerminal)
 	}
 	if m.screen != screenPicker {
@@ -2057,18 +2334,18 @@ func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
 // into the session beneath, exactly the leak the help swallow prevents.
 func (m Model) isReservedActionKey(s string) bool {
 	switch s {
-	case m.keyCycle, m.keyCycleBack, m.keyPicker, m.keyPalette, m.keyNotif, m.keyPrompt,
-		m.keyGlobalConfig, m.keyNextAgent, m.keyPrevAgent, m.keyCommandPalette,
-		m.keyGotoEditor, m.keyGotoAgent, m.keyGotoTerm:
+	case m.keys.Cycle, m.keys.CycleBack, m.keys.Picker, m.keys.Palette, m.keys.Prompt,
+		m.keys.GlobalConfig, m.keys.NextAgent, m.keys.PrevAgent, m.keys.CommandPalette,
+		m.keys.GotoEditor, m.keys.GotoAgent, m.keys.GotoTerm:
 		return true
 	}
-	if s == m.keyUsage && m.screen == screenAgent {
+	if s == m.keys.Usage && m.screen == screenAgent && m.usageEnabled() {
 		return true
 	}
 	if m.screen == screenTerminal {
 		switch s {
-		case m.keyTermSplitV, m.keyTermSplitH, m.keyTermCycle, m.keyTermZoom, m.keyTermClose,
-			m.keyTermFocusLeft, m.keyTermFocusDown, m.keyTermFocusUp, m.keyTermFocusRight:
+		case m.keys.TermSplitV, m.keys.TermSplitH, m.keys.TermZoom, m.keys.TermClose,
+			m.keys.TermFocusLeft, m.keys.TermFocusDown, m.keys.TermFocusUp, m.keys.TermFocusRight:
 			return true
 		}
 	}
@@ -2096,7 +2373,11 @@ func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.ctrl.SetRoot(abs)
 		m.screen = screenPicker
 		flashTick := m.flashCmd("config saved — welcome to caretaker!")
-		return m, tea.Batch(m.loadCmd(), m.pollStatusCmd(), m.pollUsageCmd(), flashTick)
+		cmds := []tea.Cmd{m.loadCmd(), m.pollStatusCmd(), flashTick}
+		if m.usageEnabled() {
+			cmds = append(cmds, m.pollUsageCmds(), m.scheduleUsageTick())
+		}
+		return m, tea.Batch(cmds...)
 	}
 	var cmd tea.Cmd
 	m.rootInput, cmd = m.rootInput.Update(msg)
@@ -2108,75 +2389,54 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// The usage key is only reserved on the agent screen (where the gauge
 	// lives); everywhere else it stays an ordinary session key and is
 	// forwarded below.
-	if msg.String() == m.keyUsage && m.screen == screenAgent {
+	if msg.String() == m.keys.Usage && m.screen == screenAgent && m.usageEnabled() {
 		m.usageOpen = true
 		return m, nil
 	}
 	switch msg.String() {
-	case m.keyCycle:
+	case m.keys.Cycle:
 		m.screen = m.screen.next()
 		if m.screen == screenAgent && m.current != nil {
 			m.clearWorkspaceAttention()
 		}
 		return m, nil
-	case m.keyCycleBack:
+	case m.keys.CycleBack:
 		m.screen = m.screen.prev()
 		if m.screen == screenAgent && m.current != nil {
 			m.clearWorkspaceAttention()
 		}
 		return m, nil
-	case m.keyPicker:
-		if m.current != nil {
-			if m.lastScreens == nil {
-				m.lastScreens = map[string]screen{}
-			}
-			m.lastScreens[m.current.key] = m.screen
-		}
-		m.screen = screenPicker
-		if len(m.active) > 0 {
-			m.focus = focusActive
-		}
-		// Refresh the deck on entry: dirty markers and worktree lists go stale
-		// while you edit inside a session, and this is the moment they're read.
-		return m, m.loadCmd()
-	case m.keyNextAgent:
+	case m.keys.Picker:
+		return m.returnToDeck()
+	case m.keys.NextAgent:
 		return m.rotateAgent(+1)
-	case m.keyPrevAgent:
+	case m.keys.PrevAgent:
 		return m.rotateAgent(-1)
 	}
 	if m.screen == screenTerminal && m.current != nil {
 		key := m.current.key
 		w, h := m.sessionSize()
 		switch msg.String() {
-		case m.keyTermSplitV:
-			_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitV, w, h)
-			m.mgr.ResizeTermPanes(key, w, h)
-			return m, nil
-		case m.keyTermSplitH:
-			_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), session.SplitH, w, h)
-			m.mgr.ResizeTermPanes(key, w, h)
-			return m, nil
-		case m.keyTermCycle:
-			m.mgr.CycleTermPane(key)
-			return m, nil
-		case m.keyTermFocusLeft:
+		case m.keys.TermSplitV:
+			return m.splitTerm(session.SplitV)
+		case m.keys.TermSplitH:
+			return m.splitTerm(session.SplitH)
+		case m.keys.TermFocusLeft:
 			m.mgr.FocusTermPaneDir(key, session.FocusLeft, w, h)
 			return m, nil
-		case m.keyTermFocusDown:
+		case m.keys.TermFocusDown:
 			m.mgr.FocusTermPaneDir(key, session.FocusDown, w, h)
 			return m, nil
-		case m.keyTermFocusUp:
+		case m.keys.TermFocusUp:
 			m.mgr.FocusTermPaneDir(key, session.FocusUp, w, h)
 			return m, nil
-		case m.keyTermFocusRight:
+		case m.keys.TermFocusRight:
 			m.mgr.FocusTermPaneDir(key, session.FocusRight, w, h)
 			return m, nil
-		case m.keyTermZoom:
+		case m.keys.TermZoom:
 			return m.toggleZoom()
-		case m.keyTermClose:
-			_ = m.mgr.CloseTermPane(key)
-			m.mgr.ResizeTermPanes(key, w, h)
-			return m, nil
+		case m.keys.TermClose:
+			return m.closeTermPane()
 		}
 	}
 
@@ -2184,6 +2444,54 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m = m.dismissHint()
 		s.SendKey(toUVKey(msg))
 	}
+	return m, nil
+}
+
+// returnToDeck leaves the active session for the picker: it records the current
+// workspace's last-viewed screen (so reopening lands there), switches to the
+// deck, focuses the active list when it's non-empty, and refreshes the deck —
+// dirty markers and worktree lists go stale while you edit inside a session, and
+// this is the moment they're re-read. Shared by handleSessionKey's picker branch
+// and the command palette's "back to deck" row.
+func (m Model) returnToDeck() (tea.Model, tea.Cmd) {
+	if m.current != nil {
+		if m.lastScreens == nil {
+			m.lastScreens = map[string]screen{}
+		}
+		m.lastScreens[m.current.key] = m.screen
+	}
+	m.screen = screenPicker
+	if len(m.active) > 0 {
+		m.focus = focusActive
+	}
+	return m, m.loadCmd()
+}
+
+// splitTerm spawns a new terminal pane splitting the current workspace's active
+// pane in dir, then resizes the layout to fit. Shared by the terminal-screen
+// split keys and the palette's split rows. A no-op without a current workspace.
+func (m Model) splitTerm(dir session.SplitDir) (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	key := m.current.key
+	w, h := m.sessionSize()
+	_, _ = m.mgr.SplitTermPane(key, m.current.path, m.ctrl.TermSpec(), dir, w, h)
+	m.mgr.ResizeTermPanes(key, w, h)
+	return m, nil
+}
+
+// closeTermPane closes the current workspace's active terminal pane and resizes
+// the remaining layout. Shared by the terminal-screen close key and the
+// palette's close row. A no-op without a current workspace.
+func (m Model) closeTermPane() (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	key := m.current.key
+	w, h := m.sessionSize()
+	_ = m.mgr.CloseTermPane(key)
+	m.mgr.ResizeTermPanes(key, w, h)
 	return m, nil
 }
 
@@ -2214,88 +2522,117 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	m.boardOpen = false
 	m.promptInput.Blur()
 	w, h := m.sessionSize()
+	var restoredWatches tea.Cmd
 
-	if m.formLocation == 0 {
-		// Active worktree.
-		if m.current == nil {
-			return m, m.flashCmd("no active workspace")
-		}
-		spec := m.ctrl.NewAgentSpec(label)
-		sess, err := m.mgr.SpawnAgent(m.current.key, m.current.path, spec, w, h)
-		if err != nil {
-			m.setError("spawn error: " + err.Error())
-			return m, nil
-		}
-		if prompt != "" {
-			_, _ = sess.WriteInput([]byte(prompt + "\n"))
-		}
-		save := m.saveAgents(m.current.key)
-		if m.formBackground {
-			return m, tea.Batch(save, m.flashCmd("agent launched in background"))
-		}
-		m.screen = screenAgent
-		m.clearWorkspaceAttention()
-		return m, tea.Batch(save, m.flashCmd("agent launched"))
-	}
-
-	// Home worktree.
-	home, err := m.ctrl.GlobalConfigDir()
-	if err != nil {
-		m.setError("home dir error: " + err.Error())
-		return m, nil
-	}
-	homeKey := "~/config"
-	m.homeWSPath = home
-	m.homeWSKey = homeKey
-	if _, err := m.mgr.Activate(homeKey, home, m.workspaceSpecs(homeKey), w, h); err != nil {
-		m.setError("open error: " + err.Error())
-		return m, nil
-	}
-	if err := m.ctrl.EnsureHomeDirTrusted(); err != nil {
-		m.setError("trust setup error: " + err.Error())
-		return m, nil
-	}
-
+	const homeKey = "~/config"
+	isHome := m.formLocation == 1
+	provider := normalizedProvider(m.formProvider)
+	agentMode := AgentForeground
 	if m.formBackground {
-		spec := m.ctrl.PromptAgentSpec(label)
-		sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
-		if err != nil {
-			m.setError("spawn error: " + err.Error())
-			return m, nil
-		}
-		if prompt != "" {
-			_, _ = sess.WriteInput([]byte(prompt + "\n"))
-		}
-		var save tea.Cmd
-		if m.state != nil {
-			m.state.Touch(homeKey)
-			save = m.saveAgents(homeKey)
-		}
-		return m, tea.Batch(save, m.flashCmd("background agent launched"))
+		agentMode = AgentBackground
 	}
-
-	// Home + foreground: spawn an interactive agent and navigate there.
-	spec := m.ctrl.NewAgentSpec(label)
-	sess, err := m.mgr.SpawnAgent(homeKey, home, spec, w, h)
+	spec, err := m.ctrl.NewProviderAgentSpec(provider, label, prompt, agentMode)
 	if err != nil {
 		m.setError("spawn error: " + err.Error())
 		return m, nil
 	}
-	if prompt != "" {
-		_, _ = sess.WriteInput([]byte(prompt + "\n"))
+
+	// Resolve the target workspace's (key, path). The home workspace is
+	// synthetic: before it can host an agent it must be opened, trusted, and
+	// recorded, exactly as a first activation would do.
+	var key, path string
+	if !isHome {
+		if m.current == nil {
+			return m, m.flashCmd("no active workspace")
+		}
+		key, path = m.current.key, m.current.path
+	} else {
+		home, err := m.ctrl.GlobalConfigDir()
+		if err != nil {
+			m.setError("home dir error: " + err.Error())
+			return m, nil
+		}
+		m.homeWSPath = home
+		m.homeWSKey = homeKey
+		if provider == agent.Claude {
+			if err := m.ctrl.EnsureHomeDirTrusted(); err != nil {
+				m.setError("trust setup error: " + err.Error())
+				return m, nil
+			}
+		}
+		// Restore any saved pool, but don't synthesize a default agent when the
+		// home workspace has never been opened: the selected provider below is
+		// the requested first agent.
+		specs, err := m.workspaceSpecs(homeKey, false)
+		if err != nil {
+			m.setError("open error: " + err.Error())
+			return m, nil
+		}
+		homeWasActive := m.mgr.Has(homeKey)
+		if !homeWasActive {
+			specs, err = m.prepareWorkspaceSpecs(home, specs)
+			if err != nil {
+				m.setError("open error: " + err.Error())
+				return m, nil
+			}
+		}
+		homeWS, err := m.mgr.Activate(homeKey, home, specs, w, h)
+		if err != nil {
+			m.setError("open error: " + err.Error())
+			return m, nil
+		}
+		if !homeWasActive {
+			restoredWatches = m.watchWorkspaceAgents(homeWS)
+		}
+		key, path = homeKey, home
 	}
-	// Persist the new active agent before activate() reads saved state.
-	m.persistAgents(homeKey)
-	mm, cmd := m.activate("~", "config", home)
-	model := mm.(Model)
-	model.screen = screenAgent
-	return model, tea.Batch(cmd, model.flashCmd("agent launched"))
+
+	spec, err = m.prepareAgentSpec(path, spec)
+	if err != nil {
+		m.setError("spawn error: " + err.Error())
+		return m, nil
+	}
+	spawned, err := m.mgr.SpawnAgent(key, path, spec, w, h)
+	if err != nil {
+		m.setError("spawn error: " + err.Error())
+		return m, nil
+	}
+
+	// Home + foreground navigates through activate(), which rebuilds the pane
+	// pool from persisted state — so persist the new agent first, then hand off.
+	if isHome && !m.formBackground {
+		m.persistAgents(homeKey)
+		mm, cmd := m.activate("~", "config", path)
+		model := mm.(Model)
+		model.screen = screenAgent
+		return model, tea.Batch(cmd, restoredWatches, model.watchAgentEvents(spawned), model.flashCmd("agent launched"))
+	}
+
+	// Home background records the open so the board can order it; both background
+	// paths and the active-foreground path save the workspace's agent pool.
+	if isHome && m.state != nil {
+		m.state.Touch(homeKey)
+	}
+	save := m.saveAgents(key)
+	if m.formBackground {
+		flash := "agent launched in background"
+		if isHome {
+			flash = "background agent launched"
+		}
+		return m, tea.Batch(save, m.flashCmd(flash))
+	}
+	m.screen = screenAgent
+	m.clearWorkspaceAttention()
+	return m, tea.Batch(save, restoredWatches, m.watchAgentEvents(spawned), m.flashCmd("agent launched"))
 }
 
 // handleMouseClick switches tabs when a left-click lands on a bar icon, focuses
 // the terminal pane under a click in a split layout, and otherwise forwards the
 // click to the active session.
 func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if m.overlayOpen() {
+		return m, nil
+	}
 	mo := msg.Mouse()
 	if mo.Button == tea.MouseLeft {
 		if s, ok := m.tabAt(mo.X, mo.Y); ok {
@@ -2552,7 +2889,7 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	// The picker key jumps straight to the most recently activated worktree, so
 	// it toggles: session -> picker -> back to the most recent work.
-	if msg.String() == m.keyPicker {
+	if msg.String() == m.keys.Picker {
 		if r, w, p, ok := m.mostRecentWorktree(); ok {
 			return m.activate(r, w, p)
 		}
@@ -2976,6 +3313,11 @@ func prevFileLine(fileLines []int, offset int) int {
 // stopWorkspace closes a workspace's sessions (dropping its stale attention
 // markers) and, if it was current, returns to the picker.
 func (m *Model) stopWorkspace(key string) {
+	if ws, ok := m.mgr.Workspace(key); ok {
+		for _, s := range ws.Agents {
+			m.clearAgentTracking(s.Pid())
+		}
+	}
 	m.mgr.Close(key)
 	for pid, e := range m.attention {
 		if e.key == key {
@@ -2986,6 +3328,13 @@ func (m *Model) stopWorkspace(key string) {
 		m.current = nil
 		m.screen = screenPicker
 	}
+}
+
+func (m *Model) clearAgentTracking(pid int) {
+	delete(m.attention, pid)
+	delete(m.agentStatus, pid)
+	delete(m.agentPrevStatus, pid)
+	delete(m.busySince, pid)
 }
 
 func wsKey(repoName, wtName string) string { return repoName + "/" + wtName }
@@ -3011,13 +3360,12 @@ func (m *Model) flash(s string) {
 }
 
 // flashCmd sets a transient status like flash and returns a dedicated one-shot
-// tick that expires it after transientStatusTTL. The agent-status poll also
-// calls maybeExpireStatus, but its cadence stretches to 30s on an idle deck, so
-// relying on it alone lets flashes linger far past their TTL; this tick fires on
-// its own timer regardless of deck activity. It's stamped with the current
-// statusAt so a flash set before it fires won't be cleared early (see
-// statusExpireMsg). Callers batch the returned cmd with any command they already
-// return.
+// tick that expires it after transientStatusTTL by calling maybeExpireStatus.
+// This tick fires on its own timer regardless of deck activity, so a flash
+// never lingers past its TTL waiting on some other event loop. It's stamped
+// with the current statusAt so a flash set before it fires won't be cleared
+// early (see statusExpireMsg). Callers batch the returned cmd with any
+// command they already return.
 func (m *Model) flashCmd(s string) tea.Cmd {
 	m.flash(s)
 	at := m.statusAt
@@ -3035,8 +3383,8 @@ func (m *Model) setError(s string) {
 }
 
 // maybeExpireStatus clears a transient info status once it has been shown for
-// transientStatusTTL. It's driven by the status poll, which always
-// reschedules itself, so the clear lands within a poll interval.
+// transientStatusTTL. It's driven solely by the dedicated flash-expiry tick
+// scheduled by flashCmd (see statusExpireMsg), not by the status poll.
 func (m *Model) maybeExpireStatus() {
 	if m.status == "" || m.mode != modeNormal || m.statusAt.IsZero() {
 		return
@@ -3211,6 +3559,37 @@ func (m Model) pathToKey(path string) (string, bool) {
 		return m.homeWSKey, true
 	}
 	return "", false
+}
+
+// agentLocation resolves a live session by identity rather than pid, avoiding
+// stale observer events mutating a replacement process that reused the pid.
+func (m Model) agentLocation(target *session.Session) (key, path string, ok bool) {
+	match := func(key, path string) (string, string, bool) {
+		ws, exists := m.mgr.Workspace(key)
+		if !exists {
+			return "", "", false
+		}
+		for _, candidate := range ws.Agents {
+			if candidate == target {
+				return key, path, true
+			}
+		}
+		return "", "", false
+	}
+	if m.current != nil {
+		if key, path, ok := match(m.current.key, m.current.path); ok {
+			return key, path, true
+		}
+	}
+	for _, it := range m.active {
+		if key, path, ok := match(wsKey(it.repo.Name, it.view.WT.Name), it.view.WT.Path); ok {
+			return key, path, true
+		}
+	}
+	if m.homeWSKey != "" {
+		return match(m.homeWSKey, m.homeWSPath)
+	}
+	return "", "", false
 }
 
 // busyHostedAgents counts agents polled as busy whose working directory maps to

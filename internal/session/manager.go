@@ -2,8 +2,11 @@ package session
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"time"
+
+	"github.com/KCaverly/caretaker/internal/agent"
 )
 
 // repaintWindow bounds how often WaitDirty releases the UI to re-render under
@@ -22,14 +25,33 @@ const repaintWindow = 12 * time.Millisecond
 // active.
 var errNoWorkspace = errors.New("session: workspace not active")
 
+// errNoAgent is returned when an operation targets an agent that isn't active.
+var errNoAgent = errors.New("session: agent not active")
+
+// errEmptyAgentArgv prevents a malformed provider spec from silently launching
+// the user's shell in an agent pane.
+var errEmptyAgentArgv = errors.New("session: agent command is empty")
+
 // Spec describes one session to start in a workspace.
 type Spec struct {
 	Kind  Kind
 	Title string
 	Argv  []string
-	// SessionID is the claude session UUID an Agent spec runs under, recorded on
-	// the started Session so ct can persist and later resume it.
+	// Provider identifies the CLI that owns this agent conversation.
+	Provider agent.Provider
+	// SessionID is the provider-owned, opaque conversation ID recorded on the
+	// started Session so ct can persist and later resume it.
 	SessionID string
+	// Env adds or replaces process environment entries in KEY=value form.
+	Env []string
+	// UnsetEnv removes inherited process environment entries by key. Removal
+	// wins if the same key is also present in Env.
+	UnsetEnv []string
+	// Events carries provider lifecycle notifications for this session.
+	Events <-chan agent.Event
+	// Companion owns any provider-side process needed by the interactive
+	// session. It is closed if startup fails and whenever the Session closes.
+	Companion io.Closer
 }
 
 // Workspace holds the live sessions for one activated worktree: a single editor,
@@ -252,15 +274,15 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 	}
 
 	ws := &Workspace{w: w, h: h}
-	for _, sp := range specs {
-		s, err := Start(sp.Kind, sp.Title, dir, sp.Argv, w, h, m.signalDirty)
+	for i, sp := range specs {
+		s, err := StartSpec(sp, dir, w, h, m.signalDirty)
 		if err != nil {
 			for _, started := range ws.all() {
 				started.Close()
 			}
+			closeSpecCompanions(specs[i+1:])
 			return nil, err
 		}
-		s.SessionID = sp.SessionID
 		switch {
 		case sp.Kind == Editor && ws.Editor == nil:
 			ws.Editor = s
@@ -282,20 +304,61 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 // the pool, and focuses it. The workspace must already be active.
 func (m *Manager) SpawnAgent(key, dir string, spec Spec, w, h int) (*Session, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	ws, ok := m.spaces[key]
 	if !ok {
+		m.mu.Unlock()
+		closeSpecCompanions([]Spec{spec})
 		return nil, errNoWorkspace
 	}
-	s, err := Start(spec.Kind, spec.Title, dir, spec.Argv, w, h, m.signalDirty)
+	s, err := StartSpec(spec, dir, w, h, m.signalDirty)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
-	s.SessionID = spec.SessionID
 	ws.Agents = append(ws.Agents, s)
 	ws.ActiveAgent = len(ws.Agents) - 1
+	m.mu.Unlock()
 	return s, nil
+}
+
+// ReplaceAgent starts spec and, only after startup succeeds, swaps it into idx
+// in the active workspace's agent pool. The pool order and focused index are
+// preserved. A failed start leaves the old agent running and untouched.
+func (m *Manager) ReplaceAgent(key, dir string, idx int, spec Spec, w, h int) (*Session, error) {
+	m.mu.Lock()
+	ws, ok := m.spaces[key]
+	if !ok {
+		m.mu.Unlock()
+		closeSpecCompanions([]Spec{spec})
+		return nil, errNoWorkspace
+	}
+	if idx < 0 || idx >= len(ws.Agents) {
+		m.mu.Unlock()
+		closeSpecCompanions([]Spec{spec})
+		return nil, errNoAgent
+	}
+
+	replacement, err := StartSpec(spec, dir, w, h, m.signalDirty)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	old := ws.Agents[idx]
+	ws.Agents[idx] = replacement
+	m.mu.Unlock()
+
+	// Close outside the manager lock: replacement is already installed, and a
+	// slow process teardown must not block unrelated workspace operations.
+	old.Close()
+	return replacement, nil
+}
+
+func closeSpecCompanions(specs []Spec) {
+	for _, spec := range specs {
+		if spec.Companion != nil {
+			_ = spec.Companion.Close()
+		}
+	}
 }
 
 // CloseAgent terminates and removes the agent at idx, clamping the focused
@@ -380,7 +443,7 @@ func (m *Manager) SplitTermPane(key, dir string, spec Spec, sd SplitDir, w, h in
 		return nil, nil // too small to split; silently ignore
 	}
 	newIdx := len(ws.Terms)
-	s, err := Start(spec.Kind, spec.Title, dir, spec.Argv, w/2, h, m.signalDirty)
+	s, err := StartSpec(spec, dir, w/2, h, m.signalDirty)
 	if err != nil {
 		return nil, err
 	}

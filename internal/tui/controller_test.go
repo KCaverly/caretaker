@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/config"
 )
 
 func TestParseAgentStatuses(t *testing.T) {
@@ -55,6 +58,12 @@ func TestNewAgentSpecLabels(t *testing.T) {
 	if unnamed.Title != "claude" {
 		t.Errorf("unnamed title = %q", unnamed.Title)
 	}
+	if unnamed.Provider != agent.Claude {
+		t.Errorf("unnamed provider = %q, want claude", unnamed.Provider)
+	}
+	if !equalStrings(unnamed.UnsetEnv, []string{"TMUX", "TERM_PROGRAM"}) {
+		t.Errorf("unnamed unset env = %v", unnamed.UnsetEnv)
+	}
 
 	named := c.NewAgentSpec("refactor auth")
 	want := []string{"claude", "--session-id", named.SessionID, "--teammate-mode", "in-process", "-n", "refactor auth"}
@@ -68,6 +77,214 @@ func TestNewAgentSpecLabels(t *testing.T) {
 	// Each new agent gets a distinct session id.
 	if a, b := c.NewAgentSpec(""), c.NewAgentSpec(""); a.SessionID == b.SessionID {
 		t.Error("two new agents shared a session id")
+	}
+}
+
+func TestControllerLegacyAgentProviderDefaults(t *testing.T) {
+	c := NewController(config.Config{Agent: "custom-claude"})
+	if got := c.DefaultAgentProvider(); got != agent.Claude {
+		t.Fatalf("default provider = %q, want claude", got)
+	}
+	got := c.EnabledAgentProviders()
+	if !equalProviders(got, []agent.Provider{agent.Claude}) {
+		t.Fatalf("enabled providers = %v, want [claude]", got)
+	}
+	got[0] = agent.Codex
+	if got := c.EnabledAgentProviders(); !equalProviders(got, []agent.Provider{agent.Claude}) {
+		t.Fatal("EnabledAgentProviders returned controller-owned storage")
+	}
+	if got := c.NewAgentSpec("").Argv[0]; got != "custom-claude" {
+		t.Fatalf("legacy Claude command = %q, want custom-claude", got)
+	}
+
+	// Direct literal controllers used by focused tests receive the same
+	// provider/default fallbacks through the accessors and builders.
+	direct := &Controller{}
+	direct.cfg.Agent = "literal-claude"
+	if got := direct.DefaultAgentProvider(); got != agent.Claude {
+		t.Fatalf("direct default provider = %q, want claude", got)
+	}
+	if got := direct.NewAgentSpec("").Argv[0]; got != "literal-claude" {
+		t.Fatalf("direct legacy command = %q, want literal-claude", got)
+	}
+}
+
+func TestProviderAgentSpecs(t *testing.T) {
+	projects := t.TempDir()
+	c := NewController(config.Config{
+		Agent: "legacy-claude",
+		Agents: config.Agents{
+			Default: agent.Codex,
+			Enabled: []agent.Provider{agent.Codex, agent.Claude},
+			Claude:  config.AgentProvider{Command: "configured-claude", Args: []string{"--claude-base"}},
+			Codex:   config.AgentProvider{Command: "configured-codex", Args: []string{"--codex-base"}},
+		},
+	})
+	c.projectsDir = projects
+
+	if got := c.DefaultAgentProvider(); got != agent.Codex {
+		t.Fatalf("default provider = %q, want codex", got)
+	}
+	if got := c.EnabledAgentProviders(); !equalProviders(got, []agent.Provider{agent.Codex, agent.Claude}) {
+		t.Fatalf("enabled providers = %v", got)
+	}
+
+	t.Run("claude foreground", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Claude, "amber-fox", "fix the tests", AgentForeground)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"configured-claude", "--claude-base", "--session-id", spec.SessionID, "--teammate-mode", "in-process", "-n", "amber-fox", "fix the tests"}
+		if !equalStrings(spec.Argv, want) {
+			t.Errorf("argv = %v, want %v", spec.Argv, want)
+		}
+		if spec.Provider != agent.Claude || spec.SessionID == "" {
+			t.Errorf("metadata = provider %q id %q", spec.Provider, spec.SessionID)
+		}
+		if !equalStrings(spec.UnsetEnv, []string{"TMUX", "TERM_PROGRAM"}) {
+			t.Errorf("unset env = %v", spec.UnsetEnv)
+		}
+	})
+
+	t.Run("claude background", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Claude, "amber-fox", "fix the tests", AgentBackground)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"configured-claude", "--claude-base", "--session-id", spec.SessionID, "--teammate-mode", "in-process", "--dangerously-skip-permissions", "-n", "amber-fox", "fix the tests"}
+		if !equalStrings(spec.Argv, want) {
+			t.Errorf("argv = %v, want %v", spec.Argv, want)
+		}
+	})
+
+	t.Run("codex foreground", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Codex, "amber-fox", "fix the tests", AgentForeground)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"configured-codex", "--codex-base", "fix the tests"}
+		if !equalStrings(spec.Argv, want) {
+			t.Errorf("argv = %v, want %v", spec.Argv, want)
+		}
+		if spec.Provider != agent.Codex || spec.SessionID != "" {
+			t.Errorf("metadata = provider %q id %q", spec.Provider, spec.SessionID)
+		}
+		if len(spec.UnsetEnv) != 0 {
+			t.Errorf("Codex unset env = %v, want none", spec.UnsetEnv)
+		}
+		if spec.Title != "amber-fox" {
+			t.Errorf("title = %q", spec.Title)
+		}
+	})
+
+	t.Run("codex background", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Codex, "", "fix the tests", AgentBackground)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"configured-codex", "--codex-base", "--sandbox", "workspace-write", "--ask-for-approval", "never", "fix the tests"}
+		if !equalStrings(spec.Argv, want) {
+			t.Errorf("argv = %v, want %v", spec.Argv, want)
+		}
+		if spec.Title != "codex" {
+			t.Errorf("title = %q, want codex", spec.Title)
+		}
+	})
+}
+
+func TestRestoreProviderAgentSpecs(t *testing.T) {
+	projects := t.TempDir()
+	c := NewController(config.Config{Agents: config.Agents{
+		Default: agent.Claude,
+		Enabled: []agent.Provider{agent.Claude, agent.Codex},
+		Claude:  config.AgentProvider{Command: "claude", Args: []string{"--claude-base"}},
+		Codex:   config.AgentProvider{Command: "codex", Args: []string{"--codex-base"}},
+	}})
+	c.projectsDir = projects
+	id := "11111111-2222-4333-8444-555555555555"
+
+	// Codex global background flags must precede the resume subcommand.
+	codexSpec, err := c.RestoreProviderAgentSpec(agent.Codex, id, "amber-fox", "continue", AgentBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCodex := []string{"codex", "--codex-base", "--sandbox", "workspace-write", "--ask-for-approval", "never", "resume", id, "continue"}
+	if !equalStrings(codexSpec.Argv, wantCodex) {
+		t.Errorf("Codex resume argv = %v, want %v", codexSpec.Argv, wantCodex)
+	}
+	if codexSpec.Provider != agent.Codex || codexSpec.SessionID != id {
+		t.Errorf("Codex metadata = provider %q id %q", codexSpec.Provider, codexSpec.SessionID)
+	}
+
+	// If caretaker stopped before the provider supplied an ID, restoration is a
+	// fresh launch rather than a malformed resume with an empty argument.
+	emptyCodex, err := c.RestoreProviderAgentSpec(agent.Codex, "", "amber-fox", "continue", AgentForeground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"codex", "--codex-base", "continue"}; !equalStrings(emptyCodex.Argv, want) {
+		t.Errorf("empty-ID Codex argv = %v, want %v", emptyCodex.Argv, want)
+	}
+	if emptyCodex.SessionID != "" {
+		t.Errorf("fresh Codex ID = %q, want provider-assigned empty ID", emptyCodex.SessionID)
+	}
+	emptyClaude, err := c.RestoreProviderAgentSpec(agent.Claude, "", "amber-fox", "continue", AgentForeground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptyClaude.SessionID == "" {
+		t.Error("empty-ID Claude restore did not generate a fresh UUID")
+	}
+	wantEmptyClaude := []string{"claude", "--claude-base", "--session-id", emptyClaude.SessionID, "--teammate-mode", "in-process", "-n", "amber-fox", "continue"}
+	if !equalStrings(emptyClaude.Argv, wantEmptyClaude) {
+		t.Errorf("empty-ID Claude argv = %v, want %v", emptyClaude.Argv, wantEmptyClaude)
+	}
+
+	// Claude keeps the missing-transcript fresh fallback, including background
+	// mode and the initial prompt.
+	claudeFresh, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue", AgentBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFresh := []string{"claude", "--claude-base", "--session-id", id, "--teammate-mode", "in-process", "--dangerously-skip-permissions", "-n", "amber-fox", "continue"}
+	if !equalStrings(claudeFresh.Argv, wantFresh) {
+		t.Errorf("Claude fresh argv = %v, want %v", claudeFresh.Argv, wantFresh)
+	}
+
+	proj := filepath.Join(projects, "-some-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	claudeResume, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue", AgentForeground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantResume := []string{"claude", "--claude-base", "--resume", id, "--teammate-mode", "in-process", "continue"}
+	if !equalStrings(claudeResume.Argv, wantResume) {
+		t.Errorf("Claude resume argv = %v, want %v", claudeResume.Argv, wantResume)
+	}
+}
+
+func TestProviderAgentSpecErrors(t *testing.T) {
+	c := NewController(config.Config{Agents: config.Agents{
+		Default: agent.Claude,
+		Enabled: []agent.Provider{agent.Claude},
+		Claude:  config.AgentProvider{Command: "claude"},
+	}})
+	if _, err := c.NewProviderAgentSpec(agent.Provider("other"), "", "", AgentForeground); err == nil {
+		t.Error("expected unknown-provider error")
+	}
+	if _, err := c.RestoreProviderAgentSpec("", "id", "", "", AgentForeground); err == nil {
+		t.Error("expected empty-provider error")
+	}
+	if _, err := c.NewProviderAgentSpec(agent.Claude, "", "", AgentMode(99)); err == nil {
+		t.Error("expected invalid-mode error")
+	}
+	if _, err := c.NewProviderAgentSpec(agent.Codex, "", "", AgentForeground); err == nil {
+		t.Error("expected missing-command error")
 	}
 }
 
@@ -168,6 +385,18 @@ func TestEnsureProjectTrusted(t *testing.T) {
 }
 
 func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalProviders(a, b []agent.Provider) bool {
 	if len(a) != len(b) {
 		return false
 	}

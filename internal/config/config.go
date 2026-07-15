@@ -8,6 +8,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/plasma"
 )
 
@@ -17,12 +18,14 @@ type Config struct {
 	Root string `toml:"root"`
 	// Editor is the command launched for the nvim session.
 	Editor string `toml:"editor"`
-	// Agent is the command launched for a claude session.
+	// Agent is the legacy command launched for a Claude session. Agents.Claude
+	// is the canonical provider configuration; this field remains supported so
+	// existing config files continue to work.
 	Agent string `toml:"agent"`
+	// Agents configures the available agent providers and their commands.
+	Agents Agents `toml:"agents"`
 	// Shell is the command launched for a terminal session.
 	Shell string `toml:"shell"`
-	// Backend selects the workspace backend ("zellij").
-	Backend string `toml:"backend"`
 	// WorktreePath is the path template for new worktrees, relative to the repo.
 	// Supports {name}.
 	WorktreePath string `toml:"worktree_path"`
@@ -34,6 +37,35 @@ type Config struct {
 	Usage Usage `toml:"usage"`
 	// Plasma configures the deck's ambient plasma panel.
 	Plasma Plasma `toml:"plasma"`
+}
+
+// Agents configures which agent providers can be launched.
+type Agents struct {
+	// Default is selected when the new-agent form opens.
+	Default agent.Provider `toml:"default"`
+	// Enabled lists the providers offered for new agents.
+	Enabled []agent.Provider `toml:"enabled"`
+	Claude  AgentProvider    `toml:"claude"`
+	Codex   AgentProvider    `toml:"codex"`
+}
+
+// AgentProvider configures one provider's executable and base arguments.
+type AgentProvider struct {
+	Command string   `toml:"command"`
+	Args    []string `toml:"args"`
+}
+
+// Provider returns the configuration for p. The zero value is returned for an
+// unknown provider.
+func (a Agents) Provider(p agent.Provider) AgentProvider {
+	switch p {
+	case agent.Claude:
+		return a.Claude
+	case agent.Codex:
+		return a.Codex
+	default:
+		return AgentProvider{}
+	}
 }
 
 // Plasma configures the ambient animation panel on the right of the deck.
@@ -74,7 +106,8 @@ type Keys struct {
 	// Picker returns to the CT picker.
 	Picker string `toml:"picker"`
 	// Palette opens the agent board: every agent across all open worktrees,
-	// attention first, plus the new-agent launcher.
+	// attention first, plus the new-agent launcher. Legacy-named: the
+	// fuzzy-searchable command palette is CommandPalette (below), not this.
 	Palette string `toml:"palette"`
 	// NextAgent / PrevAgent cycle the focused agent within the worktree.
 	NextAgent string `toml:"next_agent"`
@@ -83,15 +116,11 @@ type Keys struct {
 	Help string `toml:"help"`
 	// GlobalConfig opens the home-directory workspace for editing global config.
 	GlobalConfig string `toml:"global_config"`
-	// Notif is a legacy alias that also opens the agent board (it used to open
-	// a separate notification overlay).
-	Notif string `toml:"notif"`
 	// Prompt opens the new-agent form pre-set for a background home agent.
 	Prompt string `toml:"prompt"`
 	// Terminal pane management (only intercepted on the terminal screen).
 	TermSplitV string `toml:"term_split_v"` // new pane to the right
 	TermSplitH string `toml:"term_split_h"` // new pane below
-	TermCycle  string `toml:"term_cycle"`   // cycle pane focus (retired by default)
 	TermZoom   string `toml:"term_zoom"`    // toggle full-size
 	TermClose  string `toml:"term_close"`   // close active pane
 	// Directional terminal-pane focus (only intercepted on the terminal screen).
@@ -99,11 +128,12 @@ type Keys struct {
 	TermFocusDown  string `toml:"term_focus_down"`
 	TermFocusUp    string `toml:"term_focus_up"`
 	TermFocusRight string `toml:"term_focus_right"`
-	// Usage opens the usage overlay on the claude screen.
+	// Usage opens the usage overlay on the agent screen.
 	Usage string `toml:"usage"`
 	// CommandPalette opens the command palette: a fuzzy-searchable list of every
 	// ct action, each row showing its live keybinding. It teaches the chords the
 	// help overlay documents by letting the user run any action without them.
+	// Distinct from Palette, which is the (legacy-named) agent board.
 	CommandPalette string `toml:"command_palette"`
 }
 
@@ -114,10 +144,15 @@ func Default() Config {
 		shell = "/bin/sh"
 	}
 	return Config{
-		Editor:       "nvim",
-		Agent:        "claude",
+		Editor: "nvim",
+		Agent:  "claude",
+		Agents: Agents{
+			Default: agent.Claude,
+			Enabled: []agent.Provider{agent.Claude, agent.Codex},
+			Claude:  AgentProvider{Command: "claude"},
+			Codex:   AgentProvider{Command: "codex"},
+		},
 		Shell:        shell,
-		Backend:      "zellij",
 		WorktreePath: ".worktrees/{name}",
 		BranchName:   "{name}",
 		Keys: Keys{
@@ -125,9 +160,9 @@ func Default() Config {
 			GotoEditor: "alt+1", GotoAgent: "alt+2", GotoTerm: "alt+3",
 			Picker:  "ctrl+g",
 			Palette: "alt+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "alt+g", Notif: "", Prompt: "alt+y",
+			Help: "f1", GlobalConfig: "alt+g", Prompt: "alt+y",
 			TermSplitV: "alt+v", TermSplitH: "alt+s",
-			TermCycle: "", TermZoom: "alt+z", TermClose: "alt+x",
+			TermZoom: "alt+z", TermClose: "alt+x",
 			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",
 			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
 			Usage: "alt+u", CommandPalette: "alt+p",
@@ -181,8 +216,16 @@ func Load() (Config, error) {
 	}
 
 	// Decode over the defaults so unset fields keep their default values.
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	metadata, err := toml.Decode(string(data), &cfg)
+	if err != nil {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	// The top-level agent key predates provider configuration. Keep it working
+	// as the Claude command unless the new provider-specific key is explicit.
+	if metadata.IsDefined("agents", "claude", "command") {
+		cfg.Agent = cfg.Agents.Claude.Command
+	} else {
+		cfg.Agents.Claude.Command = cfg.Agent
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -231,6 +274,25 @@ func (c *Config) validate() error {
 		return err
 	}
 	c.Root = abs
+	if !c.Agents.Default.Valid() {
+		return fmt.Errorf("config `agents.default` must be %q or %q", agent.Claude, agent.Codex)
+	}
+	enabled := make(map[agent.Provider]bool, len(c.Agents.Enabled))
+	for _, provider := range c.Agents.Enabled {
+		if !provider.Valid() {
+			return fmt.Errorf("unknown agent provider %q in `agents.enabled`", provider)
+		}
+		if enabled[provider] {
+			return fmt.Errorf("duplicate agent provider %q in `agents.enabled`", provider)
+		}
+		enabled[provider] = true
+		if c.Agents.Provider(provider).Command == "" {
+			return fmt.Errorf("config `agents.%s.command` is required when %q is enabled", provider, provider)
+		}
+	}
+	if !enabled[c.Agents.Default] {
+		return fmt.Errorf("config `agents.default` %q must be present in `agents.enabled`", c.Agents.Default)
+	}
 	// A negative threshold is meaningless; treat it as "always show".
 	if c.Usage.Threshold < 0 {
 		c.Usage.Threshold = 0

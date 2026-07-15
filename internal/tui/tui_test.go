@@ -1,19 +1,26 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/codex"
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/state"
 )
 
 func ctrlKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl} }
@@ -265,9 +272,11 @@ func TestMostRecentWorktree(t *testing.T) {
 func TestPickerKeyJumpsToRecent(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -383,9 +392,11 @@ func TestDeckClickDetailLineMisses(t *testing.T) {
 
 func TestDeckClickOpensSelectedWorktree(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -414,7 +425,7 @@ func TestDeckClickOpensSelectedWorktree(t *testing.T) {
 
 func TestHelpOverlayToggle(t *testing.T) {
 	m := sampleModel()
-	m.keyHelp = "f1"
+	m.keys.Help = "f1"
 
 	// "?" opens help from the deck.
 	mm, _ := m.handleKey(tea.KeyPressMsg{Code: '?', Text: "?"})
@@ -439,7 +450,7 @@ func TestHelpOverlayToggle(t *testing.T) {
 		t.Fatal("the help key should open help from a session")
 	}
 	out := m.renderHelp(m.height - barHeight)
-	for _, want := range []string{"HELP", "Session", "Legend", m.keyCycle, m.keyPicker, m.keyPalette, "uncommitted"} {
+	for _, want := range []string{"HELP", "Session", "Legend", m.keys.Cycle, m.keys.Picker, m.keys.Palette, "uncommitted"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help overlay missing %q:\n%s", want, out)
 		}
@@ -617,8 +628,8 @@ func TestBoardOpensFromPicker(t *testing.T) {
 	if len(nav) != 1 || !rows[nav[0]].isNew {
 		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
 	}
-	// Inside an open board ctrl+n is list-down (the notif close alias is retired):
-	// it keeps the board open. The primary palette key closes.
+	// Inside an open board ctrl+n is list-down: it keeps the board open. The
+	// primary palette key closes.
 	mm, _ = m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
@@ -682,6 +693,328 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m = mm.(Model)
 	if m.formOpen || !m.boardOpen {
 		t.Fatalf("esc should return to the board list: form=%v board=%v", m.formOpen, m.boardOpen)
+	}
+}
+
+func mixedProviderModel(defaultProvider agent.Provider) Model {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Claude, agent.Codex}
+	cfg.Agents.Default = defaultProvider
+	cfg.Agents.Claude.Command = "/usr/bin/true"
+	cfg.Agents.Codex.Command = "/usr/bin/true"
+	ctrl := NewController(cfg)
+	ctrl.startCodex = func(context.Context, codex.Config) (codexRuntime, error) {
+		return newFakeCodexRuntime("unix:///tmp/caretaker-fake-codex.sock"), nil
+	}
+	return New(ctrl, session.NewManager())
+}
+
+type fakeCodexRuntime struct {
+	remote string
+	events chan agent.Event
+	once   sync.Once
+	closed atomic.Int32
+}
+
+func newFakeCodexRuntime(remote string) *fakeCodexRuntime {
+	return &fakeCodexRuntime{remote: remote, events: make(chan agent.Event, 8)}
+}
+
+func (f *fakeCodexRuntime) Close() error {
+	f.once.Do(func() {
+		f.closed.Add(1)
+		close(f.events)
+	})
+	return nil
+}
+
+func (f *fakeCodexRuntime) Remote() string                  { return f.remote }
+func (f *fakeCodexRuntime) EventStream() <-chan agent.Event { return f.events }
+
+func TestPrepareAgentSpecPlacesRemoteAfterBaseArgs(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Codex}
+	cfg.Agents.Default = agent.Codex
+	cfg.Agents.Codex = config.AgentProvider{Command: "codex-test", Args: []string{"--base", "value"}}
+	ctrl := NewController(cfg)
+	runtime := newFakeCodexRuntime("unix:///tmp/fake-runtime.sock")
+	ctrl.startCodex = func(_ context.Context, got codex.Config) (codexRuntime, error) {
+		if got.Command != "codex-test" || !equalStrings(got.Args, []string{"--base", "value"}) || got.Dir != "/repo" {
+			t.Fatalf("runtime config = %+v", got)
+		}
+		return runtime, nil
+	}
+
+	spec, err := ctrl.NewProviderAgentSpec(agent.Codex, "jade-otter", "inspect", AgentBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := ctrl.PrepareAgentSpec(context.Background(), "/repo", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"codex-test", "--base", "value", "--remote", "unix:///tmp/fake-runtime.sock",
+		"--sandbox", "workspace-write", "--ask-for-approval", "never", "inspect",
+	}
+	if !equalStrings(prepared.Argv, want) {
+		t.Fatalf("prepared argv = %v, want %v", prepared.Argv, want)
+	}
+	if prepared.Companion != runtime || prepared.Events == nil {
+		t.Fatalf("prepared runtime wiring = companion %T events nil=%v", prepared.Companion, prepared.Events == nil)
+	}
+	_ = prepared.Companion.Close()
+	_ = prepared.Companion.Close()
+	if got := runtime.closed.Load(); got != 1 {
+		t.Fatalf("runtime close count = %d, want 1", got)
+	}
+}
+
+func TestPrepareWorkspaceSpecsCleansEarlierCompanionOnFailure(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	var runtimes []*fakeCodexRuntime
+	m.ctrl.startCodex = func(context.Context, codex.Config) (codexRuntime, error) {
+		runtime := newFakeCodexRuntime("unix:///tmp/partial-runtime.sock")
+		runtimes = append(runtimes, runtime)
+		return runtime, nil
+	}
+	valid, err := m.ctrl.NewProviderAgentSpec(agent.Codex, "one", "", AgentForeground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := valid
+	invalid.Argv = []string{"wrong-command"}
+	_, err = m.prepareWorkspaceSpecs(t.TempDir(), []session.Spec{valid, invalid})
+	if err == nil {
+		t.Fatal("expected mismatched Codex command to fail preparation")
+	}
+	if len(runtimes) != 1 || runtimes[0].closed.Load() != 1 {
+		t.Fatalf("started runtimes = %d, first close count = %d", len(runtimes), runtimes[0].closed.Load())
+	}
+}
+
+func TestBoardFormProviderChoiceAndDefaultReset(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.current = &workspaceRef{key: "r/w", path: t.TempDir(), ws: &session.Workspace{}}
+	m = m.openNewAgentForm().(Model)
+	if m.formProvider != agent.Codex || m.promptInput.Placeholder != "What should Codex do?" {
+		t.Fatalf("default provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
+	}
+
+	// With two providers the row participates in focus order.
+	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+	if m.formFocus != formFieldProvider {
+		t.Fatalf("first tab focus = %d, want provider", m.formFocus)
+	}
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
+	m = mm.(Model)
+	if m.formProvider != agent.Claude || m.promptInput.Placeholder != "What should Claude do?" {
+		t.Fatalf("toggled provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
+	}
+
+	// A fresh form always returns to the configured default.
+	m = m.openNewAgentForm().(Model)
+	if m.formProvider != agent.Codex {
+		t.Fatalf("reopened form provider = %q, want codex", m.formProvider)
+	}
+}
+
+func TestWorkspaceSpecsPreserveProviders(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.state = &state.State{
+		LastOpened: map[string]int64{},
+		Workspaces: map[string]*state.WorkspaceState{
+			"r/w": {Agents: []state.AgentState{
+				{Provider: agent.Claude, SessionID: "claude-id", Label: "one"},
+				{Provider: agent.Codex, SessionID: "codex-id", Label: "two"},
+			}},
+		},
+	}
+	specs, err := m.workspaceSpecs("r/w", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []agent.Provider
+	for _, spec := range specs {
+		if spec.Kind == session.Agent {
+			got = append(got, spec.Provider)
+		}
+	}
+	if len(got) != 2 || got[0] != agent.Claude || got[1] != agent.Codex {
+		t.Fatalf("restored providers = %v", got)
+	}
+}
+
+func TestFirstHomeLaunchCreatesOnlySelectedAgent(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	m.formLocation = 1
+	m.formProvider = agent.Codex
+	m.promptInput.SetValue("inspect the project")
+	mm, _ := m.launchAgent()
+	m = mm.(Model)
+	defer m.mgr.CloseAll()
+	ws, ok := m.mgr.Workspace("~/config")
+	if !ok {
+		t.Fatal("home workspace was not activated")
+	}
+	if len(ws.Agents) != 1 {
+		t.Fatalf("home agent count = %d, want exactly the selected agent", len(ws.Agents))
+	}
+	if ws.Agents[0].Provider != agent.Codex {
+		t.Fatalf("home agent provider = %q, want codex", ws.Agents[0].Provider)
+	}
+	if ws.Agents[0].Events == nil {
+		t.Fatal("home Codex launch did not attach the observer event stream")
+	}
+}
+
+func TestPersistAgentsRecordsProvider(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	spec := session.Spec{
+		Kind: session.Agent, Title: "jade-otter", Argv: []string{"/usr/bin/true"},
+		Provider: agent.Codex, SessionID: "thread-123",
+	}
+	ws, err := m.mgr.Activate("r/w", dir, []session.Spec{spec}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.persistAgents("r/w")
+	saved, _ := m.state.Agents("r/w")
+	if len(saved) != 1 || saved[0].Provider != agent.Codex || saved[0].SessionID != "thread-123" {
+		t.Fatalf("persisted agents = %+v", saved)
+	}
+}
+
+func TestBoardRestartPreservesProviderAndPoolPosition(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	specs := []session.Spec{
+		{Kind: session.Agent, Title: "one", Argv: []string{"/usr/bin/true"}, Provider: agent.Claude, SessionID: "claude-id"},
+		{Kind: session.Agent, Title: "two", Argv: []string{"/usr/bin/true"}, Provider: agent.Codex, SessionID: "codex-id"},
+	}
+	ws, err := m.mgr.Activate("r/w", dir, specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	ws.ActiveAgent = 1
+	old := ws.Agents[1]
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.boardOpen = true
+	m.boardCursor = 1
+	mm, _ := m.handleBoard(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	m = mm.(Model)
+	if ws.Agents[1] == old {
+		t.Fatal("restart did not replace the selected session")
+	}
+	if ws.ActiveAgent != 1 || len(ws.Agents) != 2 {
+		t.Fatalf("restart changed pool shape/focus: len=%d active=%d", len(ws.Agents), ws.ActiveAgent)
+	}
+	if got := ws.Agents[1]; got.Provider != agent.Codex || got.SessionID != "codex-id" {
+		t.Fatalf("replacement metadata = provider %q id %q", got.Provider, got.SessionID)
+	}
+	if ws.Agents[1].Events == nil {
+		t.Fatal("restarted Codex session did not attach a fresh observer event stream")
+	}
+}
+
+func TestCodexAgentEventsPersistThreadAndSurviveClaudeSnapshot(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	events := make(chan agent.Event)
+	ws, err := m.mgr.Activate("r/w", dir, []session.Spec{{
+		Kind: session.Agent, Title: "jade-otter", Argv: []string{"sleep", "5"},
+		Provider: agent.Codex, Events: events,
+	}}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	sess := ws.Agents[0]
+	pid := sess.Pid()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+
+	apply := func(event agent.Event) {
+		t.Helper()
+		mm, _ := m.update(agentEventMsg{session: sess, event: event, open: true})
+		m = mm.(Model)
+	}
+	apply(agent.Event{Kind: agent.ThreadStarted, ThreadID: "thread-123"})
+	if sess.SessionID != "thread-123" {
+		t.Fatalf("live session ID = %q", sess.SessionID)
+	}
+	saved, _ := m.state.Agents("r/w")
+	if len(saved) != 1 || saved[0].Provider != agent.Codex || saved[0].SessionID != "thread-123" {
+		t.Fatalf("thread start did not persist Codex state: %+v", saved)
+	}
+
+	apply(agent.Event{Kind: agent.TurnStarted, ThreadID: "thread-123", TurnID: "turn-1"})
+	if got := m.agentStatus[pid]; got.Provider != agent.Codex || got.Status != "busy" {
+		t.Fatalf("turn start status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.ThreadStatusChanged, ThreadID: "thread-123", Status: "active", WaitingOnApproval: true})
+	if got := m.agentStatus[pid]; got.Status != "waiting" || got.WaitingFor != "permission prompt" {
+		t.Fatalf("approval status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.ThreadStatusChanged, ThreadID: "thread-123", Status: "active", WaitingOnUserInput: true})
+	if got := m.agentStatus[pid]; got.Status != "waiting" || got.WaitingFor != "input needed" {
+		t.Fatalf("input status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.TurnCompleted, ThreadID: "thread-123", TurnID: "turn-1", Status: "completed"})
+	if got := m.agentStatus[pid]; got.Status != "idle" || got.WaitingFor != "" {
+		t.Fatalf("turn complete status = %+v", got)
+	}
+
+	const claudePID = 424242
+	mm, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		claudePID: {Status: "busy", Cwd: dir, StartedAt: 10},
+	}})
+	m = mm.(Model)
+	if got := m.agentStatus[pid]; got.Provider != agent.Codex || got.Status != "idle" {
+		t.Fatalf("Claude snapshot replaced Codex status: %+v", got)
+	}
+	if got := m.agentStatus[claudePID]; got.Provider != agent.Claude || got.Status != "busy" {
+		t.Fatalf("Claude snapshot status = %+v", got)
+	}
+}
+
+func TestOverlayClicksDoNotReachBar(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Model)
+	}{
+		{"help", func(m *Model) { m.helpOpen = true }},
+		{"board", func(m *Model) { m.boardOpen = true }},
+		{"usage", func(m *Model) { m.usageOpen = true }},
+		{"palette", func(m *Model) { m.paletteOpen = true }},
+		{"diff", func(m *Model) { m.diffOpen = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := modelWithAgents(1)
+			m.screen = screenEditor
+			tc.set(&m)
+			// The agent tab normally occupies this bar zone.
+			var x int
+			for _, z := range m.barZones() {
+				if z.s == screenAgent {
+					break
+				}
+				x += lipgloss.Width(z.glyph) + 3
+			}
+			x += 2
+			mm, _ := m.handleMouseClick(tea.MouseClickMsg{X: x, Y: 0, Button: tea.MouseLeft})
+			if got := mm.(Model).screen; got != screenEditor {
+				t.Fatalf("overlay click changed screen to %d", got)
+			}
+		})
 	}
 }
 
@@ -850,9 +1183,11 @@ func TestCommandPaletteRunGotoEditor(t *testing.T) {
 // activate against a real (cheap-child) manager.
 func TestCommandPaletteRunOpenWorktree(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1082,9 +1417,11 @@ func waitForSession(t *testing.T, s *session.Session, want string) {
 func pasteModel(t *testing.T) (Model, *session.Session) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	t.Cleanup(mgr.CloseAll)
@@ -1189,9 +1526,11 @@ func TestToUVKey(t *testing.T) {
 // TestActivateFlow drives activate → cycle → return → re-activate with cheap
 // child commands (no real nvim/claude needed) and a real session manager.
 func TestActivateFlow(t *testing.T) {
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1247,9 +1586,11 @@ func TestActivateFlow(t *testing.T) {
 // TestMouseClickFocusesTermPane splits a terminal into two panes and verifies a
 // left click over the non-focused pane moves pane focus onto it.
 func TestMouseClickFocusesTermPane(t *testing.T) {
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1284,9 +1625,11 @@ func TestMouseClickFocusesTermPane(t *testing.T) {
 // board cursor opens on it.
 func TestBoardSortsAttentionFirst(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1379,7 +1722,7 @@ func TestSessionHelpHint(t *testing.T) {
 
 	// On the terminal screen it leads with the help key and surfaces panelling.
 	foot := m.sessionFooter()
-	for _, want := range []string{m.keyHelp, "help", "split", "zoom"} {
+	for _, want := range []string{m.keys.Help, "help", "split", "zoom"} {
 		if !strings.Contains(foot, want) {
 			t.Errorf("terminal footer missing %q:\n%s", want, foot)
 		}
@@ -1420,9 +1763,11 @@ func isQuit(cmd tea.Cmd) bool {
 func busyGuardModel(t *testing.T) (Model, string) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	t.Cleanup(mgr.CloseAll)
@@ -1859,14 +2204,10 @@ func TestListNavDialect(t *testing.T) {
 	}
 }
 
-// TestDeckCtrlNMovesCursor: with the notif alias retired (empty default), ctrl+n
-// in the deck is a pure list-down key — it moves the ACTIVE cursor and never
-// opens the agent board (handleKey no longer intercepts it).
+// TestDeckCtrlNMovesCursor: ctrl+n in the deck is a pure list-down key — it
+// moves the ACTIVE cursor and never opens the agent board.
 func TestDeckCtrlNMovesCursor(t *testing.T) {
 	m := sampleModel()
-	if m.keyNotif != "" {
-		t.Fatalf("precondition: notif should default empty, got %q", m.keyNotif)
-	}
 	m.focus = focusActive
 	if len(m.active) < 2 {
 		t.Fatalf("precondition: need >=2 active items, got %d", len(m.active))
@@ -1875,7 +2216,7 @@ func TestDeckCtrlNMovesCursor(t *testing.T) {
 	mm, _ := m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if m.boardOpen {
-		t.Fatal("ctrl+n in the deck must not open the board once notif is retired")
+		t.Fatal("ctrl+n in the deck must not open the board")
 	}
 	if m.activeCursor != 1 {
 		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
@@ -1883,8 +2224,7 @@ func TestDeckCtrlNMovesCursor(t *testing.T) {
 }
 
 // TestBoardCtrlNNavigates: inside an open board ctrl+n/ctrl+p navigate and do not
-// close it (nav wins over the legacy close alias), while ctrl+a and esc still
-// close.
+// close it, while ctrl+a and esc still close.
 func TestBoardCtrlNNavigates(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0
@@ -1895,7 +2235,7 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 	mm, _ = m.handleBoard(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
-		t.Fatal("ctrl+n should not close the board (nav wins over the close alias)")
+		t.Fatal("ctrl+n should not close the board (it navigates instead)")
 	}
 	if m.boardCursor != start+1 {
 		t.Fatalf("ctrl+n should move the board cursor down, got %d want %d", m.boardCursor, start+1)
@@ -1920,43 +2260,6 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 	m = mm.(Model)
 	if m.boardOpen {
 		t.Fatal("esc should still close the board")
-	}
-}
-
-// TestKeyNotifReboundFreesCtrlN: when the user rebinds keyNotif off ctrl+n, the
-// rebound key closes the board and ctrl+n becomes an ordinary list-down key both
-// in the board and in the deck.
-func TestKeyNotifReboundFreesCtrlN(t *testing.T) {
-	m := modelWithAgents(3)
-	m.keyNotif = "ctrl+b"
-	m.current.ws.ActiveAgent = 0
-	mm, _ := m.openBoard()
-	m = mm.(Model)
-	start := m.boardCursor
-
-	mm, _ = m.handleBoard(ctrlKey('n'))
-	m = mm.(Model)
-	if !m.boardOpen || m.boardCursor != start+1 {
-		t.Fatalf("rebound: ctrl+n should navigate the board, open=%v cursor=%d", m.boardOpen, m.boardCursor)
-	}
-	mm, _ = m.handleBoard(ctrlKey('b'))
-	m = mm.(Model)
-	if m.boardOpen {
-		t.Fatal("the rebound keyNotif should close the board")
-	}
-
-	// In the deck ctrl+n is now free and reaches the ACTIVE list as list-down.
-	d := sampleModel()
-	d.keyNotif = "ctrl+b"
-	d.focus = focusActive
-	d.activeCursor = 0
-	mm, _ = d.handleKey(ctrlKey('n'))
-	d = mm.(Model)
-	if d.boardOpen {
-		t.Fatal("rebound: ctrl+n must not open the board")
-	}
-	if d.activeCursor != 1 {
-		t.Fatalf("rebound: ctrl+n should move the ACTIVE cursor, got %d", d.activeCursor)
 	}
 }
 

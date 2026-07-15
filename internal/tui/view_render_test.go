@@ -11,6 +11,8 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
@@ -82,6 +84,18 @@ func TestBarShowsAgentPoolPosition(t *testing.T) {
 	single.screen = screenAgent
 	if bar := barLine(t, single); strings.Contains(bar, "1/1") {
 		t.Errorf("bar should not show a position for a single agent:\n%s", bar)
+	}
+}
+
+func TestBarShowsSingleAgentProviderIdentity(t *testing.T) {
+	m := modelWithAgents(1)
+	m.current.ws.Agents[0].Provider = agent.Codex
+	m.current.ws.Agents[0].Title = "jade-otter"
+	m.screen = screenAgent
+
+	bar := barLine(t, m)
+	if !strings.Contains(bar, "codex · jade-otter") {
+		t.Errorf("bar should identify the focused provider and agent:\n%s", bar)
 	}
 }
 
@@ -366,6 +380,75 @@ func TestBarUsageSegmentGating(t *testing.T) {
 	}
 }
 
+func codexUsageSnapshot(session, week float64) usage.Snapshot {
+	now := time.Now()
+	return usage.Snapshot{
+		Named: []usage.NamedWindow{
+			{Label: "session", Session: true, Window: &usage.Window{Utilization: session, ResetsAt: now.Add(90 * time.Minute)}},
+			{Label: "week", ShortLabel: "wk", Window: &usage.Window{Utilization: week, ResetsAt: now.Add(5 * 24 * time.Hour)}},
+		},
+		FetchedAt: now,
+	}
+}
+
+func TestUsageBarMatchesActiveAgentProvider(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Claude, agent.Codex}
+	cfg.Agents.Codex.Command = "/usr/bin/true"
+	m := New(NewController(cfg), session.NewManager())
+	m.width, m.height = 72, 24
+	m.screen = screenAgent
+	m.current = &workspaceRef{repo: "r", worktree: "w", ws: &session.Workspace{
+		Agents: []*session.Session{
+			{Provider: agent.Claude, Title: "amber-fox"},
+			{Provider: agent.Codex, Title: "jade-otter"},
+		},
+	}}
+	m.usageSnap = usageModel(80, 20).usageSnap
+	m.usageHave = true
+	m.codexUsageSnap = codexUsageSnapshot(60, 25)
+	m.codexUsageHave = true
+
+	// The Claude agent sees only the Claude estimate, even though a fresh Codex
+	// estimate also exists.
+	m.current.ws.ActiveAgent = 0
+	if bar := barLine(t, m); !strings.Contains(bar, "80%") || strings.Contains(bar, "60%") {
+		t.Errorf("Claude agent bar should show only Claude usage:\n%s", bar)
+	}
+
+	// Switching agents switches the estimate source; the stale provider's
+	// notification must not remain in the bar.
+	m.current.ws.ActiveAgent = 1
+	if bar := barLine(t, m); !strings.Contains(bar, "60%") || strings.Contains(bar, "80%") {
+		t.Errorf("Codex agent bar should show only Codex usage:\n%s", bar)
+	}
+}
+
+func TestCodexOnlyExposesCodexUsage(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Codex}
+	cfg.Agents.Default = agent.Codex
+	cfg.Agents.Codex.Command = "/usr/bin/true"
+	m := New(NewController(cfg), session.NewManager())
+	m.width, m.height = 72, 24
+	m.screen = screenAgent
+	m.current = &workspaceRef{repo: "r", worktree: "w", ws: &session.Workspace{
+		Agents: []*session.Session{{Provider: agent.Codex, Title: "jade-otter"}},
+	}}
+	m.codexUsageSnap = codexUsageSnapshot(72, 20)
+	m.codexUsageHave = true
+
+	if bar := barLine(t, m); !strings.Contains(bar, "72%") {
+		t.Errorf("Codex-only bar should show Codex usage:\n%s", bar)
+	}
+	if out := renderToTerminal(t, m.renderUsage(m.height-barHeight), m.width, m.height-barHeight); !strings.Contains(out, "Codex") || strings.Contains(out, "Claude") {
+		t.Errorf("Codex-only panel should show only Codex usage:\n%s", out)
+	}
+	if help := m.renderHelp(m.height - barHeight); !strings.Contains(help, "usage limits") {
+		t.Errorf("Codex-only help should expose usage:\n%s", help)
+	}
+}
+
 func TestBarUsageSegmentWeekBinding(t *testing.T) {
 	// The seven-day window binds (84 > 60): the segment flips to the wk label
 	// with the reset weekday instead of the session countdown.
@@ -441,6 +524,20 @@ func TestUsageOverlayRows(t *testing.T) {
 	out = renderToTerminal(t, empty.renderUsage(empty.height-barHeight), empty.width, empty.height-barHeight)
 	if !strings.Contains(out, "no usage data") {
 		t.Errorf("overlay should report missing data before the first poll:\n%s", out)
+	}
+}
+
+func TestUsageOverlayIncludesEveryEnabledProvider(t *testing.T) {
+	m := usageModel(68, 84)
+	m.agentProviders = []agent.Provider{agent.Claude, agent.Codex}
+	m.codexUsageSnap = codexUsageSnapshot(31, 55)
+	m.codexUsageHave = true
+
+	out := renderToTerminal(t, m.renderUsage(m.height-barHeight), m.width, m.height-barHeight)
+	for _, want := range []string{"Claude", "Codex", "68%", "84%", "31%", "55%"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("multi-provider overlay missing %q:\n%s", want, out)
+		}
 	}
 }
 

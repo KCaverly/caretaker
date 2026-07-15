@@ -11,6 +11,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
@@ -166,15 +167,9 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Right side: notification zone (! N  * N) then the workspace context.
-	right := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		right += notif + "   "
-	}
-	right += m.barContextLabel()
-	if right != "" {
-		right += "  "
-	}
+	// Right side: notification zone (! N  * N) then the workspace context. Its
+	// layout (and the click targets within it) is derived once by barRightZones.
+	right := m.barRightZones().text
 
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
@@ -225,18 +220,38 @@ func (m Model) barContextLabel() string {
 	if seg, ok := m.paneSegment(); ok {
 		s = accentStyle.Render(seg) + sep + s
 	}
-	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
-		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
+	if n := len(ws.Agents); m.screen == screenAgent && n > 0 {
 		if a := ws.ActiveAgentSession(); a != nil {
-			pos += " " + truncateTo(agentTitle(a.Title), 14)
+			provider := normalizedProvider(a.Provider)
+			identity := provider.String()
+			if title := agentTitle(provider, a.Title); title != provider.String() {
+				identity += " · " + title
+			}
+			if n > 1 {
+				identity = fmt.Sprintf("%d/%d ", clamp(ws.ActiveAgent, 0, n-1)+1, n) + identity
+			}
+			s = purpleStyle.Render(truncateTo(identity, 32)) + sep + s
 		}
-		s = purpleStyle.Render(pos) + sep + s
 	}
 	if seg, ok := m.usageSegment(); ok {
-		w, _ := m.usageSnap.Binding()
-		s = usageSeverity(w.Utilization).Render(seg) + sep + s
+		provider, _ := m.activeUsageProvider()
+		snap, _, _ := m.usageState(provider)
+		binding, _ := snap.BindingWindow()
+		s = usageSeverity(binding.Window.Utilization).Render(seg) + sep + s
 	}
 	return s
+}
+
+func (m Model) activeUsageProvider() (agent.Provider, bool) {
+	if m.current == nil || m.current.ws == nil {
+		return "", false
+	}
+	session := m.current.ws.ActiveAgentSession()
+	if session == nil {
+		return "", false
+	}
+	provider := normalizedProvider(session.Provider)
+	return provider, providerIn(provider, m.agentProviders)
 }
 
 // usageSegment returns the plan-usage gauge — pie glyph, the binding window's
@@ -247,23 +262,23 @@ func (m Model) barContextLabel() string {
 // drift. Like the other volatile segments it sits left of the stable
 // repo / worktree label; it leads them because it hot-swaps with every poll.
 func (m Model) usageSegment() (string, bool) {
-	if m.screen != screenAgent || !m.usageFresh() {
+	provider, ok := m.activeUsageProvider()
+	if !ok || m.screen != screenAgent || !m.usageFresh(provider) {
 		return "", false
 	}
-	w, limit := m.usageSnap.Binding()
-	if w == nil || w.Utilization < float64(m.usageThreshold) {
+	snap, _, _ := m.usageState(provider)
+	binding, ok := snap.BindingWindow()
+	if !ok || binding.Window.Utilization < float64(m.usageThreshold) {
 		return "", false
 	}
+	w := binding.Window
 	seg := usagePie(w.Utilization)
-	switch limit {
-	case usage.LimitWeek:
-		seg += " wk"
-	case usage.LimitOpus:
-		seg += " opus"
+	if binding.ShortLabel != "" {
+		seg += " " + binding.ShortLabel
 	}
 	seg += fmt.Sprintf(" %d%%", int(w.Utilization+0.5))
 	if !w.ResetsAt.IsZero() {
-		if limit == usage.LimitSession {
+		if binding.Session {
 			seg += " " + humanDur(time.Until(w.ResetsAt))
 		} else {
 			// A week-scale reset lands days out; the weekday says enough.
@@ -273,24 +288,17 @@ func (m Model) usageSegment() (string, bool) {
 	return seg, true
 }
 
-// usageZoneAt reports whether bar coordinates land on the usage segment.
-// It mirrors renderBar's right-side layout: the segment leads
-// barContextLabel, so its left edge is where the context label begins.
+// usageZoneAt reports whether bar coordinates land on the usage segment, using
+// the shared barRightZones layout so the click target tracks what renderBar drew.
 func (m Model) usageZoneAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	seg, ok := m.usageSegment()
-	if !ok {
+	z := m.barRightZones()
+	if z.usage == "" {
 		return false
 	}
-	prefix := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		prefix = notif + "   "
-	}
-	right := prefix + m.barContextLabel() + "  "
-	start := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
-	return x >= start && x < start+lipgloss.Width(seg)
+	return x >= z.usageStart && x < z.usageStart+lipgloss.Width(z.usage)
 }
 
 // usagePie maps a utilization percent to a pie glyph that fills as the
@@ -354,24 +362,18 @@ func (m Model) paneZoomIcon() string {
 }
 
 // paneZoomAt reports whether bar coordinates land on the pane indicator's zoom
-// toggle. It mirrors renderBar's right-side layout to locate the segment, then
+// toggle. It uses the shared barRightZones layout to locate the segment, then
 // targets its trailing icon (the toggle is always the segment's last glyph).
 func (m Model) paneZoomAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	seg, ok := m.paneSegment()
-	if !ok {
+	z := m.barRightZones()
+	if z.pane == "" {
 		return false
 	}
-	prefix := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		prefix = notif + "   "
-	}
-	right := prefix + m.barContextLabel() + "  "
-	labelStart := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
 	iconW := lipgloss.Width(m.paneZoomIcon())
-	iconStart := labelStart + lipgloss.Width(seg) - iconW
+	iconStart := z.paneStart + lipgloss.Width(z.pane) - iconW
 	// One column of slack on the left (the space before the icon) so the small
 	// target is easy to hit.
 	return x >= iconStart-1 && x < iconStart+iconW
@@ -444,20 +446,63 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 	return 0, false
 }
 
+// barRight holds the bar's fully-assembled right side plus the start columns of
+// its clickable zones, so drawing (renderBar) and hit-testing (notifZoneAt /
+// usageZoneAt / paneZoomAt) share one layout and can never drift apart —
+// mirroring how barZones unifies the left icons. Zone strings are "" when the
+// zone isn't shown; their start columns are only meaningful when non-empty.
+type barRight struct {
+	text       string // the right side exactly as drawn
+	notif      string // notification zone ("! N  * N")
+	notifStart int
+	usage      string // plan-usage segment (unstyled)
+	usageStart int
+	pane       string // terminal pane indicator (unstyled)
+	paneStart  int
+}
+
+// barRightZones assembles the bar's right side and locates its clickable zones.
+// The right side is the notification zone (with a 3-column gap) followed by the
+// workspace context label, with a 2-column trailing pad when anything is shown —
+// exactly what renderBar draws. The usage and pane segments each lead the context
+// label on their own screen (they never coexist), so both begin where the label
+// does.
+func (m Model) barRightZones() barRight {
+	z := barRight{notif: m.renderNotifZone()}
+	label := m.barContextLabel()
+	if z.notif != "" {
+		z.text += z.notif + "   "
+	}
+	z.text += label
+	if z.text != "" {
+		z.text += "  "
+	}
+
+	z.notifStart = m.width - lipgloss.Width(z.text)
+	labelStart := z.notifStart
+	if z.notif != "" {
+		labelStart += lipgloss.Width(z.notif + "   ")
+	}
+	if seg, ok := m.usageSegment(); ok {
+		z.usage, z.usageStart = seg, labelStart
+	}
+	if seg, ok := m.paneSegment(); ok {
+		z.pane, z.paneStart = seg, labelStart
+	}
+	return z
+}
+
 // notifZoneAt reports whether bar coordinates (x, y) land on the notification
-// zone. It mirrors renderBar's right-side layout to locate the zone's x bounds.
+// zone, using the shared barRightZones layout to locate the zone's x bounds.
 func (m Model) notifZoneAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	notif := m.renderNotifZone()
-	if notif == "" {
+	z := m.barRightZones()
+	if z.notif == "" {
 		return false
 	}
-	right := notif + "   " + m.barContextLabel() + "  "
-	start := m.width - lipgloss.Width(right)
-	end := start + lipgloss.Width(notif)
-	return x >= start && x < end
+	return x >= z.notifStart && x < z.notifStart+lipgloss.Width(z.notif)
 }
 
 // renderBoard draws the agent board overlay: every open workspace's agents
@@ -516,7 +561,7 @@ func (m Model) renderBoard(h int) string {
 
 	lines = append(lines, "", "  "+strings.Join([]string{
 		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
-		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
+		keyhint("n", "new"), keyhint("r", "restart"), keyhint("d", "close"), keyhint("esc", "close"),
 	}, helpStyle.Render("  ·  ")))
 
 	boxStr := box(lines, innerW, len(lines), true)
@@ -537,7 +582,9 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	case attnDone:
 		glyph, glyphSt = "*", boldGreen
 	}
-	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + nameStyle.Render(r.label)
+	chip := helpKeyStyle.Render(normalizedProvider(r.provider).String())
+	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + chip +
+		dimStyle.Render(" · ") + nameStyle.Render(r.label)
 	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
 	right := dimStyle.Render(status)
 	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
@@ -574,14 +621,26 @@ func (m Model) renderBoardForm(h, innerW int) string {
 		"",
 		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
 		"",
-		"  " + fieldName(formFieldWhere, "where") + toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
-		"  " + fieldName(formFieldMode, "mode") + toggle([2]string{"foreground", "background"}, bgIdx),
+	}
+	if len(m.agentProviders) > 1 {
+		providerIdx := 0
+		for i, provider := range m.agentProviders {
+			if provider == m.formProvider {
+				providerIdx = i
+			}
+		}
+		rows = append(rows, "  "+fieldName(formFieldProvider, "provider")+
+			toggle([2]string{m.agentProviders[0].String(), m.agentProviders[1].String()}, providerIdx))
+	}
+	rows = append(rows,
+		"  "+fieldName(formFieldWhere, "where")+toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
+		"  "+fieldName(formFieldMode, "mode")+toggle([2]string{"foreground", "background"}, bgIdx),
 		"",
-		"  " + strings.Join([]string{
+		"  "+strings.Join([]string{
 			keyhint("enter", "launch"), keyhint("tab", "field"),
 			keyhint("space", "toggle"), keyhint("esc", "back"),
 		}, helpStyle.Render("  ·  ")),
-	}
+	)
 	boxStr := box(rows, innerW, len(rows), true)
 	return centerBlock(boxStr, m.width, h)
 }
@@ -647,11 +706,23 @@ const usageBurnMinSpan = 5 * time.Minute
 func (m Model) renderUsage(h int) string {
 	innerW := clamp(m.width-8, 32, 56)
 	rows := []string{header("usage", -1), ""}
-	if !m.usageHave {
-		rows = append(rows, dimStyle.Render("  no usage data"))
-	} else {
-		rows = append(rows, m.usageWindowRows()...)
-		rows = append(rows, m.usageBurnRows()...)
+	for i, provider := range m.agentProviders {
+		if i > 0 {
+			rows = append(rows, "")
+		}
+		rows = append(rows, repoHdrStyle.Render("  "+providerName(provider)))
+		snap, have, hist := m.usageState(provider)
+		if !have {
+			rows = append(rows, dimStyle.Render("  no usage data"))
+			continue
+		}
+		windowRows := usageWindowRows(snap)
+		if len(windowRows) == 0 {
+			rows = append(rows, dimStyle.Render("  no usage data"))
+			continue
+		}
+		rows = append(rows, windowRows...)
+		rows = append(rows, usageBurnRows(snap, hist)...)
 	}
 	rows = append(rows, "", "  "+keyhint("esc", "close"))
 	boxStr := box(rows, innerW, len(rows), true)
@@ -661,9 +732,10 @@ func (m Model) renderUsage(h int) string {
 // usageWindowRows renders a gauge line (and an indented reset line) per
 // present window; absent windows are skipped outright — a placeholder row
 // would imply a limit the plan doesn't have.
-func (m Model) usageWindowRows() []string {
+func usageWindowRows(snap usage.Snapshot) []string {
 	var rows []string
-	add := func(label string, w *usage.Window, session bool) {
+	add := func(named usage.NamedWindow) {
+		label, w, session := named.Label, named.Window, named.Session
 		if w == nil {
 			return
 		}
@@ -682,9 +754,9 @@ func (m Model) usageWindowRows() []string {
 		}
 		rows = append(rows, "  "+strings.Repeat(" ", 9)+dimStyle.Render(line))
 	}
-	add("session", m.usageSnap.FiveHour, true)
-	add("week", m.usageSnap.SevenDay, false)
-	add("opus", m.usageSnap.SevenDayOpus, false)
+	for _, named := range snap.Windows() {
+		add(named)
+	}
 	return rows
 }
 
@@ -694,8 +766,7 @@ func (m Model) usageWindowRows() []string {
 // until the ring spans usageBurnMinSpan with a rising trend, so a flat or
 // draining window never shows a scary extrapolation, and the projection line
 // is dropped when the reset lands first (the window frees up before it caps).
-func (m Model) usageBurnRows() []string {
-	hist := m.usageHist
+func usageBurnRows(snap usage.Snapshot, hist []usageSample) []string {
 	if len(hist) < 2 {
 		return nil
 	}
@@ -707,7 +778,7 @@ func (m Model) usageBurnRows() []string {
 	perHour := (last.util - first.util) / span.Hours()
 	rows := []string{"  " + dimStyle.Render(padLine("burn", 9)) + usageSparkline(hist) +
 		dimStyle.Render(fmt.Sprintf(" ~%d%%/hr", int(perHour+0.5)))}
-	if w := m.usageSnap.FiveHour; w != nil && w.Utilization < 100 {
+	if w := sessionUsageWindow(snap); w != nil && w.Utilization < 100 {
 		caps := time.Now().Add(time.Duration((100 - w.Utilization) / perHour * float64(time.Hour)))
 		if w.ResetsAt.IsZero() || caps.Before(w.ResetsAt) {
 			rows = append(rows, "  "+strings.Repeat(" ", 9)+
@@ -1349,38 +1420,36 @@ func (m Model) renderHelp(h int) string {
 		row("ctrl+c", "quit"),
 		"",
 		repoHdrStyle.Render("  Session"),
-		row(m.keyCycle+" / "+m.keyCycleBack, "cycle view (next / prev)"),
-		row(m.keyGotoEditor+" "+m.keyGotoAgent+" "+m.keyGotoTerm, "go to editor / agent / term"),
-		row(m.keyPicker, "back to the deck"),
-		row(m.keyGlobalConfig, "open home workspace (~)"),
-		row(m.keyPrompt, "quick background agent (home)"),
-		row(m.keyPalette, "agent board"),
-		row(m.keyCommandPalette, "command palette (every action)"),
+		row(m.keys.Cycle+" / "+m.keys.CycleBack, "cycle view (next / prev)"),
+		row(m.keys.GotoEditor+" "+m.keys.GotoAgent+" "+m.keys.GotoTerm, "go to editor / agent / term"),
+		row(m.keys.Picker, "back to the deck"),
+		row(m.keys.GlobalConfig, "open home workspace (~)"),
+		row(m.keys.Prompt, "quick background agent (home)"),
+		row(m.keys.Palette, "agent board"),
+		row(m.keys.CommandPalette, "command palette (every action)"),
 	)
-	if m.keyNotif != "" {
-		rows = append(rows, row(m.keyNotif, "agent board (alias)"))
+	rows = append(rows,
+		row(m.keys.PrevAgent+" / "+m.keys.NextAgent, "prev / next agent"),
+	)
+	if m.usageEnabled() {
+		rows = append(rows, row(m.keys.Usage, "usage limits"))
 	}
 	rows = append(rows,
-		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
-		row(m.keyUsage, "usage limits"),
 		"",
 		repoHdrStyle.Render("  Terminal panes"),
-		row(m.keyTermSplitV, "vertical split"),
-		row(m.keyTermSplitH, "horizontal split"),
-		row(m.keyTermFocusLeft+" "+m.keyTermFocusDown+" "+m.keyTermFocusUp+" "+m.keyTermFocusRight, "focus left / down / up / right"),
-		row(m.keyTermZoom, "zoom / restore pane"),
-		row(m.keyTermClose, "close pane"),
+		row(m.keys.TermSplitV, "vertical split"),
+		row(m.keys.TermSplitH, "horizontal split"),
+		row(m.keys.TermFocusLeft+" "+m.keys.TermFocusDown+" "+m.keys.TermFocusUp+" "+m.keys.TermFocusRight, "focus left / down / up / right"),
+		row(m.keys.TermZoom, "zoom / restore pane"),
+		row(m.keys.TermClose, "close pane"),
 	)
-	if m.keyTermCycle != "" {
-		rows = append(rows, row(m.keyTermCycle, "cycle pane focus"))
-	}
 	rows = append(rows,
 		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
 		"",
-		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keyHelp)+
+		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keys.Help)+
 			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
 			helpStyle.Render(" in the deck) · any key closes"),
 	)
@@ -1487,17 +1556,16 @@ func (m Model) appendSessionFooter(body string) string {
 // hint mainly exists to teach. Trailing hints are dropped rather than wrapped
 // so the line always fits the single reserved row.
 func (m Model) sessionFooter() string {
-	hints := []string{keyhint(m.keyHelp, "help")}
+	hints := []string{keyhint(m.keys.Help, "help")}
 	if m.screen == screenTerminal {
 		hints = append(hints,
-			keyhint(m.keyTermSplitV+" "+m.keyTermSplitH, "split"),
-			keyhint(m.keyTermCycle, "cycle pane"),
-			keyhint(m.keyTermZoom, "zoom"),
-			keyhint(m.keyTermClose, "close"))
+			keyhint(m.keys.TermSplitV+" "+m.keys.TermSplitH, "split"),
+			keyhint(m.keys.TermZoom, "zoom"),
+			keyhint(m.keys.TermClose, "close"))
 	} else {
 		hints = append(hints,
-			keyhint(m.keyCycle, "cycle view"),
-			keyhint(m.keyPicker, "deck"))
+			keyhint(m.keys.Cycle, "cycle view"),
+			keyhint(m.keys.Picker, "deck"))
 	}
 	sep := helpStyle.Render("  ·  ")
 	for n := len(hints); n >= 1; n-- {

@@ -8,6 +8,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 )
@@ -24,7 +26,7 @@ func sampleModel() Model {
 			{WT: repo.Worktree{Repo: "api", Name: "spike", Branch: "spike"}, Live: true},
 		}},
 	}
-	m := New(&Controller{}, session.NewManager())
+	m := New(&Controller{cfg: config.Config{Keys: config.Default().Keys}}, session.NewManager())
 	mm, _ := m.Update(tea.WindowSizeMsg{Width: 72, Height: 24})
 	m = mm.(Model)
 	m.groups = groups
@@ -285,8 +287,7 @@ func TestActiveDisplayDetailLine(t *testing.T) {
 }
 
 func TestRenderHelpKeys(t *testing.T) {
-	// Defaults: the cycle fwd/back and goto rows show, and the retired notif
-	// alias + pane-cycle rows are omitted.
+	// The cycle fwd/back and goto rows show; the removed alias rows never do.
 	m := sampleModel()
 	out := m.renderHelp(m.height - barHeight)
 	for _, want := range []string{"alt+]", "alt+[", "alt+1", "alt+h", "alt+v", "cycle view"} {
@@ -295,18 +296,10 @@ func TestRenderHelpKeys(t *testing.T) {
 		}
 	}
 	if strings.Contains(out, "agent board (alias)") {
-		t.Error("retired notif alias row should be hidden when keyNotif is empty")
+		t.Error("removed notif alias row should never appear")
 	}
 	if strings.Contains(out, "cycle pane focus") {
-		t.Error("retired pane-cycle row should be hidden when keyTermCycle is empty")
-	}
-
-	// When a user re-enables the aliases, their rows reappear.
-	m.keyNotif = "ctrl+n"
-	m.keyTermCycle = "ctrl+w"
-	out = m.renderHelp(m.height - barHeight)
-	if !strings.Contains(out, "agent board (alias)") || !strings.Contains(out, "cycle pane focus") {
-		t.Errorf("rebound alias rows should appear:\n%s", out)
+		t.Error("removed pane-cycle row should never appear")
 	}
 }
 
@@ -372,6 +365,42 @@ func TestBoardRender(t *testing.T) {
 	}
 }
 
+func TestProviderRowOnlyAppearsForMixedConfig(t *testing.T) {
+	claudeOnly := modelWithAgents(1).openNewAgentForm().(Model)
+	out := claudeOnly.renderBoard(claudeOnly.height - barHeight)
+	if strings.Contains(out, "provider") || strings.Contains(out, "codex") {
+		t.Errorf("single-provider form should hide provider choice:\n%s", out)
+	}
+
+	mixed := mixedProviderModel(agent.Codex)
+	mixed.width, mixed.height = 72, 24
+	mixed = mixed.openNewAgentForm().(Model)
+	out = mixed.renderBoard(mixed.height - barHeight)
+	for _, want := range []string{"provider", "claude", "codex"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mixed-provider form missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestMixedProviderBoardChips(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.width, m.height = 72, 24
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: "/r/w", ws: &session.Workspace{
+		Agents: []*session.Session{
+			{Provider: agent.Claude, Title: "amber-fox"},
+			{Provider: agent.Codex, Title: "jade-otter"},
+		},
+	}}
+	m.boardOpen = true
+	out := m.renderBoard(m.height - barHeight)
+	for _, want := range []string{"claude", "amber-fox", "codex", "jade-otter", "restart"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mixed board missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestRenderCommandPalette(t *testing.T) {
 	m := modelWithAgents(1) // an active workspace, so view-nav rows show
 	mm, _ := m.openPalette()
@@ -387,8 +416,8 @@ func TestRenderCommandPalette(t *testing.T) {
 
 	// Each row shows its live keybinding right-aligned; the "go to editor" row
 	// carries the goto-editor key.
-	if !strings.Contains(out, m.keyGotoEditor) {
-		t.Errorf("palette should show the goto-editor row's live key %q:\n%s", m.keyGotoEditor, out)
+	if !strings.Contains(out, m.keys.GotoEditor) {
+		t.Errorf("palette should show the goto-editor row's live key %q:\n%s", m.keys.GotoEditor, out)
 	}
 }
 

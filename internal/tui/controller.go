@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/codex"
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
@@ -31,11 +33,39 @@ type Controller struct {
 	// loadSeq stamps each issued Load so the loadedMsg handler can drop
 	// results superseded by a newer in-flight load.
 	loadSeq atomic.Uint64
+	// startCodex is replaceable in tests; production uses the pane-local Codex
+	// App Server observer.
+	startCodex func(context.Context, codex.Config) (codexRuntime, error)
+}
+
+type codexRuntime interface {
+	Close() error
+	Remote() string
+	EventStream() <-chan agent.Event
 }
 
 // NewController builds a Controller from config.
 func NewController(cfg config.Config) *Controller {
+	// Keep programmatic callers that populate only the legacy Agent field on a
+	// safe Claude-only fallback. Config loaded through config.Load already has
+	// both built-in providers enabled by default.
+	if len(cfg.Agents.Enabled) == 0 {
+		cfg.Agents.Enabled = []agent.Provider{agent.Claude}
+	}
+	if !cfg.Agents.Default.Valid() {
+		cfg.Agents.Default = agent.Claude
+	}
+	if cfg.Agents.Claude.Command == "" {
+		cfg.Agents.Claude.Command = cfg.Agent
+	}
 	return &Controller{cfg: cfg}
+}
+
+func (c *Controller) startCodexRuntime(ctx context.Context, cfg codex.Config) (codexRuntime, error) {
+	if c.startCodex != nil {
+		return c.startCodex(ctx, cfg)
+	}
+	return codex.Start(ctx, cfg)
 }
 
 // SetRoot updates the repos root after first-run setup.
@@ -167,44 +197,10 @@ func (c *Controller) Remove(r repo.Repo, wt repo.Worktree, deleteBranch bool) er
 	return repo.RemoveWorktree(r, wt, deleteBranch)
 }
 
-// Keys returns the reserved navigation keystrokes (cycle, return-to-picker).
-func (c *Controller) Keys() (cycle, picker string) {
-	return c.cfg.Keys.Cycle, c.cfg.Keys.Picker
-}
-
-// CycleBackKey returns the key that cycles to the previous session view.
-func (c *Controller) CycleBackKey() string { return c.cfg.Keys.CycleBack }
-
-// GotoKeys returns the keys that jump straight to the editor, agent, and
-// terminal views.
-func (c *Controller) GotoKeys() (editor, agent, term string) {
-	k := c.cfg.Keys
-	return k.GotoEditor, k.GotoAgent, k.GotoTerm
-}
-
-// AgentKeys returns the reserved agent-pool keystrokes (open palette, next
-// agent, previous agent).
-func (c *Controller) AgentKeys() (palette, next, prev string) {
-	return c.cfg.Keys.Palette, c.cfg.Keys.NextAgent, c.cfg.Keys.PrevAgent
-}
-
-// HelpKey returns the reserved key that toggles the help overlay.
-func (c *Controller) HelpKey() string { return c.cfg.Keys.Help }
-
-// GlobalConfigKey returns the key that opens the home-directory workspace.
-func (c *Controller) GlobalConfigKey() string { return c.cfg.Keys.GlobalConfig }
-
-// NotifKey returns the key that opens the notification overlay.
-func (c *Controller) NotifKey() string { return c.cfg.Keys.Notif }
-
-// PromptKey returns the key that opens the quick-prompt overlay.
-func (c *Controller) PromptKey() string { return c.cfg.Keys.Prompt }
-
-// UsageKey returns the key that opens the usage overlay on the agent screen.
-func (c *Controller) UsageKey() string { return c.cfg.Keys.Usage }
-
-// CommandPaletteKey returns the key that opens the command palette.
-func (c *Controller) CommandPaletteKey() string { return c.cfg.Keys.CommandPalette }
+// Keys returns the reserved keystrokes (not forwarded to embedded sessions).
+// config.Load decodes the user's TOML over config.Default, so every field is
+// already populated with its default when unset — the TUI can use them directly.
+func (c *Controller) Keys() config.Keys { return c.cfg.Keys }
 
 // UsageThreshold returns the utilization percent at/above which the bar's
 // usage gauge appears (0 = always, >100 = never).
@@ -212,20 +208,6 @@ func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
 
 // PlasmaConfig returns the deck plasma-panel settings.
 func (c *Controller) PlasmaConfig() config.Plasma { return c.cfg.Plasma }
-
-// TermPaneKeys returns the reserved keys for terminal pane management. These
-// are only intercepted when the terminal screen is active.
-func (c *Controller) TermPaneKeys() (splitV, splitH, cycle, zoom, close string) {
-	k := c.cfg.Keys
-	return k.TermSplitV, k.TermSplitH, k.TermCycle, k.TermZoom, k.TermClose
-}
-
-// TermFocusKeys returns the directional terminal-pane focus keys (left, down,
-// up, right). These are only intercepted when the terminal screen is active.
-func (c *Controller) TermFocusKeys() (left, down, up, right string) {
-	k := c.cfg.Keys
-	return k.TermFocusLeft, k.TermFocusDown, k.TermFocusUp, k.TermFocusRight
-}
 
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
@@ -313,24 +295,176 @@ func (c *Controller) TermSpec() session.Spec {
 	return session.Spec{Kind: session.Terminal, Title: "term", Argv: []string{c.cfg.Shell}}
 }
 
-// agentTitle is the palette/display title for an agent with the given label,
-// falling back to a plain "claude" when it has none.
-func agentTitle(label string) string {
+// agentTitle is the palette/display title for a provider agent with the given
+// label, falling back to its provider name when it has none.
+func agentTitle(provider agent.Provider, label string) string {
 	if label == "" {
-		return "claude"
+		return provider.String()
 	}
 	return label
+}
+
+// AgentMode controls whether an agent is launched interactively or with the
+// provider's autonomous background flags.
+type AgentMode int
+
+const (
+	AgentForeground AgentMode = iota
+	AgentBackground
+)
+
+func (m AgentMode) valid() bool { return m == AgentForeground || m == AgentBackground }
+
+// EnabledAgentProviders returns the configured provider choices in palette
+// order. The returned slice is independent of the controller's configuration.
+// A zero-value/legacy controller remains Claude-only.
+func (c *Controller) EnabledAgentProviders() []agent.Provider {
+	if len(c.cfg.Agents.Enabled) == 0 {
+		return []agent.Provider{agent.Claude}
+	}
+	return append([]agent.Provider(nil), c.cfg.Agents.Enabled...)
+}
+
+// DefaultAgentProvider returns the provider initially selected by the new-agent
+// form. A zero-value/legacy controller defaults to Claude.
+func (c *Controller) DefaultAgentProvider() agent.Provider {
+	if c.cfg.Agents.Default.Valid() {
+		return c.cfg.Agents.Default
+	}
+	return agent.Claude
+}
+
+// providerConfig resolves a provider's command and base arguments. Claude's
+// legacy top-level Agent command remains the fallback for direct/programmatic
+// configs that have not populated Agents.
+func (c *Controller) providerConfig(provider agent.Provider) (config.AgentProvider, error) {
+	if !provider.Valid() {
+		return config.AgentProvider{}, fmt.Errorf("unknown agent provider %q", provider)
+	}
+	providerCfg := c.cfg.Agents.Provider(provider)
+	if provider == agent.Claude && providerCfg.Command == "" {
+		providerCfg.Command = c.cfg.Agent
+	}
+	if providerCfg.Command == "" {
+		return config.AgentProvider{}, fmt.Errorf("agent provider %q has no command", provider)
+	}
+	return providerCfg, nil
+}
+
+// PrepareAgentSpec attaches any provider-side runtime required before the
+// interactive process starts. Claude needs no companion. Each Codex pane owns
+// a private App Server observed by caretaker; the stock Codex TUI connects to
+// it through --remote and remains the sole approval/input responder.
+func (c *Controller) PrepareAgentSpec(ctx context.Context, dir string, spec session.Spec) (session.Spec, error) {
+	if normalizedProvider(spec.Provider) != agent.Codex {
+		return spec, nil
+	}
+	providerCfg, err := c.providerConfig(agent.Codex)
+	if err != nil {
+		return session.Spec{}, err
+	}
+	insertAt := 1 + len(providerCfg.Args)
+	if len(spec.Argv) < insertAt || len(spec.Argv) == 0 || spec.Argv[0] != providerCfg.Command {
+		return session.Spec{}, fmt.Errorf("Codex session command does not match configured provider")
+	}
+	runtime, err := c.startCodexRuntime(ctx, codex.Config{
+		Command: providerCfg.Command,
+		Args:    providerCfg.Args,
+		Dir:     dir,
+	})
+	if err != nil {
+		return session.Spec{}, err
+	}
+	argv := make([]string, 0, len(spec.Argv)+2)
+	argv = append(argv, spec.Argv[:insertAt]...)
+	argv = append(argv, "--remote", runtime.Remote())
+	argv = append(argv, spec.Argv[insertAt:]...)
+	spec.Argv = argv
+	spec.Events = runtime.EventStream()
+	spec.Companion = runtime
+	return spec, nil
+}
+
+// NewProviderAgentSpec constructs a brand-new provider session. Claude owns a
+// caller-generated UUID from launch; Codex assigns its thread ID after launch,
+// so a fresh Codex spec deliberately starts with an empty SessionID.
+func (c *Controller) NewProviderAgentSpec(provider agent.Provider, label, prompt string, mode AgentMode) (session.Spec, error) {
+	if !mode.valid() {
+		return session.Spec{}, fmt.Errorf("invalid agent mode %d", mode)
+	}
+	providerCfg, err := c.providerConfig(provider)
+	if err != nil {
+		return session.Spec{}, err
+	}
+
+	switch provider {
+	case agent.Claude:
+		return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, prompt, mode), nil
+	case agent.Codex:
+		argv := append([]string{providerCfg.Command}, providerCfg.Args...)
+		if mode == AgentBackground {
+			argv = append(argv, "--sandbox", "workspace-write", "--ask-for-approval", "never")
+		}
+		if prompt != "" {
+			argv = append(argv, prompt)
+		}
+		return session.Spec{
+			Kind: session.Agent, Title: agentTitle(provider, label), Argv: argv,
+			Provider: provider,
+		}, nil
+	default:
+		// providerConfig already validates this, but keep the switch exhaustive.
+		return session.Spec{}, fmt.Errorf("unknown agent provider %q", provider)
+	}
+}
+
+// RestoreProviderAgentSpec constructs a persisted provider session. Claude
+// keeps its missing-transcript fallback; Codex resumes through its resume
+// subcommand, with global background flags placed before that subcommand.
+func (c *Controller) RestoreProviderAgentSpec(provider agent.Provider, id, label, prompt string, mode AgentMode) (session.Spec, error) {
+	// A provider may not have reported its conversation ID before caretaker was
+	// stopped. Relaunch that entry as a fresh session rather than constructing a
+	// malformed resume command with an empty identifier.
+	if id == "" {
+		return c.NewProviderAgentSpec(provider, label, prompt, mode)
+	}
+	if !mode.valid() {
+		return session.Spec{}, fmt.Errorf("invalid agent mode %d", mode)
+	}
+	providerCfg, err := c.providerConfig(provider)
+	if err != nil {
+		return session.Spec{}, err
+	}
+
+	switch provider {
+	case agent.Claude:
+		if !c.transcriptExists(id) {
+			return c.freshClaudeAgentSpec(providerCfg, id, label, prompt, mode), nil
+		}
+		return c.resumeClaudeAgentSpec(providerCfg, id, label, prompt, mode), nil
+	case agent.Codex:
+		argv := append([]string{providerCfg.Command}, providerCfg.Args...)
+		if mode == AgentBackground {
+			argv = append(argv, "--sandbox", "workspace-write", "--ask-for-approval", "never")
+		}
+		argv = append(argv, "resume", id)
+		if prompt != "" {
+			argv = append(argv, prompt)
+		}
+		return session.Spec{
+			Kind: session.Agent, Title: agentTitle(provider, label), Argv: argv,
+			Provider: provider, SessionID: id,
+		}, nil
+	default:
+		return session.Spec{}, fmt.Errorf("unknown agent provider %q", provider)
+	}
 }
 
 // PromptAgentSpec returns a spec for a brand-new Claude agent session with
 // --dangerously-skip-permissions set, for autonomous background execution.
 func (c *Controller) PromptAgentSpec(label string) session.Spec {
-	id := newSessionID()
-	argv := []string{c.cfg.Agent, "--session-id", id, "--teammate-mode", "in-process", "--dangerously-skip-permissions"}
-	if label != "" {
-		argv = append(argv, "-n", label)
-	}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	providerCfg, _ := c.providerConfig(agent.Claude)
+	return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, "", AgentBackground)
 }
 
 // NewAgentSpec returns the spec for a brand-new Claude agent session, optionally
@@ -340,17 +474,33 @@ func (c *Controller) PromptAgentSpec(label string) session.Spec {
 // picker), and teammate split-pane mode is pinned off so any agent team renders
 // in-process inside the pane ct controls.
 func (c *Controller) NewAgentSpec(label string) session.Spec {
-	return c.freshAgentSpec(newSessionID(), label)
+	providerCfg, _ := c.providerConfig(agent.Claude)
+	return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, "", AgentForeground)
 }
 
 // freshAgentSpec builds the spec for a brand-new claude session running under
 // the given id (shared by NewAgentSpec and the resume-fallback path).
 func (c *Controller) freshAgentSpec(id, label string) session.Spec {
-	argv := []string{c.cfg.Agent, "--session-id", id, "--teammate-mode", "in-process"}
+	providerCfg, _ := c.providerConfig(agent.Claude)
+	return c.freshClaudeAgentSpec(providerCfg, id, label, "", AgentForeground)
+}
+
+func (c *Controller) freshClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string, mode AgentMode) session.Spec {
+	argv := append([]string{providerCfg.Command}, providerCfg.Args...)
+	argv = append(argv, "--session-id", id, "--teammate-mode", "in-process")
+	if mode == AgentBackground {
+		argv = append(argv, "--dangerously-skip-permissions")
+	}
 	if label != "" {
 		argv = append(argv, "-n", label)
 	}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	if prompt != "" {
+		argv = append(argv, prompt)
+	}
+	return session.Spec{
+		Kind: session.Agent, Title: agentTitle(agent.Claude, label), Argv: argv,
+		Provider: agent.Claude, SessionID: id, UnsetEnv: []string{"TMUX", "TERM_PROGRAM"},
+	}
 }
 
 // AgentSpec returns the spec to (re)launch a persisted agent. It resumes the
@@ -393,8 +543,23 @@ func (c *Controller) transcriptExists(id string) bool {
 // drives only ct's palette title; the conversation's own name is restored by
 // claude on resume.
 func (c *Controller) ResumeAgentSpec(id, label string) session.Spec {
-	argv := []string{c.cfg.Agent, "--resume", id, "--teammate-mode", "in-process"}
-	return session.Spec{Kind: session.Agent, Title: agentTitle(label), Argv: argv, SessionID: id}
+	providerCfg, _ := c.providerConfig(agent.Claude)
+	return c.resumeClaudeAgentSpec(providerCfg, id, label, "", AgentForeground)
+}
+
+func (c *Controller) resumeClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string, mode AgentMode) session.Spec {
+	argv := append([]string{providerCfg.Command}, providerCfg.Args...)
+	argv = append(argv, "--resume", id, "--teammate-mode", "in-process")
+	if mode == AgentBackground {
+		argv = append(argv, "--dangerously-skip-permissions")
+	}
+	if prompt != "" {
+		argv = append(argv, prompt)
+	}
+	return session.Spec{
+		Kind: session.Agent, Title: agentTitle(agent.Claude, label), Argv: argv,
+		Provider: agent.Claude, SessionID: id, UnsetEnv: []string{"TMUX", "TERM_PROGRAM"},
+	}
 }
 
 // newSessionID returns a random RFC-4122 v4 UUID for a fresh claude session.
@@ -409,6 +574,7 @@ func newSessionID() string {
 // AgentStatus is the live state of a Claude session as reported by
 // `claude agents --json`, keyed elsewhere by pid.
 type AgentStatus struct {
+	Provider   agent.Provider
 	Status     string // "busy", "idle", or "waiting"
 	WaitingFor string // when waiting: "permission prompt" / "input needed"
 	Cwd        string
@@ -436,7 +602,7 @@ func parseAgentStatuses(data []byte) (map[int]AgentStatus, error) {
 		if r.Pid == 0 {
 			continue
 		}
-		out[r.Pid] = AgentStatus{Status: r.Status, WaitingFor: r.WaitingFor, Cwd: r.Cwd, StartedAt: r.StartedAt}
+		out[r.Pid] = AgentStatus{Provider: agent.Claude, Status: r.Status, WaitingFor: r.WaitingFor, Cwd: r.Cwd, StartedAt: r.StartedAt}
 	}
 	return out, nil
 }
@@ -444,7 +610,12 @@ func parseAgentStatuses(data []byte) (map[int]AgentStatus, error) {
 // AgentStatuses runs `claude agents --json` and returns live session statuses
 // keyed by pid. It requires no TTY and exits immediately.
 func (c *Controller) AgentStatuses(ctx context.Context) (map[int]AgentStatus, error) {
-	out, err := exec.CommandContext(ctx, c.cfg.Agent, "agents", "--json").Output()
+	providerCfg, err := c.providerConfig(agent.Claude)
+	if err != nil {
+		return nil, err
+	}
+	argv := append(append([]string(nil), providerCfg.Args...), "agents", "--json")
+	out, err := exec.CommandContext(ctx, providerCfg.Command, argv...).Output()
 	if err != nil {
 		return nil, err
 	}

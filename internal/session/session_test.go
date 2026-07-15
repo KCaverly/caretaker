@@ -1,13 +1,16 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/KCaverly/caretaker/internal/agent"
 	uv "github.com/charmbracelet/ultraviolet"
 )
 
@@ -367,6 +370,40 @@ func TestRenderCacheNoStaleFrameUnderRacingWrites(t *testing.T) {
 	}
 }
 
+// TestResizeShrinkKeepsRecentOutput reproduces the split-pane content loss:
+// with a full screen of output, shrinking the pane (as a horizontal split
+// does) must keep the newest lines — the emulator truncates the buffer from
+// the bottom, which would keep the oldest lines and destroy everything near
+// the cursor. The evicted top lines must land in scrollback, not vanish.
+func TestResizeShrinkKeepsRecentOutput(t *testing.T) {
+	s, err := Start(Terminal, "term", t.TempDir(),
+		[]string{"sh", "-c", "i=1; while [ $i -le 20 ]; do echo line-$i; i=$((i+1)); done; sleep 5"},
+		80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	waitFor(t, s, "line-20") // full screen: 20 lines on a 24-row pty
+
+	s.Resize(80, 5) // top pane after an even horizontal split of ~11 rows → use 5 to force a deep shrink
+
+	got := s.Render()
+	if !strings.Contains(got, "line-20") {
+		t.Fatalf("newest output lost on shrink; screen was:\n%s", got)
+	}
+	if strings.Contains(got, "line-5") && !strings.Contains(got, "line-15") {
+		t.Fatalf("shrink kept the oldest lines instead of the newest; screen was:\n%s", got)
+	}
+	if n := s.emu.ScrollbackLen(); n == 0 {
+		t.Error("lines evicted by the shrink were not pushed into scrollback")
+	}
+
+	// The cursor must sit on-screen where the child's next prompt will draw.
+	if _, y, _ := s.Cursor(); y < 0 || y >= 5 {
+		t.Errorf("cursor row %d outside the 5-row pane after shrink", y)
+	}
+}
+
 func TestManagerActivateReuses(t *testing.T) {
 	m := NewManager()
 	defer m.CloseAll()
@@ -463,5 +500,240 @@ func TestManagerSpawnAndCloseAgent(t *testing.T) {
 	// Spawning into a non-existent workspace errors.
 	if _, err := m.SpawnAgent("nope", t.TempDir(), Spec{Kind: Agent, Argv: sleep}, 80, 24); err == nil {
 		t.Error("expected error spawning into an inactive workspace")
+	}
+}
+
+func TestStartSpecPropagatesAgentMetadataAndEnvironment(t *testing.T) {
+	t.Setenv("CT_SESSION_REMOVE", "inherited")
+	events := make(chan agent.Event)
+	companion := newTestCloser(nil)
+	spec := Spec{
+		Kind:      Agent,
+		Title:     "codex agent",
+		Argv:      []string{"sh", "-c", `printf '%s|%s|%s' "$CT_SESSION_SET" "${CT_SESSION_REMOVE-unset}" "$TERM"; sleep 5`},
+		Provider:  agent.Codex,
+		SessionID: "opaque-thread-id",
+		Env:       []string{"CT_SESSION_SET=provider-value", "CT_SESSION_REMOVE=explicit-value"},
+		UnsetEnv:  []string{"CT_SESSION_REMOVE"},
+		Events:    events,
+		Companion: companion,
+	}
+	s, err := StartSpec(spec, t.TempDir(), 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	waitFor(t, s, "provider-value|unset|xterm-256color")
+	if s.Provider != agent.Codex {
+		t.Fatalf("provider = %q, want %q", s.Provider, agent.Codex)
+	}
+	if s.SessionID != "opaque-thread-id" {
+		t.Fatalf("session ID = %q, want opaque provider ID", s.SessionID)
+	}
+	if s.Title != "codex agent" {
+		t.Fatalf("title = %q, want propagated title", s.Title)
+	}
+	if s.Events != events {
+		t.Fatal("provider event stream was not propagated to Session")
+	}
+	if s.companion != companion {
+		t.Fatal("provider companion ownership was not propagated to Session")
+	}
+}
+
+func TestStartSpecClosesCompanionWhenPTYStartupFails(t *testing.T) {
+	companion := newTestCloser(nil)
+	missing := filepath.Join(t.TempDir(), "definitely-missing-command")
+	_, err := StartSpec(Spec{
+		Kind:      Agent,
+		Argv:      []string{missing},
+		Companion: companion,
+	}, t.TempDir(), 80, 24, func(*Session) {})
+	if err == nil {
+		t.Fatal("StartSpec unexpectedly succeeded")
+	}
+	if got := companion.count.Load(); got != 1 {
+		t.Fatalf("companion Close calls = %d, want 1 after PTY startup failure", got)
+	}
+}
+
+func TestSessionCloseOwnsCompanionIdempotently(t *testing.T) {
+	release := make(chan struct{})
+	companion := newTestCloser(release)
+	s, err := StartSpec(Spec{
+		Kind:      Agent,
+		Argv:      []string{"sh", "-c", "sleep 5"},
+		Companion: companion,
+	}, t.TempDir(), 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closed)
+	}()
+	if call := waitForCloserCall(t, companion); call != 1 {
+		t.Fatalf("first companion call number = %d, want 1", call)
+	}
+
+	// Close has already killed the child and closed the PTY. Hold its first
+	// companion call open long enough for the output pump to observe that exit;
+	// the pump must share the same once-only ownership path.
+	select {
+	case call := <-companion.called:
+		t.Fatalf("companion Close called again by output pump (call %d)", call)
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Session.Close did not return")
+	}
+
+	s.Close()
+	if got := companion.count.Load(); got != 1 {
+		t.Fatalf("companion Close calls = %d after repeated Session.Close, want 1", got)
+	}
+}
+
+func TestNaturalChildExitClosesCompanionOnce(t *testing.T) {
+	companion := newTestCloser(nil)
+	s, err := StartSpec(Spec{
+		Kind:      Agent,
+		Argv:      []string{"sh", "-c", "exit 0"},
+		Companion: companion,
+	}, t.TempDir(), 80, 24, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call := waitForCloserCall(t, companion); call != 1 {
+		t.Fatalf("natural-exit companion call number = %d, want 1", call)
+	}
+	if s.Alive() {
+		t.Fatal("session still alive after child exit cleanup")
+	}
+
+	// A later manager/session cleanup must not hand the same provider process
+	// back to its closer a second time.
+	s.Close()
+	if got := companion.count.Load(); got != 1 {
+		t.Fatalf("companion Close calls = %d after natural exit plus Close, want 1", got)
+	}
+}
+
+type testCloser struct {
+	count   atomic.Int32
+	called  chan int32
+	release <-chan struct{}
+}
+
+func newTestCloser(release <-chan struct{}) *testCloser {
+	return &testCloser{called: make(chan int32, 4), release: release}
+}
+
+func (c *testCloser) Close() error {
+	call := c.count.Add(1)
+	c.called <- call
+	if call == 1 && c.release != nil {
+		<-c.release
+	}
+	return nil
+}
+
+func waitForCloserCall(t *testing.T, closer *testCloser) int32 {
+	t.Helper()
+	select {
+	case call := <-closer.called:
+		return call
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for companion Close")
+		return 0
+	}
+}
+
+func TestStartRejectsAgentWithoutCommand(t *testing.T) {
+	if _, err := Start(Agent, "agent", t.TempDir(), nil, 80, 24, func(*Session) {}); !errors.Is(err, errEmptyAgentArgv) {
+		t.Fatalf("Start empty agent error = %v, want %v", err, errEmptyAgentArgv)
+	}
+}
+
+func TestManagerReplaceAgentTransactional(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	dir := t.TempDir()
+	sleep := []string{"sh", "-c", "sleep 5"}
+	ws, err := m.Activate("r/w", dir, []Spec{
+		{Kind: Agent, Title: "first", Argv: sleep, Provider: agent.Claude, SessionID: "first-id"},
+		{Kind: Agent, Title: "old", Argv: sleep, Provider: agent.Claude, SessionID: "old-id"},
+		{Kind: Agent, Title: "third", Argv: sleep, Provider: agent.Claude, SessionID: "third-id"},
+	}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws.ActiveAgent = 0
+	old := ws.Agents[1]
+
+	// A replacement that cannot start must not mutate the pool or stop the old
+	// process.
+	missing := filepath.Join(dir, "definitely-missing-agent-command")
+	if _, err := m.ReplaceAgent("r/w", dir, 1, Spec{Kind: Agent, Argv: []string{missing}}, 80, 24); err == nil {
+		t.Fatal("ReplaceAgent missing command unexpectedly succeeded")
+	}
+	if len(ws.Agents) != 3 || ws.Agents[1] != old {
+		t.Fatal("failed replacement changed the agent pool")
+	}
+	if !old.Alive() {
+		t.Fatal("failed replacement closed the old agent")
+	}
+	if ws.ActiveAgent != 0 {
+		t.Fatalf("failed replacement changed focus to %d", ws.ActiveAgent)
+	}
+
+	replacement, err := m.ReplaceAgent("r/w", dir, 1, Spec{
+		Kind:      Agent,
+		Title:     "new",
+		Argv:      sleep,
+		Provider:  agent.Codex,
+		SessionID: "new-id",
+		UnsetEnv:  []string{"TMUX", "TERM_PROGRAM"},
+	}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.Agents) != 3 || ws.Agents[1] != replacement {
+		t.Fatal("successful replacement did not preserve pool index")
+	}
+	if ws.Agents[0].Title != "first" || ws.Agents[2].Title != "third" {
+		t.Fatal("successful replacement reordered sibling agents")
+	}
+	if ws.ActiveAgent != 0 {
+		t.Fatalf("successful replacement changed focus to %d", ws.ActiveAgent)
+	}
+	if replacement.Provider != agent.Codex || replacement.SessionID != "new-id" {
+		t.Fatalf("replacement metadata = provider %q ID %q", replacement.Provider, replacement.SessionID)
+	}
+	if old.Alive() {
+		t.Fatal("successful replacement left the old agent running")
+	}
+}
+
+func TestManagerReplaceAgentErrorsForMissingTarget(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+	spec := Spec{Kind: Agent, Argv: []string{"sh", "-c", "sleep 5"}}
+
+	if _, err := m.ReplaceAgent("missing", t.TempDir(), 0, spec, 80, 24); !errors.Is(err, errNoWorkspace) {
+		t.Fatalf("missing workspace error = %v, want %v", err, errNoWorkspace)
+	}
+	if _, err := m.Activate("r/w", t.TempDir(), []Spec{{Kind: Terminal, Argv: []string{"sleep", "5"}}}, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ReplaceAgent("r/w", t.TempDir(), 0, spec, 80, 24); !errors.Is(err, errNoAgent) {
+		t.Fatalf("missing agent error = %v, want %v", err, errNoAgent)
 	}
 }
