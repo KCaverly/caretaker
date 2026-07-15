@@ -925,6 +925,24 @@ func TestBoardRestartPreservesProviderAndPoolPosition(t *testing.T) {
 	}
 }
 
+func TestCodexTranscriptWheel(t *testing.T) {
+	tests := []struct {
+		button tea.MouseButton
+		want   string
+		ok     bool
+	}{
+		{tea.MouseWheelUp, "\x1b[1;2A", true},
+		{tea.MouseWheelDown, "\x1b[1;2B", true},
+		{tea.MouseLeft, "", false},
+	}
+	for _, tt := range tests {
+		got, ok := codexTranscriptWheel(tt.button)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("codexTranscriptWheel(%v) = (%q, %t), want (%q, %t)", tt.button, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
 func TestCodexAgentEventsPersistThreadAndSurviveClaudeSnapshot(t *testing.T) {
 	m := mixedProviderModel(agent.Claude)
 	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}

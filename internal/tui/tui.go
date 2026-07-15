@@ -249,6 +249,11 @@ type Model struct {
 	diffOpen bool
 	diffView diffState
 
+	// Codex exposes its stable conversation history in a transcript overlay.
+	// Caretaker tracks its default Ctrl+T toggle per hosted session so the wheel
+	// can drive that overlay without switching Codex into jittery raw mode.
+	codexTranscript map[*session.Session]bool
+
 	// live agent statuses from `claude agents --json`, keyed by pid
 	agentStatus     map[int]AgentStatus
 	agentPrevStatus map[int]string    // pid → status from previous poll, for transition detection
@@ -377,6 +382,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
 		attention:       map[int]attnEntry{},
+		codexTranscript: map[*session.Session]bool{},
 	}
 }
 
@@ -2442,6 +2448,14 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	if s := m.activeSession(); s != nil {
 		m = m.dismissHint()
+		if normalizedProvider(s.Provider) == agent.Codex {
+			switch msg.String() {
+			case "ctrl+t":
+				m.codexTranscript[s] = !m.codexTranscript[s]
+			case "esc":
+				delete(m.codexTranscript, s)
+			}
+		}
 		s.SendKey(toUVKey(msg))
 	}
 	return m, nil
@@ -2853,20 +2867,30 @@ func (m Model) forwardMouse(msg tea.MouseMsg) {
 	case tea.MouseReleaseMsg:
 		s.SendMouse(uv.MouseReleaseEvent(shift(e.Mouse())))
 	case tea.MouseWheelMsg:
-		// Most terminal programs that handle the wheel enable mouse reporting,
-		// but Codex's raw-scrollback mode intentionally leaves it to the host
-		// terminal. Let the hosted session consume the wheel when it has primary
-		// screen history; otherwise preserve the program's native mouse handling.
-		rows := 3
-		if e.Mouse().Button == tea.MouseWheelDown {
-			rows = -rows
-		}
-		if s.Scroll(rows) {
-			return
+		if normalizedProvider(s.Provider) == agent.Codex && m.codexTranscript[s] {
+			if seq, ok := codexTranscriptWheel(e.Mouse().Button); ok {
+				_, _ = s.WriteInput([]byte(seq))
+				return
+			}
 		}
 		s.SendMouse(uv.MouseWheelEvent(shift(e.Mouse())))
 	case tea.MouseMotionMsg:
 		s.SendMouse(uv.MouseMotionEvent(shift(e.Mouse())))
+	}
+}
+
+// codexTranscriptWheel translates a wheel direction into Codex's default
+// transcript-pager bindings. Ultraviolet's terminal emulator cannot encode
+// modified cursor keys, so callers write the standard xterm sequences directly
+// to the hosted PTY.
+func codexTranscriptWheel(button tea.MouseButton) (string, bool) {
+	switch button {
+	case tea.MouseWheelUp:
+		return "\x1b[1;2A", true // Shift+Up
+	case tea.MouseWheelDown:
+		return "\x1b[1;2B", true // Shift+Down
+	default:
+		return "", false
 	}
 }
 
