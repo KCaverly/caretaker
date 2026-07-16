@@ -6,6 +6,29 @@ A terminal "deck" for managing git worktrees across your repos. Each worktree ge
 
 Built with [Bubble Tea](https://charm.land/bubbletea) v2 and [charmbracelet/x/vt](https://github.com/charmbracelet/x).
 
+![The ct deck showing repositories, active worktrees, branch divergence, and the ambient plasma panel](docs/screenshots/worktree-deck.png)
+
+## At a glance
+
+### One agent board
+
+Run Claude and Codex side by side, see what needs attention, and jump between agents across every
+active worktree.
+
+![The agent board showing Claude and Codex agents across multiple worktrees](docs/screenshots/agent-board.png)
+
+### Persistent terminal panes
+
+Split, focus, and zoom terminals while tests, servers, and monitoring tools keep running.
+
+![A workspace with three terminal panes running tests, a development server, and a process monitor](docs/screenshots/split-terminal-workspace.png)
+
+### Everything is discoverable
+
+Search every action and see its current configurable shortcut without leaving the workspace.
+
+![The searchable ct command palette with live keyboard shortcuts](docs/screenshots/command-palette.png)
+
 ## Requirements
 
 - Go 1.25+
