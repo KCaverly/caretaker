@@ -1,7 +1,6 @@
-// Package usage reads the Claude plan usage-limit utilization that Claude
-// Code's /usage screen reports: the rolling five-hour session window, the
-// seven-day window, and the seven-day Opus window. It reuses the OAuth token
-// Claude Code already stores on the machine, so ct never handles a password.
+// Package usage reads plan usage-limit utilization from the local Claude Code
+// and Codex sign-ins. It never handles a password: Claude reuses its stored
+// OAuth token, while Codex is queried through its read-only App Server API.
 package usage
 
 import (
@@ -15,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -34,7 +34,20 @@ type Snapshot struct {
 	FiveHour     *Window // nil when the endpoint omits it
 	SevenDay     *Window
 	SevenDayOpus *Window
-	FetchedAt    time.Time
+	// Named contains provider-defined windows. Claude leaves this nil and uses
+	// the three stable fields above; Codex supplies primary/secondary windows
+	// whose duration can vary by plan.
+	Named     []NamedWindow
+	FetchedAt time.Time
+}
+
+// NamedWindow gives a usage window its panel and compact bar labels. Session
+// windows use countdown reset text; longer windows use a weekday.
+type NamedWindow struct {
+	Label      string
+	ShortLabel string
+	Session    bool
+	Window     *Window
 }
 
 // Limit identifies which window is the binding constraint.
@@ -75,6 +88,35 @@ func (s Snapshot) Binding() (*Window, Limit) {
 		}
 	}
 	return best, which
+}
+
+// Windows returns the snapshot's display windows in shortest-to-longest
+// order. Provider-defined windows take precedence over Claude's fixed shape.
+func (s Snapshot) Windows() []NamedWindow {
+	if s.Named != nil {
+		return s.Named
+	}
+	return []NamedWindow{
+		{Label: "session", Session: true, Window: s.FiveHour},
+		{Label: "week", ShortLabel: "wk", Window: s.SevenDay},
+		{Label: "opus", ShortLabel: "opus", Window: s.SevenDayOpus},
+	}
+}
+
+// BindingWindow returns the most-utilized display window. Ties retain the
+// earlier (normally shorter) window.
+func (s Snapshot) BindingWindow() (NamedWindow, bool) {
+	var best NamedWindow
+	found := false
+	for _, candidate := range s.Windows() {
+		if candidate.Window == nil {
+			continue
+		}
+		if !found || candidate.Window.Utilization > best.Window.Utilization {
+			best, found = candidate, true
+		}
+	}
+	return best, found
 }
 
 // usageResponse mirrors the live shape of GET
@@ -146,6 +188,160 @@ func Fetch(ctx context.Context) (Snapshot, error) {
 	}
 	snap.FetchedAt = time.Now()
 	return snap, nil
+}
+
+// FetchCodex retrieves the current Codex rate-limit snapshot through a short-
+// lived App Server process. command and args are the configured Codex provider
+// command; the app-server arguments are appended in the same way as interactive
+// Codex sessions.
+func FetchCodex(ctx context.Context, command string, args []string) (Snapshot, error) {
+	if command == "" {
+		command = "codex"
+	}
+	argv := append([]string(nil), args...)
+	argv = append(argv, "app-server", "--listen", "stdio://")
+	cmd := exec.CommandContext(ctx, command, argv...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("usage: open Codex stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("usage: open Codex stdout: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return Snapshot{}, fmt.Errorf("usage: start Codex App Server: %w", err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	enc, dec := json.NewEncoder(stdin), json.NewDecoder(stdout)
+	if err := enc.Encode(map[string]any{
+		"method": "initialize", "id": 1,
+		"params": map[string]any{"clientInfo": map[string]string{
+			"name": "caretaker", "title": "Caretaker", "version": "dev",
+		}},
+	}); err != nil {
+		return Snapshot{}, fmt.Errorf("usage: initialize Codex App Server: %w", err)
+	}
+	if _, err := readCodexResponse(dec, 1); err != nil {
+		return Snapshot{}, err
+	}
+	if err := enc.Encode(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		return Snapshot{}, fmt.Errorf("usage: initialize Codex client: %w", err)
+	}
+	if err := enc.Encode(map[string]any{"method": "account/rateLimits/read", "id": 2, "params": nil}); err != nil {
+		return Snapshot{}, fmt.Errorf("usage: request Codex rate limits: %w", err)
+	}
+	result, err := readCodexResponse(dec, 2)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap, err := parseCodexUsage(result)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.FetchedAt = time.Now()
+	return snap, nil
+}
+
+type codexRPCMessage struct {
+	ID     json.RawMessage `json:"id"`
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func readCodexResponse(dec *json.Decoder, id int) (json.RawMessage, error) {
+	want := fmt.Sprint(id)
+	for {
+		var msg codexRPCMessage
+		if err := dec.Decode(&msg); err != nil {
+			return nil, fmt.Errorf("usage: read Codex App Server response: %w", err)
+		}
+		if string(msg.ID) != want {
+			continue
+		}
+		if msg.Error != nil {
+			return nil, fmt.Errorf("usage: Codex App Server rejected request (%d): %s", msg.Error.Code, msg.Error.Message)
+		}
+		if msg.Result == nil {
+			return nil, errors.New("usage: Codex App Server response has no result")
+		}
+		return msg.Result, nil
+	}
+}
+
+type codexRateLimitResponse struct {
+	RateLimits          codexRateLimitSnapshot            `json:"rateLimits"`
+	RateLimitsByLimitID map[string]codexRateLimitSnapshot `json:"rateLimitsByLimitId"`
+}
+
+type codexRateLimitSnapshot struct {
+	Primary   *codexRateLimitWindow `json:"primary"`
+	Secondary *codexRateLimitWindow `json:"secondary"`
+}
+
+type codexRateLimitWindow struct {
+	UsedPercent       float64 `json:"usedPercent"`
+	WindowDurationMin *int64  `json:"windowDurationMins"`
+	ResetsAt          *int64  `json:"resetsAt"`
+}
+
+func parseCodexUsage(data []byte) (Snapshot, error) {
+	var raw codexRateLimitResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return Snapshot{}, fmt.Errorf("usage: decode Codex rate limits: %w", err)
+	}
+	limits := raw.RateLimits
+	if named, ok := raw.RateLimitsByLimitID["codex"]; ok {
+		limits = named
+	}
+
+	var windows []NamedWindow
+	add := func(fallback string, raw *codexRateLimitWindow) {
+		if raw == nil {
+			return
+		}
+		label, short, session := codexWindowLabel(fallback, raw.WindowDurationMin)
+		window := &Window{Utilization: raw.UsedPercent}
+		if raw.ResetsAt != nil {
+			window.ResetsAt = time.Unix(*raw.ResetsAt, 0)
+		}
+		windows = append(windows, NamedWindow{
+			Label: label, ShortLabel: short, Session: session, Window: window,
+		})
+	}
+	add("primary", limits.Primary)
+	add("secondary", limits.Secondary)
+	return Snapshot{Named: windows}, nil
+}
+
+func codexWindowLabel(fallback string, minutes *int64) (label, short string, session bool) {
+	if minutes == nil || *minutes <= 0 {
+		return fallback, fallback, false
+	}
+	mins := *minutes
+	switch {
+	case mins < 24*60:
+		return "session", "", true
+	case mins == 7*24*60:
+		return "week", "wk", false
+	case mins%(24*60) == 0:
+		label = fmt.Sprintf("%dd", mins/(24*60))
+	case mins%60 == 0:
+		label = fmt.Sprintf("%dh", mins/60)
+	default:
+		label = fmt.Sprintf("%dm", mins)
+	}
+	return label, strings.ToLower(label), false
 }
 
 // parseUsage decodes a usage response body into a Snapshot. Split out from

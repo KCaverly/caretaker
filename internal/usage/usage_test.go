@@ -1,6 +1,9 @@
 package usage
 
 import (
+	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -118,4 +121,84 @@ func TestTokenFromJSON(t *testing.T) {
 	if _, err := tokenFromJSON([]byte(`{"claudeAiOauth": {"accessToken": ""}}`)); err != ErrNoCredentials {
 		t.Errorf("empty token err = %v, want ErrNoCredentials", err)
 	}
+}
+
+func TestParseCodexUsage(t *testing.T) {
+	snap, err := parseCodexUsage([]byte(`{
+  "rateLimits": {"primary": null, "secondary": null},
+  "rateLimitsByLimitId": {
+    "codex": {
+      "primary": {"usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1784680000},
+      "secondary": {"usedPercent": 62, "windowDurationMins": 10080, "resetsAt": 1785000000}
+    }
+  }
+}`))
+	if err != nil {
+		t.Fatalf("parseCodexUsage: %v", err)
+	}
+	if len(snap.Named) != 2 {
+		t.Fatalf("named windows = %+v, want two", snap.Named)
+	}
+	if got := snap.Named[0]; got.Label != "session" || !got.Session || got.Window.Utilization != 37 {
+		t.Errorf("primary window = %+v, want 5h session at 37%%", got)
+	}
+	if got := snap.Named[1]; got.Label != "week" || got.ShortLabel != "wk" || got.Window.Utilization != 62 {
+		t.Errorf("secondary window = %+v, want week at 62%%", got)
+	}
+	binding, ok := snap.BindingWindow()
+	if !ok || binding.Label != "week" {
+		t.Errorf("binding window = %+v, %v; want week", binding, ok)
+	}
+}
+
+func TestFetchCodex(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snap, err := FetchCodex(ctx, os.Args[0], []string{
+		"-test.run=TestCodexAppServerHelper", "--", "codex-usage-helper",
+	})
+	if err != nil {
+		t.Fatalf("FetchCodex: %v", err)
+	}
+	if len(snap.Named) != 2 || snap.Named[0].Window.Utilization != 41 || snap.Named[1].Window.Utilization != 73 {
+		t.Errorf("snapshot = %+v, want helper response", snap)
+	}
+	if snap.FetchedAt.IsZero() {
+		t.Error("FetchedAt should be populated")
+	}
+}
+
+// TestCodexAppServerHelper becomes a tiny stdio App Server only when spawned
+// by TestFetchCodex. In the parent test process it returns immediately.
+func TestCodexAppServerHelper(t *testing.T) {
+	helper := false
+	for _, arg := range os.Args {
+		if arg == "codex-usage-helper" {
+			helper = true
+			break
+		}
+	}
+	if !helper {
+		return
+	}
+	dec, enc := json.NewDecoder(os.Stdin), json.NewEncoder(os.Stdout)
+	var request map[string]any
+	if err := dec.Decode(&request); err != nil {
+		os.Exit(2)
+	}
+	_ = enc.Encode(map[string]any{"id": 1, "result": map[string]any{}})
+	if err := dec.Decode(&request); err != nil { // initialized notification
+		os.Exit(2)
+	}
+	if err := dec.Decode(&request); err != nil { // rateLimits/read request
+		os.Exit(2)
+	}
+	_ = enc.Encode(map[string]any{
+		"id": 2,
+		"result": map[string]any{"rateLimits": map[string]any{
+			"primary":   map[string]any{"usedPercent": 41, "windowDurationMins": 300},
+			"secondary": map[string]any{"usedPercent": 73, "windowDurationMins": 10080},
+		}},
+	})
+	os.Exit(0)
 }

@@ -1,6 +1,12 @@
 package state
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/KCaverly/caretaker/internal/agent"
+)
 
 func TestStateRoundTrip(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
@@ -33,8 +39,8 @@ func TestAgentsRoundTrip(t *testing.T) {
 	}
 
 	want := []AgentState{
-		{SessionID: "id-1", Label: "claude"},
-		{SessionID: "id-2", Label: "refactor auth"},
+		{Provider: agent.Claude, SessionID: "id-1", Label: "claude"},
+		{Provider: agent.Codex, SessionID: "id-2", Label: "refactor auth"},
 	}
 	s.SetAgents("repo/wt", want, 1)
 	if err := s.Save(); err != nil {
@@ -55,6 +61,33 @@ func TestAgentsRoundTrip(t *testing.T) {
 	s.SetAgents("repo/wt", nil, 0)
 	if got, _ := s.Agents("repo/wt"); got != nil {
 		t.Errorf("cleared pool should be nil, got %v", got)
+	}
+}
+
+func TestLoadLegacyAgentDefaultsProviderToClaude(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	stateDir := filepath.Join(root, "ct")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"workspaces":{"repo/wt":{"agents":[{"session_id":"old-id","label":"old agent"}],"active_agent":0}}}`
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := Load().Agents("repo/wt")
+	if len(got) != 1 || got[0].Provider != agent.Claude {
+		t.Fatalf("legacy agents = %+v, want Claude provider", got)
+	}
+}
+
+func TestSetAgentsDefaultsMissingProviderToClaude(t *testing.T) {
+	s := &State{Workspaces: map[string]*WorkspaceState{}}
+	s.SetAgents("repo/wt", []AgentState{{SessionID: "id"}}, 0)
+	got, _ := s.Agents("repo/wt")
+	if len(got) != 1 || got[0].Provider != agent.Claude {
+		t.Fatalf("agents = %+v, want Claude provider", got)
 	}
 }
 

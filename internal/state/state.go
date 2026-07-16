@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/KCaverly/caretaker/internal/agent"
 )
 
 // State is ct's persisted state, loaded from and saved to a JSON file in the
@@ -33,11 +35,12 @@ type WorkspaceState struct {
 	ActiveAgent int          `json:"active_agent"`
 }
 
-// AgentState is one persisted agent: the claude session UUID to resume and the
-// display label shown in the agent palette.
+// AgentState is one persisted agent: its provider conversation ID to resume
+// and the display label shown in the agent palette.
 type AgentState struct {
-	SessionID string `json:"session_id"`
-	Label     string `json:"label"`
+	Provider  agent.Provider `json:"provider"`
+	SessionID string         `json:"session_id"`
+	Label     string         `json:"label"`
 }
 
 // dir returns ct's state directory (honoring XDG_STATE_HOME).
@@ -72,6 +75,11 @@ func Load() *State {
 	if s.Workspaces == nil {
 		s.Workspaces = map[string]*WorkspaceState{}
 	}
+	for _, workspace := range s.Workspaces {
+		if workspace != nil {
+			normalizeAgents(workspace.Agents)
+		}
+	}
 	return s
 }
 
@@ -103,7 +111,18 @@ func (s *State) SetAgents(key string, agents []AgentState, active int) {
 		delete(s.Workspaces, key)
 		return
 	}
-	s.Workspaces[key] = &WorkspaceState{Agents: agents, ActiveAgent: active}
+	stored := append([]AgentState(nil), agents...)
+	normalizeAgents(stored)
+	s.Workspaces[key] = &WorkspaceState{Agents: stored, ActiveAgent: active}
+}
+
+// normalizeAgents migrates state written before providers were persisted.
+func normalizeAgents(agents []AgentState) {
+	for i := range agents {
+		if agents[i].Provider == "" {
+			agents[i].Provider = agent.Claude
+		}
+	}
 }
 
 // Snapshot marshals the current state in memory, without touching the disk.

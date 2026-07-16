@@ -9,7 +9,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
 )
@@ -39,6 +42,12 @@ var (
 	liveStyle    = lipgloss.NewStyle().Foreground(cGreen)
 	dirtyStyle   = lipgloss.NewStyle().Foreground(cYellow)
 	recentStyle  = lipgloss.NewStyle().Foreground(cYellow)
+
+	// Deck work-state cluster: commits the branch carries beyond main (green,
+	// the accent's healthy sibling) and commits it trails behind (yellow, the
+	// same caution hue as the dirty marker). Hoisted like the other row styles.
+	aheadStyle   = lipgloss.NewStyle().Foreground(cGreen)
+	behindStyle  = lipgloss.NewStyle().Foreground(cYellow)
 	selStyle     = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cSelBg)
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
@@ -61,6 +70,16 @@ var (
 	boldAccent = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
 	boldYellow = lipgloss.NewStyle().Bold(true).Foreground(cYellow)
 	boldRed    = lipgloss.NewStyle().Bold(true).Foreground(cRed)
+
+	// Diff viewer line styles, hoisted like the deck's so they're never rebuilt
+	// per frame: added lines green, removed lines red, hunk headers in the
+	// accent, `diff --git` file headers bold, and section rules / the truncation
+	// notice in the faint style.
+	diffAddStyle  = lipgloss.NewStyle().Foreground(cGreen)
+	diffDelStyle  = lipgloss.NewStyle().Foreground(cRed)
+	diffHunkStyle = lipgloss.NewStyle().Foreground(cAccent)
+	diffFileStyle = lipgloss.NewStyle().Bold(true).Foreground(cFg)
+	diffRuleStyle = lipgloss.NewStyle().Foreground(cFaint)
 
 	// Bordered box frames for the deck sections and overlays: faint idle,
 	// accent when focused. Rounded border + 0,1 padding match the old per-call
@@ -86,10 +105,14 @@ func (m Model) View() tea.View {
 		body = m.renderSetup(h - barHeight)
 	case m.helpOpen:
 		body = m.renderHelp(h - barHeight)
+	case m.paletteOpen:
+		body = m.renderPalette(h - barHeight)
 	case m.boardOpen:
 		body = m.renderBoard(h - barHeight)
 	case m.usageOpen:
 		body = m.renderUsage(h - barHeight)
+	case m.diffOpen:
+		body = m.renderDiff(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
@@ -144,15 +167,9 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Right side: notification zone (! N  * N) then the workspace context.
-	right := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		right += notif + "   "
-	}
-	right += m.barContextLabel()
-	if right != "" {
-		right += "  "
-	}
+	// Right side: notification zone (! N  * N) then the workspace context. Its
+	// layout (and the click targets within it) is derived once by barRightZones.
+	right := m.barRightZones().text
 
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	bar := left + strings.Repeat(" ", gap) + right
@@ -203,18 +220,38 @@ func (m Model) barContextLabel() string {
 	if seg, ok := m.paneSegment(); ok {
 		s = accentStyle.Render(seg) + sep + s
 	}
-	if n := len(ws.Agents); m.screen == screenAgent && n > 1 {
-		pos := fmt.Sprintf("%d/%d", clamp(ws.ActiveAgent, 0, n-1)+1, n)
+	if n := len(ws.Agents); m.screen == screenAgent && n > 0 {
 		if a := ws.ActiveAgentSession(); a != nil {
-			pos += " " + truncateTo(agentTitle(a.Title), 14)
+			provider := normalizedProvider(a.Provider)
+			identity := provider.String()
+			if title := agentTitle(provider, a.Title); title != provider.String() {
+				identity += " · " + title
+			}
+			if n > 1 {
+				identity = fmt.Sprintf("%d/%d ", clamp(ws.ActiveAgent, 0, n-1)+1, n) + identity
+			}
+			s = purpleStyle.Render(truncateTo(identity, 32)) + sep + s
 		}
-		s = purpleStyle.Render(pos) + sep + s
 	}
 	if seg, ok := m.usageSegment(); ok {
-		w, _ := m.usageSnap.Binding()
-		s = usageSeverity(w.Utilization).Render(seg) + sep + s
+		provider, _ := m.activeUsageProvider()
+		snap, _, _ := m.usageState(provider)
+		binding, _ := snap.BindingWindow()
+		s = usageSeverity(binding.Window.Utilization).Render(seg) + sep + s
 	}
 	return s
+}
+
+func (m Model) activeUsageProvider() (agent.Provider, bool) {
+	if m.current == nil || m.current.ws == nil {
+		return "", false
+	}
+	session := m.current.ws.ActiveAgentSession()
+	if session == nil {
+		return "", false
+	}
+	provider := normalizedProvider(session.Provider)
+	return provider, providerIn(provider, m.agentProviders)
 }
 
 // usageSegment returns the plan-usage gauge — pie glyph, the binding window's
@@ -225,23 +262,23 @@ func (m Model) barContextLabel() string {
 // drift. Like the other volatile segments it sits left of the stable
 // repo / worktree label; it leads them because it hot-swaps with every poll.
 func (m Model) usageSegment() (string, bool) {
-	if m.screen != screenAgent || !m.usageFresh() {
+	provider, ok := m.activeUsageProvider()
+	if !ok || m.screen != screenAgent || !m.usageFresh(provider) {
 		return "", false
 	}
-	w, limit := m.usageSnap.Binding()
-	if w == nil || w.Utilization < float64(m.usageThreshold) {
+	snap, _, _ := m.usageState(provider)
+	binding, ok := snap.BindingWindow()
+	if !ok || binding.Window.Utilization < float64(m.usageThreshold) {
 		return "", false
 	}
+	w := binding.Window
 	seg := usagePie(w.Utilization)
-	switch limit {
-	case usage.LimitWeek:
-		seg += " wk"
-	case usage.LimitOpus:
-		seg += " opus"
+	if binding.ShortLabel != "" {
+		seg += " " + binding.ShortLabel
 	}
 	seg += fmt.Sprintf(" %d%%", int(w.Utilization+0.5))
 	if !w.ResetsAt.IsZero() {
-		if limit == usage.LimitSession {
+		if binding.Session {
 			seg += " " + humanDur(time.Until(w.ResetsAt))
 		} else {
 			// A week-scale reset lands days out; the weekday says enough.
@@ -251,24 +288,17 @@ func (m Model) usageSegment() (string, bool) {
 	return seg, true
 }
 
-// usageZoneAt reports whether bar coordinates land on the usage segment.
-// It mirrors renderBar's right-side layout: the segment leads
-// barContextLabel, so its left edge is where the context label begins.
+// usageZoneAt reports whether bar coordinates land on the usage segment, using
+// the shared barRightZones layout so the click target tracks what renderBar drew.
 func (m Model) usageZoneAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	seg, ok := m.usageSegment()
-	if !ok {
+	z := m.barRightZones()
+	if z.usage == "" {
 		return false
 	}
-	prefix := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		prefix = notif + "   "
-	}
-	right := prefix + m.barContextLabel() + "  "
-	start := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
-	return x >= start && x < start+lipgloss.Width(seg)
+	return x >= z.usageStart && x < z.usageStart+lipgloss.Width(z.usage)
 }
 
 // usagePie maps a utilization percent to a pie glyph that fills as the
@@ -332,24 +362,18 @@ func (m Model) paneZoomIcon() string {
 }
 
 // paneZoomAt reports whether bar coordinates land on the pane indicator's zoom
-// toggle. It mirrors renderBar's right-side layout to locate the segment, then
+// toggle. It uses the shared barRightZones layout to locate the segment, then
 // targets its trailing icon (the toggle is always the segment's last glyph).
 func (m Model) paneZoomAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	seg, ok := m.paneSegment()
-	if !ok {
+	z := m.barRightZones()
+	if z.pane == "" {
 		return false
 	}
-	prefix := ""
-	if notif := m.renderNotifZone(); notif != "" {
-		prefix = notif + "   "
-	}
-	right := prefix + m.barContextLabel() + "  "
-	labelStart := m.width - lipgloss.Width(right) + lipgloss.Width(prefix)
 	iconW := lipgloss.Width(m.paneZoomIcon())
-	iconStart := labelStart + lipgloss.Width(seg) - iconW
+	iconStart := z.paneStart + lipgloss.Width(z.pane) - iconW
 	// One column of slack on the left (the space before the icon) so the small
 	// target is easy to hit.
 	return x >= iconStart-1 && x < iconStart+iconW
@@ -422,20 +446,63 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 	return 0, false
 }
 
+// barRight holds the bar's fully-assembled right side plus the start columns of
+// its clickable zones, so drawing (renderBar) and hit-testing (notifZoneAt /
+// usageZoneAt / paneZoomAt) share one layout and can never drift apart —
+// mirroring how barZones unifies the left icons. Zone strings are "" when the
+// zone isn't shown; their start columns are only meaningful when non-empty.
+type barRight struct {
+	text       string // the right side exactly as drawn
+	notif      string // notification zone ("! N  * N")
+	notifStart int
+	usage      string // plan-usage segment (unstyled)
+	usageStart int
+	pane       string // terminal pane indicator (unstyled)
+	paneStart  int
+}
+
+// barRightZones assembles the bar's right side and locates its clickable zones.
+// The right side is the notification zone (with a 3-column gap) followed by the
+// workspace context label, with a 2-column trailing pad when anything is shown —
+// exactly what renderBar draws. The usage and pane segments each lead the context
+// label on their own screen (they never coexist), so both begin where the label
+// does.
+func (m Model) barRightZones() barRight {
+	z := barRight{notif: m.renderNotifZone()}
+	label := m.barContextLabel()
+	if z.notif != "" {
+		z.text += z.notif + "   "
+	}
+	z.text += label
+	if z.text != "" {
+		z.text += "  "
+	}
+
+	z.notifStart = m.width - lipgloss.Width(z.text)
+	labelStart := z.notifStart
+	if z.notif != "" {
+		labelStart += lipgloss.Width(z.notif + "   ")
+	}
+	if seg, ok := m.usageSegment(); ok {
+		z.usage, z.usageStart = seg, labelStart
+	}
+	if seg, ok := m.paneSegment(); ok {
+		z.pane, z.paneStart = seg, labelStart
+	}
+	return z
+}
+
 // notifZoneAt reports whether bar coordinates (x, y) land on the notification
-// zone. It mirrors renderBar's right-side layout to locate the zone's x bounds.
+// zone, using the shared barRightZones layout to locate the zone's x bounds.
 func (m Model) notifZoneAt(x, y int) bool {
 	if y != 0 {
 		return false
 	}
-	notif := m.renderNotifZone()
-	if notif == "" {
+	z := m.barRightZones()
+	if z.notif == "" {
 		return false
 	}
-	right := notif + "   " + m.barContextLabel() + "  "
-	start := m.width - lipgloss.Width(right)
-	end := start + lipgloss.Width(notif)
-	return x >= start && x < end
+	return x >= z.notifStart && x < z.notifStart+lipgloss.Width(z.notif)
 }
 
 // renderBoard draws the agent board overlay: every open workspace's agents
@@ -494,7 +561,7 @@ func (m Model) renderBoard(h int) string {
 
 	lines = append(lines, "", "  "+strings.Join([]string{
 		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
-		keyhint("n", "new"), keyhint("d", "close"), keyhint("esc", "close"),
+		keyhint("n", "new"), keyhint("r", "restart"), keyhint("d", "close"), keyhint("esc", "close"),
 	}, helpStyle.Render("  ·  ")))
 
 	boxStr := box(lines, innerW, len(lines), true)
@@ -515,7 +582,9 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	case attnDone:
 		glyph, glyphSt = "*", boldGreen
 	}
-	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + nameStyle.Render(r.label)
+	chip := helpKeyStyle.Render(normalizedProvider(r.provider).String())
+	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + chip +
+		dimStyle.Render(" · ") + nameStyle.Render(r.label)
 	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
 	right := dimStyle.Render(status)
 	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
@@ -550,18 +619,78 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	rows := []string{
 		header("new agent", -1),
 		"",
-		"  " + fieldName(formFieldPrompt, "prompt") + m.promptInput.View(),
+		"  " + fieldName(formFieldPrompt, "prompt"),
+	}
+	for _, line := range strings.Split(m.promptInput.View(), "\n") {
+		rows = append(rows, "  "+line)
+	}
+	rows = append(rows, "")
+	if len(m.agentProviders) > 1 {
+		providerIdx := 0
+		for i, provider := range m.agentProviders {
+			if provider == m.formProvider {
+				providerIdx = i
+			}
+		}
+		rows = append(rows, "  "+fieldName(formFieldProvider, "provider")+
+			toggle([2]string{m.agentProviders[0].String(), m.agentProviders[1].String()}, providerIdx))
+	}
+	rows = append(rows,
+		"  "+fieldName(formFieldWhere, "where")+toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
+		"  "+fieldName(formFieldMode, "mode")+toggle([2]string{"foreground", "background"}, bgIdx),
 		"",
-		"  " + fieldName(formFieldWhere, "where") + toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
-		"  " + fieldName(formFieldMode, "mode") + toggle([2]string{"foreground", "background"}, bgIdx),
-		"",
-		"  " + strings.Join([]string{
-			keyhint("enter", "launch"), keyhint("tab", "field"),
+		"  "+strings.Join([]string{
+			keyhint("ctrl+enter", "launch"), keyhint("tab", "field"),
 			keyhint("space", "toggle"), keyhint("esc", "back"),
 		}, helpStyle.Render("  ·  ")),
-	}
+	)
 	boxStr := box(rows, innerW, len(rows), true)
 	return centerBlock(boxStr, m.width, h)
+}
+
+// renderPalette draws the command-palette overlay: a titled box holding the
+// fuzzy query input and the filtered command rows, each with its live keybinding
+// right-aligned in a faint style. The row list is windowed to the available
+// height (as the deck lists are) with the selection drawn as a full-width bar.
+func (m Model) renderPalette(h int) string {
+	innerW := clamp(m.width-8, 40, 72)
+	cmds := m.filteredPaletteCommands()
+
+	// header, blank, input, blank up top; blank + footer legend at the bottom.
+	lines := []string{header("commands", -1), "", "  " + m.paletteInput.View(), ""}
+	rowsAvail := max(1, h-8)
+	if len(cmds) == 0 {
+		lines = append(lines, dimStyle.Render("  no matching commands"))
+	} else {
+		start, end := windowBounds(len(cmds), m.paletteCursor, rowsAvail)
+		for i := start; i < end; i++ {
+			lines = append(lines, m.paletteLine(cmds[i], i == m.paletteCursor, innerW))
+		}
+	}
+
+	lines = append(lines, "", "  "+strings.Join([]string{
+		keyhint("↑↓", "move"), keyhint("enter", "run"), keyhint("esc", "close"),
+	}, helpStyle.Render("  ·  ")))
+
+	boxStr := box(lines, innerW, len(lines), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// paletteLine renders one command row: the verb-phrase title on the left and the
+// live keybinding hint right-aligned in a faint style, drawn as a full-width
+// selection bar when it is the cursor row. Mirrors boardAgentLine's layout.
+func (m Model) paletteLine(c paletteCmd, selected bool, innerW int) string {
+	left := "  " + nameStyle.Render(c.title)
+	content := left
+	if c.hint != "" {
+		right := helpStyle.Render(c.hint)
+		gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
+		content = left + strings.Repeat(" ", gap) + right
+	}
+	if selected {
+		return selBar(content, innerW)
+	}
+	return content
 }
 
 // usageGaugeWidth is the overlay gauge's cell count — wide enough that one
@@ -580,11 +709,23 @@ const usageBurnMinSpan = 5 * time.Minute
 func (m Model) renderUsage(h int) string {
 	innerW := clamp(m.width-8, 32, 56)
 	rows := []string{header("usage", -1), ""}
-	if !m.usageHave {
-		rows = append(rows, dimStyle.Render("  no usage data"))
-	} else {
-		rows = append(rows, m.usageWindowRows()...)
-		rows = append(rows, m.usageBurnRows()...)
+	for i, provider := range m.agentProviders {
+		if i > 0 {
+			rows = append(rows, "")
+		}
+		rows = append(rows, repoHdrStyle.Render("  "+providerName(provider)))
+		snap, have, hist := m.usageState(provider)
+		if !have {
+			rows = append(rows, dimStyle.Render("  no usage data"))
+			continue
+		}
+		windowRows := usageWindowRows(snap)
+		if len(windowRows) == 0 {
+			rows = append(rows, dimStyle.Render("  no usage data"))
+			continue
+		}
+		rows = append(rows, windowRows...)
+		rows = append(rows, usageBurnRows(snap, hist)...)
 	}
 	rows = append(rows, "", "  "+keyhint("esc", "close"))
 	boxStr := box(rows, innerW, len(rows), true)
@@ -594,9 +735,10 @@ func (m Model) renderUsage(h int) string {
 // usageWindowRows renders a gauge line (and an indented reset line) per
 // present window; absent windows are skipped outright — a placeholder row
 // would imply a limit the plan doesn't have.
-func (m Model) usageWindowRows() []string {
+func usageWindowRows(snap usage.Snapshot) []string {
 	var rows []string
-	add := func(label string, w *usage.Window, session bool) {
+	add := func(named usage.NamedWindow) {
+		label, w, session := named.Label, named.Window, named.Session
 		if w == nil {
 			return
 		}
@@ -615,9 +757,9 @@ func (m Model) usageWindowRows() []string {
 		}
 		rows = append(rows, "  "+strings.Repeat(" ", 9)+dimStyle.Render(line))
 	}
-	add("session", m.usageSnap.FiveHour, true)
-	add("week", m.usageSnap.SevenDay, false)
-	add("opus", m.usageSnap.SevenDayOpus, false)
+	for _, named := range snap.Windows() {
+		add(named)
+	}
 	return rows
 }
 
@@ -627,8 +769,7 @@ func (m Model) usageWindowRows() []string {
 // until the ring spans usageBurnMinSpan with a rising trend, so a flat or
 // draining window never shows a scary extrapolation, and the projection line
 // is dropped when the reset lands first (the window frees up before it caps).
-func (m Model) usageBurnRows() []string {
-	hist := m.usageHist
+func usageBurnRows(snap usage.Snapshot, hist []usageSample) []string {
 	if len(hist) < 2 {
 		return nil
 	}
@@ -640,7 +781,7 @@ func (m Model) usageBurnRows() []string {
 	perHour := (last.util - first.util) / span.Hours()
 	rows := []string{"  " + dimStyle.Render(padLine("burn", 9)) + usageSparkline(hist) +
 		dimStyle.Render(fmt.Sprintf(" ~%d%%/hr", int(perHour+0.5)))}
-	if w := m.usageSnap.FiveHour; w != nil && w.Utilization < 100 {
+	if w := sessionUsageWindow(snap); w != nil && w.Utilization < 100 {
 		caps := time.Now().Add(time.Duration((100 - w.Utilization) / perHour * float64(time.Hour)))
 		if w.ResetsAt.IsZero() || caps.Before(w.ResetsAt) {
 			rows = append(rows, "  "+strings.Repeat(" ", 9)+
@@ -694,6 +835,214 @@ func untilPhrase(d time.Duration) string {
 		return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 	return fmt.Sprintf("%dm", int(d.Minutes()))
+}
+
+// --- diff viewer ---
+
+// diffLineCap bounds a scope's pre-rendered line count so a monster diff can't
+// blow up memory or the render loop; the excess is replaced by a single dim
+// truncation notice.
+const diffLineCap = 20000
+
+// renderDiff draws the read-only diff viewer full-body: a one-line header (bold
+// repo/worktree, then the dim summary and the active scope label), a faint rule,
+// the windowed content lines, and a one-line footer legend. loading and
+// genuinely-empty diffs show a centered dim notice instead. Every line is
+// width-clamped (ANSI-aware) so long diff lines can't wrap and break the layout.
+func (m Model) renderDiff(h int) string {
+	d := m.diffView
+	if d.loading {
+		return centerBlock(dimStyle.Render("loading diff…"), m.width, h)
+	}
+	sc := d.active()
+	if sc.files == 0 {
+		var msg string
+		switch {
+		case d.scopeUncommitted:
+			msg = "nothing to show — no uncommitted changes"
+		case d.base != "":
+			msg = "nothing to show — branch is level with " + d.base + " and clean"
+		default:
+			msg = "nothing to show — clean"
+		}
+		return centerBlock(dimStyle.Render(msg), m.width, h)
+	}
+
+	scopeLabel := "[all]"
+	if d.scopeUncommitted {
+		scopeLabel = "[uncommitted]"
+	}
+	summary := fmt.Sprintf("↑%d · %d files · +%d −%d", d.ahead, sc.files, sc.add, sc.del)
+	header := "  " + repoHdrStyle.Render(d.repoName+"/"+d.wtName) + "  " +
+		dimStyle.Render(summary) + " " + helpKeyStyle.Render(scopeLabel)
+	rule := diffRuleStyle.Render(strings.Repeat("─", max(1, m.width)))
+
+	avail := max(1, h-diffChromeRows)
+	start := clamp(d.offset, 0, max(0, len(sc.lines)-1))
+	end := min(len(sc.lines), start+avail)
+
+	out := make([]string, 0, avail+diffChromeRows)
+	out = append(out, ansi.Truncate(header, m.width, ""), rule)
+	for i := start; i < end; i++ {
+		out = append(out, ansi.Truncate(sc.lines[i], m.width, ""))
+	}
+	for i := end - start; i < avail; i++ {
+		out = append(out, "") // pad so the footer sits at the bottom edge
+	}
+	footer := "  " + strings.Join([]string{
+		keyhint("j/k", "scroll"), keyhint("J/K", "file"),
+		keyhint("u", "scope"), keyhint("x", "remove"), keyhint("esc", "back"),
+	}, helpStyle.Render(" · "))
+	out = append(out, ansi.Truncate(footer, m.width, ""))
+	return strings.Join(out, "\n")
+}
+
+// diffBuilder accumulates a scope's styled lines while recording the indices of
+// the file-header lines (the `diff --git` rows) for the J/K jumps.
+type diffBuilder struct {
+	lines     []string
+	fileLines []int
+}
+
+func (b *diffBuilder) add(line string) { b.lines = append(b.lines, line) }
+
+func (b *diffBuilder) addFile(line string) {
+	b.fileLines = append(b.fileLines, len(b.lines))
+	b.lines = append(b.lines, line)
+}
+
+// buildDiffContent renders both scopes into d from the fetched msg. The full
+// scope (the default) shows the vs-base section — present only when the branch
+// has a base to compare against — followed by the uncommitted section; the
+// uncommitted scope shows just the latter, so `u` narrows the view. Lines are
+// pre-styled here once (renderDiff only windows and width-clamps them). width
+// sizes the section rules; the diff bodies reflow via the render-time clamp, so
+// a later resize only leaves the rules slightly long/short (cosmetic).
+func buildDiffContent(d *diffState, msg diffMsg, width int) {
+	// Uncommitted section, shared by both scopes.
+	var uncB diffBuilder
+	uf, ua, ud := appendDiffSection(&uncB, "uncommitted", "",
+		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, width)
+	d.uncommitted = finishScope(uncB, uf, ua, ud)
+
+	// Full scope: the vs-base section (when a base was available) then the same
+	// uncommitted section.
+	var fullB diffBuilder
+	files, add, del := 0, 0, 0
+	if d.base != "" {
+		cf, ca, cd := appendDiffSection(&fullB, "vs "+d.base, pluralize(d.ahead, "commit"),
+			msg.committedStat, nil, msg.committedBody, width)
+		files, add, del = cf, ca, cd
+		fullB.add("")
+	}
+	uf2, ua2, ud2 := appendDiffSection(&fullB, "uncommitted", "",
+		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, width)
+	files, add, del = files+uf2, add+ua2, del+ud2
+	d.full = finishScope(fullB, files, add, del)
+}
+
+// appendDiffSection appends one titled section to b — a faint `── <title>
+// (<meta>) ──` rule, the file index, a blank line, then the styled unified-diff
+// body — and returns the section's file count and +/− totals for the header
+// summary. Untracked paths are listed in the index as `?? path  new` (they carry
+// no diff body). A section with no files still draws its rule and a dim
+// "(nothing)" so the scope is never blank mid-view.
+func appendDiffSection(b *diffBuilder, title, meta string, stat []repo.FileStat, untracked []string, body string, width int) (files, add, del int) {
+	b.add(diffRule(title, meta, width))
+	for _, fs := range stat {
+		b.add(diffIndexLine(fs))
+		files++
+		add += fs.Add
+		del += fs.Del
+	}
+	for _, p := range untracked {
+		b.add(dimStyle.Render("  ?? "+p+"  ") + diffAddStyle.Render("new"))
+		files++
+	}
+	if files == 0 {
+		b.add(dimStyle.Render("  (nothing)"))
+	}
+	b.add("")
+	appendDiffBody(b, body)
+	return files, add, del
+}
+
+// appendDiffBody styles a unified-diff body line by line into b: `diff --git`
+// rows are bold file headers (and recorded for J/K), `@@` rows are hunk headers,
+// `+`/`−` rows are coloured, and context lines pass through plain.
+func appendDiffBody(b *diffBuilder, body string) {
+	body = strings.TrimRight(body, "\n")
+	if body == "" {
+		return
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "diff --git"):
+			b.addFile(diffFileStyle.Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.add(diffHunkStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.add(diffAddStyle.Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.add(diffDelStyle.Render(line))
+		default:
+			b.add(line)
+		}
+	}
+}
+
+// diffIndexLine renders one file's index row: a dim `M` marker, the path, and
+// either the +/− line counts or a dim `binary` for files git couldn't diff.
+func diffIndexLine(fs repo.FileStat) string {
+	left := dimStyle.Render("  M ") + nameStyle.Render(fs.Path)
+	if fs.Binary {
+		return left + "  " + dimStyle.Render("binary")
+	}
+	return left + "  " + diffAddStyle.Render("+"+strconv.Itoa(fs.Add)) +
+		" " + diffDelStyle.Render("−"+strconv.Itoa(fs.Del))
+}
+
+// diffRule builds a section rule `── <title> (<meta>) ─────…` filled to width in
+// the faint style; an empty meta drops the parenthetical.
+func diffRule(title, meta string, width int) string {
+	head := "── " + title
+	if meta != "" {
+		head += " (" + meta + ")"
+	}
+	head += " "
+	if fill := width - lipgloss.Width(head); fill > 0 {
+		head += strings.Repeat("─", fill)
+	}
+	return diffRuleStyle.Render(head)
+}
+
+// finishScope packages a builder into a scopeContent with its summary counts,
+// enforcing diffLineCap: lines past the cap are dropped (along with their
+// file-header indices) and replaced by a single dim truncation notice.
+func finishScope(b diffBuilder, files, add, del int) scopeContent {
+	sc := scopeContent{lines: b.lines, fileLines: b.fileLines, files: files, add: add, del: del}
+	if len(sc.lines) > diffLineCap {
+		more := len(sc.lines) - diffLineCap
+		sc.lines = sc.lines[:diffLineCap]
+		var fl []int
+		for _, i := range sc.fileLines {
+			if i < diffLineCap {
+				fl = append(fl, i)
+			}
+		}
+		sc.fileLines = fl
+		sc.lines = append(sc.lines, dimStyle.Render(fmt.Sprintf("… diff truncated (%d more lines)", more)))
+	}
+	return sc
+}
+
+// pluralize renders "1 commit" / "3 commits" for the section-rule meta.
+func pluralize(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 // truncateTo shortens s to at most w display columns, appending "…" when it
@@ -830,10 +1179,12 @@ func (m Model) renderCreateForm() []string {
 }
 
 // activeDisplay builds the ACTIVE section's display lines (a repo header before
-// each repo's first worktree, then one row per worktree) alongside a parallel
-// slice mapping each display line back to its m.active index (-1 for header
-// lines). Shared by renderActive and the click hit-test so their row layout
-// stays identical.
+// each repo's first worktree, then one row per worktree, plus a "└" detail line
+// beneath the focused worktree) alongside a parallel slice mapping each display
+// line back to its m.active index (-1 for header and detail lines). Shared by
+// renderActive and the click hit-test so their row layout stays identical; the
+// detail line's -1 makes it non-navigable, so a click on it misses and the
+// windowing centres on the worktree row, not the detail beneath it.
 func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
 	lastRepo := ""
 	for i, it := range m.active {
@@ -842,8 +1193,15 @@ func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
 			rowItem = append(rowItem, -1)
 			lastRepo = it.repo.Name
 		}
-		lines = append(lines, m.activeRow(it, i == m.activeCursor && m.focus == focusActive, innerW))
+		selected := i == m.activeCursor && m.focus == focusActive
+		lines = append(lines, m.activeRow(it, selected, innerW))
 		rowItem = append(rowItem, i)
+		if selected {
+			if detail := activeDetail(it.view, innerW); detail != "" {
+				lines = append(lines, detail)
+				rowItem = append(rowItem, -1)
+			}
+		}
 	}
 	return
 }
@@ -875,6 +1233,12 @@ func (m Model) renderActive(innerW, rows int) []string {
 	start, end := activeWindowStart(rowItem, m.activeCursor, rows)
 	return append(lines, display[start:end]...)
 }
+
+// activeRowPrefixW is the fixed column count the row draws before the worktree
+// name: "  " + rank + "   " + live + " " + notif + " " + dirty + " ". Keeping it
+// a constant lets the name-truncation and cluster-alignment maths stay in step
+// with the format string that lays the glyphs out.
+const activeRowPrefixW = 12
 
 func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	key := wsKey(it.repo.Name, it.view.WT.Name)
@@ -913,8 +1277,17 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 		rankCh = strconv.Itoa(rank)
 	}
 
+	// Right-aligned work-state cluster (↑ahead / ↓behind / —). The name flexes:
+	// it is truncated so the cluster keeps its column at the row's right edge, on
+	// selected and unselected rows alike.
+	cluster, clusterW := stateCluster(it.view)
+	nameMax := max(1, innerW-activeRowPrefixW-clusterW-1)
+	name := truncateTo(it.view.WT.Name, nameMax)
+	gap := max(1, innerW-activeRowPrefixW-lipgloss.Width(name)-clusterW)
+
 	if highlight {
-		return selBar(fmt.Sprintf("  %s   %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, it.view.WT.Name), innerW)
+		left := fmt.Sprintf("  %s   %s %s %s %s", rankCh, liveChar, notifChar, dirtyChar, name)
+		return selBar(left+strings.Repeat(" ", gap)+cluster, innerW)
 	}
 
 	rankCol := " "
@@ -925,7 +1298,101 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	if it.view.Dirty {
 		dirty = dirtyStyle.Render(dirtyChar)
 	}
-	return "  " + rankCol + "   " + liveSt.Render(liveChar) + " " + notifSt.Render(notifChar) + " " + dirty + " " + nameStyle.Render(it.view.WT.Name)
+	left := "  " + rankCol + "   " + liveSt.Render(liveChar) + " " + notifSt.Render(notifChar) + " " + dirty + " " + nameStyle.Render(name)
+	return left + strings.Repeat(" ", gap) + cluster
+}
+
+// stateCluster renders a worktree's right-aligned work-state indicator: "↑N"
+// (green) when the branch is ahead of main, "↓M" (yellow) when behind, both
+// (space-separated) when it has diverged in both directions, and a dim "—" when
+// there's nothing to show — no base branch to compare against, or level with it.
+// Returns the styled string plus its display width so the row can right-align it.
+func stateCluster(v WorktreeView) (string, int) {
+	if !v.HasBase || (v.Ahead == 0 && v.Behind == 0) {
+		return dimStyle.Render("—"), 1
+	}
+	var parts []string
+	plain := ""
+	if v.Ahead > 0 {
+		s := "↑" + strconv.Itoa(v.Ahead)
+		parts = append(parts, aheadStyle.Render(s))
+		plain += s
+	}
+	if v.Behind > 0 {
+		s := "↓" + strconv.Itoa(v.Behind)
+		parts = append(parts, behindStyle.Render(s))
+		if plain != "" {
+			plain += " "
+		}
+		plain += s
+	}
+	return strings.Join(parts, " "), lipgloss.Width(plain)
+}
+
+// activeDetail builds the dim "└" line shown directly beneath the focused
+// worktree row: the branch's divergence from main spelled out, its uncommitted
+// diffstat, the last-commit subject (in quotes), and the tip's age — each
+// segment omitted when it doesn't apply, joined by " · ". The subject is the
+// segment that flexes: it is truncated so the whole line fits innerW. Returns ""
+// when every segment is empty, so activeDisplay drops the line entirely.
+func activeDetail(v WorktreeView, innerW int) string {
+	const prefix = "      └ "
+
+	// head holds the segments left of the subject (divergence, diffstat); tail
+	// holds those to its right (age). The subject slots between them.
+	var head, tail []string
+	if v.HasBase {
+		switch {
+		case v.Ahead > 0 && v.Behind > 0:
+			head = append(head, fmt.Sprintf("%d ahead, %d behind", v.Ahead, v.Behind))
+		case v.Ahead > 0:
+			head = append(head, fmt.Sprintf("%d ahead", v.Ahead))
+		case v.Behind > 0:
+			head = append(head, fmt.Sprintf("%d behind", v.Behind))
+		default:
+			head = append(head, "no commits yet")
+		}
+	}
+	if v.Dirty && v.Add+v.Del > 0 {
+		head = append(head, fmt.Sprintf("+%d −%d uncommitted", v.Add, v.Del))
+	}
+	if v.CommitTime > 0 {
+		tail = append(tail, humanDur(time.Since(time.Unix(v.CommitTime, 0))))
+	}
+
+	subject := ""
+	if v.Subject != "" {
+		// Budget the subject against everything else already claiming the line:
+		// the prefix, the fixed segments, the separators joining the subject in,
+		// and the two quote marks around it.
+		used := lipgloss.Width(prefix)
+		if fixed := append(append([]string{}, head...), tail...); len(fixed) > 0 {
+			used += lipgloss.Width(strings.Join(fixed, " · "))
+		}
+		seps := 0
+		if len(head) > 0 {
+			seps++
+		}
+		if len(tail) > 0 {
+			seps++
+		}
+		used += seps * lipgloss.Width(" · ")
+		if budget := innerW - used - 2; budget >= 1 {
+			subject = `"` + truncateTo(v.Subject, budget) + `"`
+		}
+	}
+
+	segs := append([]string{}, head...)
+	if subject != "" {
+		segs = append(segs, subject)
+	}
+	segs = append(segs, tail...)
+	if len(segs) == 0 {
+		return ""
+	}
+	// A final truncate guards the narrow-width case where even the budgeted line
+	// overshoots (e.g. the subject was dropped but head+tail still overflow).
+	return dimStyle.Render(truncateTo(prefix+strings.Join(segs, " · "), innerW))
 }
 
 // renderHelp draws the key + legend overlay, centered in the body area. The
@@ -950,42 +1417,42 @@ func (m Model) renderHelp(h int) string {
 		row("enter", "open / create"),
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
+		row("v", "view diff (deck)"),
 		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
 		"",
 		repoHdrStyle.Render("  Session"),
-		row(m.keyCycle+" / "+m.keyCycleBack, "cycle view (next / prev)"),
-		row(m.keyGotoEditor+" "+m.keyGotoAgent+" "+m.keyGotoTerm, "go to editor / agent / term"),
-		row(m.keyPicker, "back to the deck"),
-		row(m.keyGlobalConfig, "open home workspace (~)"),
-		row(m.keyPrompt, "quick background agent (home)"),
-		row(m.keyPalette, "agent board"),
+		row(m.keys.Cycle+" / "+m.keys.CycleBack, "cycle view (next / prev)"),
+		row(m.keys.GotoEditor+" "+m.keys.GotoAgent+" "+m.keys.GotoTerm, "go to editor / agent / term"),
+		row(m.keys.Picker, "back to the deck"),
+		row(m.keys.GlobalConfig, "open home workspace (~)"),
+		row(m.keys.Prompt, "quick background agent (home)"),
+		row(m.keys.Palette, "agent board"),
+		row(m.keys.CommandPalette, "command palette (every action)"),
 	)
-	if m.keyNotif != "" {
-		rows = append(rows, row(m.keyNotif, "agent board (alias)"))
+	rows = append(rows,
+		row(m.keys.PrevAgent+" / "+m.keys.NextAgent, "prev / next agent"),
+	)
+	if m.usageEnabled() {
+		rows = append(rows, row(m.keys.Usage, "usage limits"))
 	}
 	rows = append(rows,
-		row(m.keyPrevAgent+" / "+m.keyNextAgent, "prev / next agent"),
-		row(m.keyUsage, "usage limits"),
 		"",
 		repoHdrStyle.Render("  Terminal panes"),
-		row(m.keyTermSplitV, "vertical split"),
-		row(m.keyTermSplitH, "horizontal split"),
-		row(m.keyTermFocusLeft+" "+m.keyTermFocusDown+" "+m.keyTermFocusUp+" "+m.keyTermFocusRight, "focus left / down / up / right"),
-		row(m.keyTermZoom, "zoom / restore pane"),
-		row(m.keyTermClose, "close pane"),
+		row(m.keys.TermSplitV, "vertical split"),
+		row(m.keys.TermSplitH, "horizontal split"),
+		row(m.keys.TermFocusLeft+" "+m.keys.TermFocusDown+" "+m.keys.TermFocusUp+" "+m.keys.TermFocusRight, "focus left / down / up / right"),
+		row(m.keys.TermZoom, "zoom / restore pane"),
+		row(m.keys.TermClose, "close pane"),
 	)
-	if m.keyTermCycle != "" {
-		rows = append(rows, row(m.keyTermCycle, "cycle pane focus"))
-	}
 	rows = append(rows,
 		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
 		"",
-		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keyHelp)+
+		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keys.Help)+
 			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
 			helpStyle.Render(" in the deck) · any key closes"),
 	)
@@ -1092,17 +1559,16 @@ func (m Model) appendSessionFooter(body string) string {
 // hint mainly exists to teach. Trailing hints are dropped rather than wrapped
 // so the line always fits the single reserved row.
 func (m Model) sessionFooter() string {
-	hints := []string{keyhint(m.keyHelp, "help")}
+	hints := []string{keyhint(m.keys.Help, "help")}
 	if m.screen == screenTerminal {
 		hints = append(hints,
-			keyhint(m.keyTermSplitV+" "+m.keyTermSplitH, "split"),
-			keyhint(m.keyTermCycle, "cycle pane"),
-			keyhint(m.keyTermZoom, "zoom"),
-			keyhint(m.keyTermClose, "close"))
+			keyhint(m.keys.TermSplitV+" "+m.keys.TermSplitH, "split"),
+			keyhint(m.keys.TermZoom, "zoom"),
+			keyhint(m.keys.TermClose, "close"))
 	} else {
 		hints = append(hints,
-			keyhint(m.keyCycle, "cycle view"),
-			keyhint(m.keyPicker, "deck"))
+			keyhint(m.keys.Cycle, "cycle view"),
+			keyhint(m.keys.Picker, "deck"))
 	}
 	sep := helpStyle.Render("  ·  ")
 	for n := len(hints); n >= 1; n-- {

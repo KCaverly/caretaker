@@ -1,18 +1,26 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
+	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/codex"
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/state"
 )
 
 func ctrlKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl} }
@@ -264,9 +272,11 @@ func TestMostRecentWorktree(t *testing.T) {
 func TestPickerKeyJumpsToRecent(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -341,11 +351,52 @@ func TestDeckClickActiveSection(t *testing.T) {
 	}
 }
 
+// TestDeckClickDetailLineMisses proves the └ work-state detail line under the
+// focused worktree row is not a click target: its rowItem entry is -1 (like a
+// repo header), so a click on it neither selects nor activates anything.
+func TestDeckClickDetailLineMisses(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	// Give the cursor row work-state so its detail line actually renders.
+	m.active[0].view.HasBase = true
+	m.active[0].view.Ahead = 2
+
+	L := m.deckLayout(m.height - barHeight)
+	display, rowItem := m.activeDisplay(m.width - 4)
+	start, _ := activeWindowStart(rowItem, m.activeCursor, L.activeRows)
+	// display = [caretaker(-1), feat-login(0), └ detail(-1), bugfix(1), api(-1), spike(2)].
+	if len(rowItem) != 6 || rowItem[2] != -1 || !strings.Contains(display[2], "└") {
+		t.Fatalf("expected the detail line at display index 2 with rowItem -1, got %v", rowItem)
+	}
+	yRow := func(di int) int { return barHeight + L.newOuterH + 1 + 2 + (di - start) }
+
+	// A click on the detail line is a miss: unhandled, cursor and focus intact.
+	mm, _, ok := m.deckClick(5, yRow(2))
+	m = mm.(Model)
+	if ok {
+		t.Error("clicking the detail line should not be handled")
+	}
+	if m.activeCursor != 0 || m.focus != focusActive || m.current != nil {
+		t.Fatalf("detail-line click must not select or activate: cursor=%d focus=%v current=%+v",
+			m.activeCursor, m.focus, m.current)
+	}
+
+	// The row beneath it (bugfix, shifted down by the detail line) still selects.
+	mm, _, ok = m.deckClick(5, yRow(3))
+	m = mm.(Model)
+	if !ok || m.activeCursor != 1 {
+		t.Fatalf("click below the detail line should select bugfix: ok=%v cursor=%d", ok, m.activeCursor)
+	}
+}
+
 func TestDeckClickOpensSelectedWorktree(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -374,7 +425,7 @@ func TestDeckClickOpensSelectedWorktree(t *testing.T) {
 
 func TestHelpOverlayToggle(t *testing.T) {
 	m := sampleModel()
-	m.keyHelp = "f1"
+	m.keys.Help = "f1"
 
 	// "?" opens help from the deck.
 	mm, _ := m.handleKey(tea.KeyPressMsg{Code: '?', Text: "?"})
@@ -399,7 +450,7 @@ func TestHelpOverlayToggle(t *testing.T) {
 		t.Fatal("the help key should open help from a session")
 	}
 	out := m.renderHelp(m.height - barHeight)
-	for _, want := range []string{"HELP", "Session", "Legend", m.keyCycle, m.keyPicker, m.keyPalette, "uncommitted"} {
+	for _, want := range []string{"HELP", "Session", "Legend", m.keys.Cycle, m.keys.Picker, m.keys.Palette, "uncommitted"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help overlay missing %q:\n%s", want, out)
 		}
@@ -577,8 +628,8 @@ func TestBoardOpensFromPicker(t *testing.T) {
 	if len(nav) != 1 || !rows[nav[0]].isNew {
 		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
 	}
-	// Inside an open board ctrl+n is list-down (the notif close alias is retired):
-	// it keeps the board open. The primary palette key closes.
+	// Inside an open board ctrl+n is list-down: it keeps the board open. The
+	// primary palette key closes.
 	mm, _ = m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
@@ -602,6 +653,28 @@ func TestQuickPromptOpensForm(t *testing.T) {
 	if m.formLocation != 1 || !m.formBackground || m.formFocus != formFieldPrompt {
 		t.Fatalf("quick prompt should preselect home+background with prompt focused: loc=%d bg=%v focus=%d",
 			m.formLocation, m.formBackground, m.formFocus)
+	}
+}
+
+func TestBoardFormPromptSupportsMultipleLines(t *testing.T) {
+	m := modelWithAgents(1).openNewAgentForm().(Model)
+
+	for _, key := range []tea.KeyPressMsg{
+		{Code: 'f', Text: "f"},
+		{Code: tea.KeyEnter},
+		{Code: 's', Text: "s"},
+	} {
+		mm, _ := m.handleBoardForm(key)
+		m = mm.(Model)
+	}
+	if got, want := m.promptInput.Value(), "f\ns"; got != want {
+		t.Fatalf("prompt = %q, want %q", got, want)
+	}
+	if m.formFocus != formFieldPrompt || !m.formOpen {
+		t.Fatalf("enter should edit the prompt without leaving the form: focus=%d open=%v", m.formFocus, m.formOpen)
+	}
+	if m.promptInput.Height() < 3 {
+		t.Fatalf("multi-line prompt should retain its expanded input area, height=%d", m.promptInput.Height())
 	}
 }
 
@@ -642,6 +715,564 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m = mm.(Model)
 	if m.formOpen || !m.boardOpen {
 		t.Fatalf("esc should return to the board list: form=%v board=%v", m.formOpen, m.boardOpen)
+	}
+}
+
+func mixedProviderModel(defaultProvider agent.Provider) Model {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Claude, agent.Codex}
+	cfg.Agents.Default = defaultProvider
+	cfg.Agents.Claude.Command = "/usr/bin/true"
+	cfg.Agents.Codex.Command = "/usr/bin/true"
+	ctrl := NewController(cfg)
+	ctrl.startCodex = func(context.Context, codex.Config) (codexRuntime, error) {
+		return newFakeCodexRuntime("unix:///tmp/caretaker-fake-codex.sock"), nil
+	}
+	return New(ctrl, session.NewManager())
+}
+
+type fakeCodexRuntime struct {
+	remote string
+	events chan agent.Event
+	once   sync.Once
+	closed atomic.Int32
+}
+
+func newFakeCodexRuntime(remote string) *fakeCodexRuntime {
+	return &fakeCodexRuntime{remote: remote, events: make(chan agent.Event, 8)}
+}
+
+func (f *fakeCodexRuntime) Close() error {
+	f.once.Do(func() {
+		f.closed.Add(1)
+		close(f.events)
+	})
+	return nil
+}
+
+func (f *fakeCodexRuntime) Remote() string                  { return f.remote }
+func (f *fakeCodexRuntime) EventStream() <-chan agent.Event { return f.events }
+
+func TestPrepareAgentSpecPlacesRemoteAfterBaseArgs(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agents.Enabled = []agent.Provider{agent.Codex}
+	cfg.Agents.Default = agent.Codex
+	cfg.Agents.Codex = config.AgentProvider{Command: "codex-test", Args: []string{"--base", "value"}}
+	ctrl := NewController(cfg)
+	runtime := newFakeCodexRuntime("unix:///tmp/fake-runtime.sock")
+	ctrl.startCodex = func(_ context.Context, got codex.Config) (codexRuntime, error) {
+		if got.Command != "codex-test" || !equalStrings(got.Args, []string{"--base", "value"}) || got.Dir != "/repo" {
+			t.Fatalf("runtime config = %+v", got)
+		}
+		return runtime, nil
+	}
+
+	spec, err := ctrl.NewProviderAgentSpec(agent.Codex, "jade-otter", "inspect", AgentBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := ctrl.PrepareAgentSpec(context.Background(), "/repo", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"codex-test", "--base", "value", "--remote", "unix:///tmp/fake-runtime.sock",
+		"--sandbox", "workspace-write", "--ask-for-approval", "never", "inspect",
+	}
+	if !equalStrings(prepared.Argv, want) {
+		t.Fatalf("prepared argv = %v, want %v", prepared.Argv, want)
+	}
+	if prepared.Companion != runtime || prepared.Events == nil {
+		t.Fatalf("prepared runtime wiring = companion %T events nil=%v", prepared.Companion, prepared.Events == nil)
+	}
+	_ = prepared.Companion.Close()
+	_ = prepared.Companion.Close()
+	if got := runtime.closed.Load(); got != 1 {
+		t.Fatalf("runtime close count = %d, want 1", got)
+	}
+}
+
+func TestPrepareWorkspaceSpecsCleansEarlierCompanionOnFailure(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	var runtimes []*fakeCodexRuntime
+	m.ctrl.startCodex = func(context.Context, codex.Config) (codexRuntime, error) {
+		runtime := newFakeCodexRuntime("unix:///tmp/partial-runtime.sock")
+		runtimes = append(runtimes, runtime)
+		return runtime, nil
+	}
+	valid, err := m.ctrl.NewProviderAgentSpec(agent.Codex, "one", "", AgentForeground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := valid
+	invalid.Argv = []string{"wrong-command"}
+	_, err = m.prepareWorkspaceSpecs(t.TempDir(), []session.Spec{valid, invalid})
+	if err == nil {
+		t.Fatal("expected mismatched Codex command to fail preparation")
+	}
+	if len(runtimes) != 1 || runtimes[0].closed.Load() != 1 {
+		t.Fatalf("started runtimes = %d, first close count = %d", len(runtimes), runtimes[0].closed.Load())
+	}
+}
+
+func TestBoardFormProviderChoiceAndDefaultReset(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.current = &workspaceRef{key: "r/w", path: t.TempDir(), ws: &session.Workspace{}}
+	m = m.openNewAgentForm().(Model)
+	if m.formProvider != agent.Codex || m.promptInput.Placeholder != "What should Codex do?" {
+		t.Fatalf("default provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
+	}
+
+	// With two providers the row participates in focus order.
+	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+	if m.formFocus != formFieldProvider {
+		t.Fatalf("first tab focus = %d, want provider", m.formFocus)
+	}
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
+	m = mm.(Model)
+	if m.formProvider != agent.Claude || m.promptInput.Placeholder != "What should Claude do?" {
+		t.Fatalf("toggled provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
+	}
+
+	// A fresh form always returns to the configured default.
+	m = m.openNewAgentForm().(Model)
+	if m.formProvider != agent.Codex {
+		t.Fatalf("reopened form provider = %q, want codex", m.formProvider)
+	}
+}
+
+func TestWorkspaceSpecsPreserveProviders(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.state = &state.State{
+		LastOpened: map[string]int64{},
+		Workspaces: map[string]*state.WorkspaceState{
+			"r/w": {Agents: []state.AgentState{
+				{Provider: agent.Claude, SessionID: "claude-id", Label: "one"},
+				{Provider: agent.Codex, SessionID: "codex-id", Label: "two"},
+			}},
+		},
+	}
+	specs, err := m.workspaceSpecs("r/w", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []agent.Provider
+	for _, spec := range specs {
+		if spec.Kind == session.Agent {
+			got = append(got, spec.Provider)
+		}
+	}
+	if len(got) != 2 || got[0] != agent.Claude || got[1] != agent.Codex {
+		t.Fatalf("restored providers = %v", got)
+	}
+}
+
+func TestFirstHomeLaunchCreatesOnlySelectedAgent(t *testing.T) {
+	m := mixedProviderModel(agent.Codex)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	m.formLocation = 1
+	m.formProvider = agent.Codex
+	m.promptInput.SetValue("inspect the project")
+	mm, _ := m.launchAgent()
+	m = mm.(Model)
+	defer m.mgr.CloseAll()
+	ws, ok := m.mgr.Workspace("~/config")
+	if !ok {
+		t.Fatal("home workspace was not activated")
+	}
+	if len(ws.Agents) != 1 {
+		t.Fatalf("home agent count = %d, want exactly the selected agent", len(ws.Agents))
+	}
+	if ws.Agents[0].Provider != agent.Codex {
+		t.Fatalf("home agent provider = %q, want codex", ws.Agents[0].Provider)
+	}
+	if ws.Agents[0].Events == nil {
+		t.Fatal("home Codex launch did not attach the observer event stream")
+	}
+}
+
+func TestPersistAgentsRecordsProvider(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	spec := session.Spec{
+		Kind: session.Agent, Title: "jade-otter", Argv: []string{"/usr/bin/true"},
+		Provider: agent.Codex, SessionID: "thread-123",
+	}
+	ws, err := m.mgr.Activate("r/w", dir, []session.Spec{spec}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.persistAgents("r/w")
+	saved, _ := m.state.Agents("r/w")
+	if len(saved) != 1 || saved[0].Provider != agent.Codex || saved[0].SessionID != "thread-123" {
+		t.Fatalf("persisted agents = %+v", saved)
+	}
+}
+
+func TestBoardRestartPreservesProviderAndPoolPosition(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	specs := []session.Spec{
+		{Kind: session.Agent, Title: "one", Argv: []string{"/usr/bin/true"}, Provider: agent.Claude, SessionID: "claude-id"},
+		{Kind: session.Agent, Title: "two", Argv: []string{"/usr/bin/true"}, Provider: agent.Codex, SessionID: "codex-id"},
+	}
+	ws, err := m.mgr.Activate("r/w", dir, specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	ws.ActiveAgent = 1
+	old := ws.Agents[1]
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+	m.boardOpen = true
+	m.boardCursor = 1
+	mm, _ := m.handleBoard(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	m = mm.(Model)
+	if ws.Agents[1] == old {
+		t.Fatal("restart did not replace the selected session")
+	}
+	if ws.ActiveAgent != 1 || len(ws.Agents) != 2 {
+		t.Fatalf("restart changed pool shape/focus: len=%d active=%d", len(ws.Agents), ws.ActiveAgent)
+	}
+	if got := ws.Agents[1]; got.Provider != agent.Codex || got.SessionID != "codex-id" {
+		t.Fatalf("replacement metadata = provider %q id %q", got.Provider, got.SessionID)
+	}
+	if ws.Agents[1].Events == nil {
+		t.Fatal("restarted Codex session did not attach a fresh observer event stream")
+	}
+}
+
+func TestCodexTranscriptWheel(t *testing.T) {
+	tests := []struct {
+		button tea.MouseButton
+		want   string
+		ok     bool
+	}{
+		{tea.MouseWheelUp, "\x1b[1;2A", true},
+		{tea.MouseWheelDown, "\x1b[1;2B", true},
+		{tea.MouseLeft, "", false},
+	}
+	for _, tt := range tests {
+		got, ok := codexTranscriptWheel(tt.button)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("codexTranscriptWheel(%v) = (%q, %t), want (%q, %t)", tt.button, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestCodexAgentEventsPersistThreadAndSurviveClaudeSnapshot(t *testing.T) {
+	m := mixedProviderModel(agent.Claude)
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	events := make(chan agent.Event)
+	ws, err := m.mgr.Activate("r/w", dir, []session.Spec{{
+		Kind: session.Agent, Title: "jade-otter", Argv: []string{"sleep", "5"},
+		Provider: agent.Codex, Events: events,
+	}}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.mgr.CloseAll()
+	sess := ws.Agents[0]
+	pid := sess.Pid()
+	m.current = &workspaceRef{repo: "r", worktree: "w", key: "r/w", path: dir, ws: ws}
+
+	apply := func(event agent.Event) {
+		t.Helper()
+		mm, _ := m.update(agentEventMsg{session: sess, event: event, open: true})
+		m = mm.(Model)
+	}
+	apply(agent.Event{Kind: agent.ThreadStarted, ThreadID: "thread-123"})
+	if sess.SessionID != "thread-123" {
+		t.Fatalf("live session ID = %q", sess.SessionID)
+	}
+	saved, _ := m.state.Agents("r/w")
+	if len(saved) != 1 || saved[0].Provider != agent.Codex || saved[0].SessionID != "thread-123" {
+		t.Fatalf("thread start did not persist Codex state: %+v", saved)
+	}
+
+	apply(agent.Event{Kind: agent.TurnStarted, ThreadID: "thread-123", TurnID: "turn-1"})
+	if got := m.agentStatus[pid]; got.Provider != agent.Codex || got.Status != "busy" {
+		t.Fatalf("turn start status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.ThreadStatusChanged, ThreadID: "thread-123", Status: "active", WaitingOnApproval: true})
+	if got := m.agentStatus[pid]; got.Status != "waiting" || got.WaitingFor != "permission prompt" {
+		t.Fatalf("approval status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.ThreadStatusChanged, ThreadID: "thread-123", Status: "active", WaitingOnUserInput: true})
+	if got := m.agentStatus[pid]; got.Status != "waiting" || got.WaitingFor != "input needed" {
+		t.Fatalf("input status = %+v", got)
+	}
+	apply(agent.Event{Kind: agent.TurnCompleted, ThreadID: "thread-123", TurnID: "turn-1", Status: "completed"})
+	if got := m.agentStatus[pid]; got.Status != "idle" || got.WaitingFor != "" {
+		t.Fatalf("turn complete status = %+v", got)
+	}
+
+	const claudePID = 424242
+	mm, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		claudePID: {Status: "busy", Cwd: dir, StartedAt: 10},
+	}})
+	m = mm.(Model)
+	if got := m.agentStatus[pid]; got.Provider != agent.Codex || got.Status != "idle" {
+		t.Fatalf("Claude snapshot replaced Codex status: %+v", got)
+	}
+	if got := m.agentStatus[claudePID]; got.Provider != agent.Claude || got.Status != "busy" {
+		t.Fatalf("Claude snapshot status = %+v", got)
+	}
+}
+
+func TestOverlayClicksDoNotReachBar(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Model)
+	}{
+		{"help", func(m *Model) { m.helpOpen = true }},
+		{"board", func(m *Model) { m.boardOpen = true }},
+		{"usage", func(m *Model) { m.usageOpen = true }},
+		{"palette", func(m *Model) { m.paletteOpen = true }},
+		{"diff", func(m *Model) { m.diffOpen = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := modelWithAgents(1)
+			m.screen = screenEditor
+			tc.set(&m)
+			// The agent tab normally occupies this bar zone.
+			var x int
+			for _, z := range m.barZones() {
+				if z.s == screenAgent {
+					break
+				}
+				x += lipgloss.Width(z.glyph) + 3
+			}
+			x += 2
+			mm, _ := m.handleMouseClick(tea.MouseClickMsg{X: x, Y: 0, Button: tea.MouseLeft})
+			if got := mm.(Model).screen; got != screenEditor {
+				t.Fatalf("overlay click changed screen to %d", got)
+			}
+		})
+	}
+}
+
+func TestCommandPaletteToggle(t *testing.T) {
+	m := sampleModel()
+
+	// alt+p opens the palette from the deck.
+	mm, _ := m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if !m.paletteOpen {
+		t.Fatal("alt+p should open the command palette")
+	}
+	// alt+p again closes it.
+	mm, _ = m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("alt+p should close the command palette")
+	}
+	// esc closes it too.
+	mm, _ = m.handleKey(altKey('p'))
+	m = mm.(Model)
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("esc should close the command palette")
+	}
+}
+
+// TestCommandPaletteClosesOtherOverlays: opening the palette must never stack on
+// top of the board or usage overlays.
+func TestCommandPaletteClosesOtherOverlays(t *testing.T) {
+	m := sampleModel()
+	m.boardOpen = true
+	m.usageOpen = true
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	if !m.paletteOpen || m.boardOpen || m.usageOpen {
+		t.Fatalf("opening the palette should close other overlays: palette=%v board=%v usage=%v",
+			m.paletteOpen, m.boardOpen, m.usageOpen)
+	}
+}
+
+// TestCommandPaletteBlockedDuringConfirm: a picker modal confirm owns its keys,
+// so alt+p must not open over it.
+func TestCommandPaletteBlockedDuringConfirm(t *testing.T) {
+	m := sampleModel() // screen is the picker
+	m.mode = modeConfirmRemove
+	mm, _ := m.handleKey(altKey('p'))
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Fatal("alt+p must not open over a picker modal confirm")
+	}
+}
+
+func TestCommandPaletteFilter(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	all := len(m.filteredPaletteCommands())
+	m.paletteInput.SetValue("help")
+	got := m.filteredPaletteCommands()
+	if len(got) == 0 || len(got) >= all {
+		t.Fatalf("query should narrow the list: all=%d got=%d", all, len(got))
+	}
+	found := false
+	for _, c := range got {
+		if c.title == "help" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("query 'help' should still match the help row")
+	}
+}
+
+// TestCommandPaletteCursorResetsOnQueryChange: typing that changes the query
+// snaps the cursor back to the top of the (re-filtered) list.
+func TestCommandPaletteCursorResetsOnQueryChange(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	if m.paletteCursor == 0 {
+		t.Fatal("down should have moved the cursor off the top")
+	}
+
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: 'h', Text: "h"})
+	m = mm.(Model)
+	if m.paletteCursor != 0 {
+		t.Fatalf("cursor should reset to 0 on query change, got %d", m.paletteCursor)
+	}
+}
+
+// TestCommandPaletteCursorClamped: the cursor never runs off either end of the
+// filtered list.
+func TestCommandPaletteCursorClamped(t *testing.T) {
+	m := sampleModel()
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	n := len(m.filteredPaletteCommands())
+
+	// Up at the top stays at 0.
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = mm.(Model)
+	if m.paletteCursor != 0 {
+		t.Fatalf("up at the top should stay at 0, got %d", m.paletteCursor)
+	}
+	// Down well past the end clamps at n-1.
+	for i := 0; i < n+5; i++ {
+		mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyDown})
+		m = mm.(Model)
+	}
+	if m.paletteCursor != n-1 {
+		t.Fatalf("down should clamp at %d, got %d", n-1, m.paletteCursor)
+	}
+}
+
+// TestCommandPaletteAvailability: view-navigation rows only appear with an
+// active workspace.
+func TestCommandPaletteAvailability(t *testing.T) {
+	m := sampleModel() // no current workspace
+	for _, c := range m.paletteCommands() {
+		if c.title == "go to editor" {
+			t.Fatal("no workspace should not offer 'go to editor'")
+		}
+	}
+
+	m2 := modelWithAgents(1)
+	found := false
+	for _, c := range m2.paletteCommands() {
+		if c.title == "go to editor" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("an active workspace should offer 'go to editor'")
+	}
+}
+
+// TestCommandPaletteRunGotoEditor: enter on the "go to editor" row closes the
+// palette and switches the screen.
+func TestCommandPaletteRunGotoEditor(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenTerminal
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	m.paletteInput.SetValue("editor") // only "go to editor" matches
+	m.paletteCursor = 0
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.paletteOpen {
+		t.Error("enter should close the palette")
+	}
+	if m.screen != screenEditor {
+		t.Fatalf("enter on 'go to editor' should switch to editor, got %v", m.screen)
+	}
+}
+
+// TestCommandPaletteRunOpenWorktree: enter on an "open <repo>/<wt>" row runs
+// activate against a real (cheap-child) manager.
+func TestCommandPaletteRunOpenWorktree(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: keys,
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+	dir := t.TempDir()
+	m.groups = []Group{{Repo: repo.Repo{Name: "repo"}, Worktrees: []WorktreeView{
+		{WT: repo.Worktree{Repo: "repo", Name: "wt", Path: dir}},
+	}}}
+	m.recomputeActive()
+
+	mm, _ = m.openPalette()
+	m = mm.(Model)
+	m.paletteInput.SetValue("open repo/wt")
+	m.paletteCursor = 0
+	mm, _ = m.handlePalette(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.current == nil || m.current.key != "repo/wt" {
+		t.Fatalf("enter on the open row should activate repo/wt, got %+v", m.current)
+	}
+	if m.paletteOpen {
+		t.Error("enter should close the palette")
+	}
+}
+
+// TestCommandPaletteSwallowsSessionKeys: while the palette is open no session is
+// visible and a stray letter key lands in the query, never in the session.
+func TestCommandPaletteSwallowsSessionKeys(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenEditor
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+
+	if m.visibleSessions() != nil {
+		t.Error("no session should be visible while the palette is open")
+	}
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	m = mm.(Model)
+	if !m.paletteOpen {
+		t.Error("a letter key should not close the palette")
+	}
+	if m.paletteInput.Value() != "z" {
+		t.Fatalf("letter should type into the query, got %q", m.paletteInput.Value())
 	}
 }
 
@@ -826,9 +1457,11 @@ func waitForSession(t *testing.T, s *session.Session, want string) {
 func pasteModel(t *testing.T) (Model, *session.Session) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	t.Cleanup(mgr.CloseAll)
@@ -893,6 +1526,28 @@ func TestPasteBlockedByOverlay(t *testing.T) {
 	}
 }
 
+// TestPasteIntoPaletteOnly: a paste while the command palette is open lands in
+// the palette's query input and nowhere else — in particular not in the deck
+// filter, which stays focused across screens and would otherwise receive a
+// duplicate through the focus-routed path.
+func TestPasteIntoPaletteOnly(t *testing.T) {
+	m := sampleModel() // picker, NEW section, filter focused
+	mm, _ := m.openPalette()
+	m = mm.(Model)
+	m.paletteCursor = 2
+	mm, _ = m.Update(tea.PasteMsg{Content: "usage"})
+	m = mm.(Model)
+	if got := m.paletteInput.Value(); got != "usage" {
+		t.Fatalf("paste should reach the palette input, got %q", got)
+	}
+	if got := m.filter.Value(); got != "" {
+		t.Errorf("paste leaked into the deck filter: %q", got)
+	}
+	if m.paletteCursor != 0 {
+		t.Errorf("paste changed the query, so the cursor should reset to 0, got %d", m.paletteCursor)
+	}
+}
+
 func TestToUVKey(t *testing.T) {
 	uvk := toUVKey(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	if uvk.Code != 'a' || uvk.Text != "a" {
@@ -911,9 +1566,11 @@ func TestToUVKey(t *testing.T) {
 // TestActivateFlow drives activate → cycle → return → re-activate with cheap
 // child commands (no real nvim/claude needed) and a real session manager.
 func TestActivateFlow(t *testing.T) {
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -969,9 +1626,11 @@ func TestActivateFlow(t *testing.T) {
 // TestMouseClickFocusesTermPane splits a terminal into two panes and verifies a
 // left click over the non-focused pane moves pane focus onto it.
 func TestMouseClickFocusesTermPane(t *testing.T) {
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1006,9 +1665,11 @@ func TestMouseClickFocusesTermPane(t *testing.T) {
 // board cursor opens on it.
 func TestBoardSortsAttentionFirst(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	defer mgr.CloseAll()
@@ -1101,7 +1762,7 @@ func TestSessionHelpHint(t *testing.T) {
 
 	// On the terminal screen it leads with the help key and surfaces panelling.
 	foot := m.sessionFooter()
-	for _, want := range []string{m.keyHelp, "help", "split", "zoom"} {
+	for _, want := range []string{m.keys.Help, "help", "split", "zoom"} {
 		if !strings.Contains(foot, want) {
 			t.Errorf("terminal footer missing %q:\n%s", want, foot)
 		}
@@ -1142,9 +1803,11 @@ func isQuit(cmd tea.Cmd) bool {
 func busyGuardModel(t *testing.T) (Model, string) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	keys := config.Default().Keys
+	keys.Cycle = "ctrl+o"
 	ctrl := &Controller{cfg: config.Config{
 		Editor: "cat", Agent: "cat", Shell: "sh",
-		Keys: config.Keys{Cycle: "ctrl+o", Picker: "ctrl+g"},
+		Keys: keys,
 	}}
 	mgr := session.NewManager()
 	t.Cleanup(mgr.CloseAll)
@@ -1581,14 +2244,10 @@ func TestListNavDialect(t *testing.T) {
 	}
 }
 
-// TestDeckCtrlNMovesCursor: with the notif alias retired (empty default), ctrl+n
-// in the deck is a pure list-down key — it moves the ACTIVE cursor and never
-// opens the agent board (handleKey no longer intercepts it).
+// TestDeckCtrlNMovesCursor: ctrl+n in the deck is a pure list-down key — it
+// moves the ACTIVE cursor and never opens the agent board.
 func TestDeckCtrlNMovesCursor(t *testing.T) {
 	m := sampleModel()
-	if m.keyNotif != "" {
-		t.Fatalf("precondition: notif should default empty, got %q", m.keyNotif)
-	}
 	m.focus = focusActive
 	if len(m.active) < 2 {
 		t.Fatalf("precondition: need >=2 active items, got %d", len(m.active))
@@ -1597,7 +2256,7 @@ func TestDeckCtrlNMovesCursor(t *testing.T) {
 	mm, _ := m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if m.boardOpen {
-		t.Fatal("ctrl+n in the deck must not open the board once notif is retired")
+		t.Fatal("ctrl+n in the deck must not open the board")
 	}
 	if m.activeCursor != 1 {
 		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
@@ -1605,8 +2264,7 @@ func TestDeckCtrlNMovesCursor(t *testing.T) {
 }
 
 // TestBoardCtrlNNavigates: inside an open board ctrl+n/ctrl+p navigate and do not
-// close it (nav wins over the legacy close alias), while ctrl+a and esc still
-// close.
+// close it, while ctrl+a and esc still close.
 func TestBoardCtrlNNavigates(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0
@@ -1617,7 +2275,7 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 	mm, _ = m.handleBoard(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
-		t.Fatal("ctrl+n should not close the board (nav wins over the close alias)")
+		t.Fatal("ctrl+n should not close the board (it navigates instead)")
 	}
 	if m.boardCursor != start+1 {
 		t.Fatalf("ctrl+n should move the board cursor down, got %d want %d", m.boardCursor, start+1)
@@ -1642,43 +2300,6 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 	m = mm.(Model)
 	if m.boardOpen {
 		t.Fatal("esc should still close the board")
-	}
-}
-
-// TestKeyNotifReboundFreesCtrlN: when the user rebinds keyNotif off ctrl+n, the
-// rebound key closes the board and ctrl+n becomes an ordinary list-down key both
-// in the board and in the deck.
-func TestKeyNotifReboundFreesCtrlN(t *testing.T) {
-	m := modelWithAgents(3)
-	m.keyNotif = "ctrl+b"
-	m.current.ws.ActiveAgent = 0
-	mm, _ := m.openBoard()
-	m = mm.(Model)
-	start := m.boardCursor
-
-	mm, _ = m.handleBoard(ctrlKey('n'))
-	m = mm.(Model)
-	if !m.boardOpen || m.boardCursor != start+1 {
-		t.Fatalf("rebound: ctrl+n should navigate the board, open=%v cursor=%d", m.boardOpen, m.boardCursor)
-	}
-	mm, _ = m.handleBoard(ctrlKey('b'))
-	m = mm.(Model)
-	if m.boardOpen {
-		t.Fatal("the rebound keyNotif should close the board")
-	}
-
-	// In the deck ctrl+n is now free and reaches the ACTIVE list as list-down.
-	d := sampleModel()
-	d.keyNotif = "ctrl+b"
-	d.focus = focusActive
-	d.activeCursor = 0
-	mm, _ = d.handleKey(ctrlKey('n'))
-	d = mm.(Model)
-	if d.boardOpen {
-		t.Fatal("rebound: ctrl+n must not open the board")
-	}
-	if d.activeCursor != 1 {
-		t.Fatalf("rebound: ctrl+n should move the ACTIVE cursor, got %d", d.activeCursor)
 	}
 }
 
@@ -1774,5 +2395,329 @@ func TestHelpPlainKeyDoesNotLeak(t *testing.T) {
 	waitForSession(t, sess, "Z")
 	if strings.Contains(sess.Render(), "x") {
 		t.Error("a plain key dismissing help leaked into the session")
+	}
+}
+
+// --- diff viewer ---
+
+// diffKey builds a KeyPressMsg for a single rune (Text set so Key.String()
+// returns the rune, as the diff routing keys off msg.String()).
+func diffKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Text: string(r)} }
+
+// openSampleDiff opens the diff for active[idx] of a sampleModel and delivers a
+// diffMsg with the given payload, returning the model with content built. The
+// selected worktree is given a base branch (so the vs-base section renders) and
+// marked ahead/dirty per the flags.
+func openSampleDiff(t *testing.T, idx int, committed, uncommitted []repo.FileStat, cbody, ubody string, untracked []string, dirty bool) Model {
+	t.Helper()
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = idx
+	m.active[idx].view.BaseBranch = "main"
+	m.active[idx].view.Ahead = 3
+	m.active[idx].view.Dirty = dirty
+	mm, cmd := m.openDiff(m.active[idx])
+	m = mm.(Model)
+	if !m.diffOpen || !m.diffView.loading || cmd == nil {
+		t.Fatalf("openDiff: open=%v loading=%v cmd=%v", m.diffOpen, m.diffView.loading, cmd != nil)
+	}
+	res, _ := m.update(diffMsg{
+		key:             m.diffView.key,
+		committedBody:   cbody,
+		committedStat:   committed,
+		uncommittedBody: ubody,
+		uncommittedStat: uncommitted,
+		untracked:       untracked,
+	})
+	return res.(Model)
+}
+
+func manyLineDiff(n int) string {
+	var b strings.Builder
+	b.WriteString("diff --git a/f.go b/f.go\n@@ -1,1 +1,")
+	b.WriteString(strconv.Itoa(n))
+	b.WriteString(" @@\n")
+	for i := 0; i < n; i++ {
+		b.WriteString("+line ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func TestDiffOpensFromDeckKey(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	mm, cmd := m.handleActiveKey(diffKey('v'))
+	m = mm.(Model)
+	if !m.diffOpen || !m.diffView.loading {
+		t.Fatalf("v should open the diff in the loading state: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if cmd == nil {
+		t.Error("opening the diff should return a fetch command")
+	}
+	it, _ := m.selectedActive()
+	if m.diffView.key != wsKey(it.repo.Name, it.view.WT.Name) {
+		t.Errorf("diff target key = %q, want %q", m.diffView.key, wsKey(it.repo.Name, it.view.WT.Name))
+	}
+}
+
+func TestDiffMsgRendersAndStaleDropped(t *testing.T) {
+	stat := []repo.FileStat{{Path: "main.go", Add: 4, Del: 2}}
+	m := openSampleDiff(t, 0, stat, nil,
+		"diff --git a/main.go b/main.go\n@@ -1,2 +1,2 @@\n-old\n+new\n", "", nil, false)
+	if m.diffView.loading {
+		t.Fatal("diffMsg arrival should clear the loading state")
+	}
+	if len(m.diffView.full.lines) == 0 {
+		t.Fatal("content should be built on diffMsg arrival")
+	}
+	out := m.renderDiff(m.height - barHeight)
+	for _, want := range []string{"vs main", "main.go", "[all]", "scroll"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered diff missing %q:\n%s", want, out)
+		}
+	}
+
+	// A diffMsg carrying a different (stale) key is dropped: content unchanged.
+	before := len(m.diffView.full.lines)
+	res, _ := m.update(diffMsg{key: "someone/else", committedBody: "junk"})
+	m = res.(Model)
+	if len(m.diffView.full.lines) != before {
+		t.Error("a stale-key diffMsg should be dropped, not applied")
+	}
+}
+
+func TestDiffErrorClosesOverlay(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	mm, _ := m.openDiff(m.active[0])
+	m = mm.(Model)
+	res, _ := m.update(diffMsg{key: m.diffView.key, err: errTest})
+	m = res.(Model)
+	if m.diffOpen {
+		t.Error("a diff error should close the overlay")
+	}
+	if m.statusLevel != statusError || !strings.Contains(m.status, "diff error") {
+		t.Errorf("a diff error should set a sticky error status, got level=%v status=%q", m.statusLevel, m.status)
+	}
+}
+
+var errTest = &testErr{}
+
+type testErr struct{}
+
+func (*testErr) Error() string { return "boom" }
+
+func TestDiffScrollClamping(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	avail := m.diffBodyHeight()
+	maxOff := max(0, len(m.diffView.full.lines)-avail)
+	if maxOff == 0 {
+		t.Fatal("test needs content taller than the viewport")
+	}
+
+	// Up at the top stays at 0.
+	mm, _ := m.handleDiff(diffKey('k'))
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("up at the top should stay at 0, got %d", m.diffView.offset)
+	}
+	// G jumps to the bottom (maxOff); further down clamps there.
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: 'G', Text: "G"})
+	m = mm.(Model)
+	if m.diffView.offset != maxOff {
+		t.Fatalf("G should land on maxOff %d, got %d", maxOff, m.diffView.offset)
+	}
+	for i := 0; i < 5; i++ {
+		mm, _ = m.handleDiff(diffKey('j'))
+		m = mm.(Model)
+	}
+	if m.diffView.offset != maxOff {
+		t.Fatalf("down past the bottom should clamp at %d, got %d", maxOff, m.diffView.offset)
+	}
+	// g returns to the top.
+	mm, _ = m.handleDiff(diffKey('g'))
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("g should return to the top, got %d", m.diffView.offset)
+	}
+}
+
+func TestDiffScopeToggleResetsOffset(t *testing.T) {
+	m := openSampleDiff(t, 0,
+		[]repo.FileStat{{Path: "committed.go", Add: 40}}, []repo.FileStat{{Path: "wip.go", Add: 1}},
+		manyLineDiff(40), "diff --git a/wip.go b/wip.go\n@@ -1,1 +1,1 @@\n+wip\n", nil, true)
+
+	// Scroll down in the full scope, then toggle to uncommitted.
+	mm, _ := m.handleDiff(tea.KeyPressMsg{Code: 'G', Text: "G"})
+	m = mm.(Model)
+	if m.diffView.offset == 0 {
+		t.Fatal("precondition: expected a non-zero offset in the full scope")
+	}
+	mm, _ = m.handleDiff(diffKey('u'))
+	m = mm.(Model)
+	if !m.diffView.scopeUncommitted {
+		t.Fatal("u should switch to the uncommitted scope")
+	}
+	if m.diffView.offset != 0 {
+		t.Fatalf("scope toggle should reset the offset to 0, got %d", m.diffView.offset)
+	}
+	// The uncommitted scope is shorter than the full scope and mentions wip.go.
+	if len(m.diffView.uncommitted.lines) >= len(m.diffView.full.lines) {
+		t.Error("the uncommitted scope should be a subset of the full scope")
+	}
+	out := m.renderDiff(m.height - barHeight)
+	if !strings.Contains(out, "[uncommitted]") || !strings.Contains(out, "wip.go") {
+		t.Errorf("uncommitted scope render missing content:\n%s", out)
+	}
+}
+
+func TestDiffFileJump(t *testing.T) {
+	// Two files, each tall enough that the content overflows the viewport so the
+	// second file's header sits at a scrollable offset (jumps clamp to the
+	// bottom when everything already fits).
+	fileBody := func(name string) string {
+		var b strings.Builder
+		b.WriteString("diff --git a/" + name + " b/" + name + "\n@@ -1,1 +1,30 @@\n")
+		for i := 0; i < 30; i++ {
+			b.WriteString("+line\n")
+		}
+		return b.String()
+	}
+	body := fileBody("one.go") + fileBody("two.go")
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "one.go", Add: 30}, {Path: "two.go", Add: 30}}, nil, body, "", nil, false)
+	fl := m.diffView.full.fileLines
+	if len(fl) < 2 {
+		t.Fatalf("expected at least 2 file-header lines, got %d", len(fl))
+	}
+	// J from the top lands on the first file header past offset 0.
+	mm, _ := m.handleDiff(tea.KeyPressMsg{Code: 'J', Text: "J"})
+	m = mm.(Model)
+	if !contains(fl, m.diffView.offset) {
+		t.Fatalf("J should land on a file-header line, got offset %d (fileLines %v)", m.diffView.offset, fl)
+	}
+	landed := m.diffView.offset
+	// K from there lands on the previous file header (or the top).
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: 'K', Text: "K"})
+	m = mm.(Model)
+	if m.diffView.offset >= landed {
+		t.Fatalf("K should move to an earlier file header, got %d (was %d)", m.diffView.offset, landed)
+	}
+}
+
+func contains(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDiffXEntersRemoveFlow(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 1}}, nil,
+		"diff --git a/f.go b/f.go\n@@ -1,1 +1,1 @@\n+x\n", "", nil, true)
+	mm, _ := m.handleDiff(diffKey('x'))
+	m = mm.(Model)
+	if m.diffOpen {
+		t.Error("x should close the diff")
+	}
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("x should enter the remove confirm, got mode %v", m.mode)
+	}
+	if !strings.Contains(m.status, "UNCOMMITTED CHANGES") || !strings.Contains(m.status, "view diff") {
+		t.Errorf("dirty remove prompt should warn and offer view diff, got %q", m.status)
+	}
+}
+
+func TestDiffFromRemovePrompt(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+	m.mode = modeConfirmRemove
+	m.status = "remove worktree …"
+	mm, cmd := m.handleConfirmKey(diffKey('v'))
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Errorf("v should exit the confirm mode, got %v", m.mode)
+	}
+	if !m.diffOpen || !m.diffView.loading {
+		t.Fatalf("v from the remove prompt should open the diff: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if cmd == nil {
+		t.Error("opening the diff should return a fetch command")
+	}
+}
+
+func TestPaletteViewDiffRow(t *testing.T) {
+	m := sampleModel()
+	m.focus = focusActive
+	m.activeCursor = 0
+
+	// The row exists for a chosen worktree (not active[0]) and moving to it must
+	// move the active cursor onto that worktree.
+	target := m.active[len(m.active)-1]
+	wantTitle := "view diff: " + target.repo.Name + "/" + target.view.WT.Name
+	var run func(Model) (tea.Model, tea.Cmd)
+	for _, c := range m.paletteCommands() {
+		if c.title == wantTitle {
+			run = c.run
+		}
+	}
+	if run == nil {
+		t.Fatalf("palette should contain %q", wantTitle)
+	}
+	mm, cmd := run(m)
+	m = mm.(Model)
+	if !m.diffOpen || m.diffView.loading == false || cmd == nil {
+		t.Fatalf("running the view-diff row should open the diff: open=%v loading=%v", m.diffOpen, m.diffView.loading)
+	}
+	if m.screen != screenPicker || m.focus != focusActive {
+		t.Errorf("view-diff row should return to the picker's active section: screen=%v focus=%v", m.screen, m.focus)
+	}
+	if m.diffView.key != wsKey(target.repo.Name, target.view.WT.Name) {
+		t.Errorf("view-diff row opened the wrong worktree: %q", m.diffView.key)
+	}
+	if it, _ := m.selectedActive(); wsKey(it.repo.Name, it.view.WT.Name) != m.diffView.key {
+		t.Error("active cursor should have moved onto the diff's worktree")
+	}
+}
+
+func TestDiffWheelScrolls(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	mm, _ := m.diffWheel(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	m = mm.(Model)
+	if m.diffView.offset != 3 {
+		t.Fatalf("a wheel-down notch should scroll 3 lines, got %d", m.diffView.offset)
+	}
+	mm, _ = m.diffWheel(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	m = mm.(Model)
+	if m.diffView.offset != 0 {
+		t.Fatalf("a wheel-up notch should scroll back, got %d", m.diffView.offset)
+	}
+}
+
+func TestDiffSwallowsUnknownKeys(t *testing.T) {
+	m := openSampleDiff(t, 0, []repo.FileStat{{Path: "f.go", Add: 40}}, nil, manyLineDiff(40), "", nil, false)
+	m.diffView.offset = 5
+	mm, _ := m.handleDiff(diffKey('z'))
+	m = mm.(Model)
+	if !m.diffOpen {
+		t.Error("an unknown key should not close the diff")
+	}
+	if m.diffView.offset != 5 {
+		t.Errorf("an unknown key should not move the offset, got %d", m.diffView.offset)
+	}
+	if m.mode != modeNormal {
+		t.Errorf("an unknown key should not change the mode, got %v", m.mode)
+	}
+	// esc / q close.
+	mm, _ = m.handleDiff(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.diffOpen {
+		t.Error("esc should close the diff")
 	}
 }

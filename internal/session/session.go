@@ -5,6 +5,7 @@
 package session
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/KCaverly/caretaker/internal/agent"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
@@ -31,10 +33,15 @@ const (
 type Session struct {
 	Kind  Kind
 	Title string
-	// SessionID is the claude session UUID an Agent session runs under (set by
-	// the Manager from the Spec). It lets ct resume the same conversation across
-	// runs; empty for non-agent sessions.
+	// Provider identifies the CLI that owns an agent session. It is empty for
+	// non-agent sessions and legacy agent specs that predate provider metadata.
+	Provider agent.Provider
+	// SessionID is the provider-owned, opaque conversation ID an Agent session
+	// runs under. It lets ct resume the same conversation across runs; empty for
+	// non-agent sessions and conversations whose provider has not supplied an ID.
 	SessionID string
+	// Events carries lifecycle notifications from the provider integration.
+	Events <-chan agent.Event
 
 	cmd *exec.Cmd
 	pty *os.File
@@ -43,7 +50,9 @@ type Session struct {
 	cursorVisible atomic.Bool
 	closed        atomic.Bool
 	closeOnce     sync.Once
+	companionOnce sync.Once
 	dirty         func(*Session) // signalled when the screen changes
+	companion     io.Closer
 
 	// Render cache. emu.Render() re-serialises the entire w×h buffer to an ANSI
 	// string on every call (~60µs/616 allocs at 80×24 up to ~253µs/1,901 allocs
@@ -71,37 +80,51 @@ type Session struct {
 // dirty is called with the session whenever the program produces output, so the
 // caller can decide whether a repaint is needed (e.g. only for visible sessions).
 func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func(*Session)) (*Session, error) {
-	if len(argv) == 0 {
+	return StartSpec(Spec{Kind: kind, Title: title, Argv: argv}, dir, w, h, dirty)
+}
+
+// StartSpec launches spec in dir on a pty sized w×h. In addition to the
+// command, it applies provider-specific environment changes and propagates
+// agent metadata to the returned Session.
+func StartSpec(spec Spec, dir string, w, h int, dirty func(*Session)) (*Session, error) {
+	if len(spec.Argv) == 0 && spec.Kind == Agent {
+		if spec.Companion != nil {
+			_ = spec.Companion.Close()
+		}
+		return nil, errEmptyAgentArgv
+	}
+	if len(spec.Argv) == 0 {
 		shell := os.Getenv("SHELL")
 		if shell == "" {
 			shell = "/bin/sh"
 		}
-		argv = []string{shell}
+		spec.Argv = []string{shell}
 	}
 
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	if kind == Agent {
-		// Claude's agent-teams feature auto-detects tmux/iTerm2 from these and
-		// would then spawn split-pane teammates outside ct's emulator. Drop them
-		// so teams render in-process inside the pane ct controls.
-		cmd.Env = dropEnv(cmd.Env, "TMUX", "TERM_PROGRAM")
-	}
+	cmd.Env = buildEnv(spec.Env, spec.UnsetEnv)
 
 	w, h = max(w, 1), max(h, 1)
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
 	if err != nil {
+		if spec.Companion != nil {
+			_ = spec.Companion.Close()
+		}
 		return nil, err
 	}
 
 	s := &Session{
-		Kind:  kind,
-		Title: title,
-		cmd:   cmd,
-		pty:   f,
-		emu:   vt.NewSafeEmulator(w, h),
-		dirty: dirty,
+		Kind:      spec.Kind,
+		Title:     spec.Title,
+		Provider:  spec.Provider,
+		SessionID: spec.SessionID,
+		Events:    spec.Events,
+		cmd:       cmd,
+		pty:       f,
+		emu:       vt.NewSafeEmulator(w, h),
+		dirty:     dirty,
+		companion: spec.Companion,
 	}
 	s.cursorVisible.Store(true)
 	s.renderCacheDirty.Store(true) // no cache yet: first Render must serialise
@@ -113,6 +136,30 @@ func Start(kind Kind, title, dir string, argv []string, w, h int, dirty func(*Se
 	go io.Copy(f, s.emu) //nolint:errcheck // emulator(SendKey) → pty (input)
 
 	return s, nil
+}
+
+// buildEnv returns the current process environment with caretaker's terminal
+// default and the spec's provider-specific changes applied. Explicit Env
+// entries replace inherited entries with the same key; UnsetEnv wins over both
+// inherited and explicit entries.
+func buildEnv(set, unset []string) []string {
+	env := append([]string(nil), os.Environ()...)
+	env = upsertEnv(env, "TERM=xterm-256color")
+	for _, entry := range set {
+		env = upsertEnv(env, entry)
+	}
+	return dropEnv(env, unset...)
+}
+
+// upsertEnv appends entry after removing existing entries for its key. Invalid
+// entries are left for os/exec to reject rather than silently changing the
+// caller's requested environment.
+func upsertEnv(env []string, entry string) []string {
+	key, _, ok := strings.Cut(entry, "=")
+	if !ok || key == "" {
+		return append(env, entry)
+	}
+	return append(dropEnv(env, key), entry)
 }
 
 // pumpOutput copies child output into the emulator and signals repaints. When
@@ -132,6 +179,7 @@ func (s *Session) pumpOutput() {
 			s.closed.Store(true)
 			s.signal()
 			_ = s.cmd.Wait()
+			s.closeCompanion()
 			return
 		}
 	}
@@ -191,9 +239,32 @@ func (s *Session) Resize(w, h int) {
 	if w < 1 || h < 1 {
 		return
 	}
+	s.scrollForShrink(h)
 	s.emu.Resize(w, h)
 	s.renderCacheDirty.Store(true) // resize reshapes the buffer; drop the cache
 	_ = pty.Setsize(s.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
+}
+
+// scrollForShrink keeps the newest output visible when the pane loses rows
+// (splitting, unzooming). The emulator's Resize truncates the buffer from the
+// BOTTOM, which would destroy the most recent screenful and leave the oldest;
+// a real terminal instead scrolls content up into scrollback so the cursor's
+// line survives. Emulate that here: scroll up (CSI S — which also pushes the
+// evicted top lines into the emulator's scrollback) just enough that the
+// cursor row lands inside the new height, where Resize's cursor clamp will
+// then agree with the content. Alt-screen programs (nvim, claude) repaint on
+// SIGWINCH and have no scrollback semantics, so they are left alone. Growing
+// back does not restore the scrolled-off lines — like a terminal that doesn't
+// re-fill from scrollback, the content simply stays where it is.
+func (s *Session) scrollForShrink(newH int) {
+	if s.emu.IsAltScreen() {
+		return
+	}
+	shift := s.emu.CursorPosition().Y - (newH - 1)
+	if shift <= 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(s.emu, "\x1b[%dS", shift)
 }
 
 // Size returns the emulator's current dimensions.
@@ -238,5 +309,14 @@ func (s *Session) Close() {
 		}
 		_ = s.pty.Close()
 		_ = s.emu.Close()
+		s.closeCompanion()
+	})
+}
+
+func (s *Session) closeCompanion() {
+	s.companionOnce.Do(func() {
+		if s.companion != nil {
+			_ = s.companion.Close()
+		}
 	})
 }

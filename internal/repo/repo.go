@@ -115,7 +115,7 @@ func parseWorktreeList(out string) []Worktree {
 }
 
 // WorktreeStatus returns the coarse git state of a worktree — one `git status`
-// subprocess. Commit times come separately from BranchTipTimes, which covers a
+// subprocess. Commit times come separately from BranchTips, which covers a
 // whole repo in a single call.
 func WorktreeStatus(wt Worktree) (Status, error) {
 	out, err := git(wt.Path, "status", "--porcelain")
@@ -125,29 +125,242 @@ func WorktreeStatus(wt Worktree) (Status, error) {
 	return Status{Dirty: strings.TrimSpace(out) != ""}, nil
 }
 
-// BranchTipTimes returns the committer time (unix seconds) of every local
-// branch tip in r, keyed by short branch name — one subprocess for the whole
-// repo, replacing a per-worktree `git log -1`. Worktree HEADs equal their
-// branch tips in ct's branch-per-worktree model; detached worktrees simply
-// miss the map (time 0).
-func BranchTipTimes(r Repo) (map[string]int64, error) {
+// BranchTip is a local branch tip's metadata, gathered in one for-each-ref
+// pass: the committer time (unix seconds) and the commit subject.
+type BranchTip struct {
+	Time    int64  // committer time (unix seconds)
+	Subject string // first line of the tip commit message
+}
+
+// BranchTips returns the tip metadata of every local branch in r, keyed by
+// short branch name — one subprocess for the whole repo, replacing a
+// per-worktree `git log -1`. Worktree HEADs equal their branch tips in ct's
+// branch-per-worktree model; detached worktrees simply miss the map (a zero
+// BranchTip).
+func BranchTips(r Repo) (map[string]BranchTip, error) {
 	// %00 expands to a NUL in the output, an unambiguous separator no branch
-	// name can contain (a raw NUL can't be passed as an exec argument).
-	out, err := git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)", "refs/heads")
+	// name or subject can contain (a raw NUL can't be passed as an exec
+	// argument). Two of them fence three fields; a NUL beats spaces here because
+	// commit subjects contain spaces freely.
+	out, err := git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)%00%(subject)", "refs/heads")
 	if err != nil {
 		return nil, err
 	}
-	tips := make(map[string]int64)
+	return parseBranchTips(out), nil
+}
+
+// parseBranchTips parses the NUL-fenced for-each-ref output (three fields per
+// line: short name, committer unix time, subject) into the tip map. Lines
+// missing a field or with an unparseable time are skipped; the NUL separator
+// keeps subjects — which contain spaces freely — intact.
+func parseBranchTips(out string) map[string]BranchTip {
+	tips := make(map[string]BranchTip)
 	for _, line := range strings.Split(out, "\n") {
-		name, ts, ok := strings.Cut(strings.TrimRight(line, "\r"), "\x00")
-		if !ok {
+		fields := strings.SplitN(strings.TrimRight(line, "\r"), "\x00", 3)
+		if len(fields) < 3 {
 			continue
 		}
-		if t, err := strconv.ParseInt(strings.TrimSpace(ts), 10, 64); err == nil {
-			tips[name] = t
+		name, ts, subject := fields[0], fields[1], fields[2]
+		t, err := strconv.ParseInt(strings.TrimSpace(ts), 10, 64)
+		if err != nil {
+			continue
+		}
+		tips[name] = BranchTip{Time: t, Subject: subject}
+	}
+	return tips
+}
+
+// AheadBehind reports how far a worktree's branch has diverged from the repo's
+// main branch: how many commits it carries that main lacks (ahead) and how many
+// main carries that it lacks (behind), via a symmetric difference against the
+// merge-base. It runs one `git rev-list --left-right --count <main>...HEAD` in
+// the worktree; git prints the left count (commits reachable from main but not
+// HEAD = behind) then the right count (reachable from HEAD but not main =
+// ahead), verified against git-rev-list's docs and a manual test.
+//
+// ok is false — divergence is simply unavailable — for the main worktree
+// itself, when mainBranch is empty (a detached primary tree), or on any git
+// error (e.g. an unborn branch with no commits to compare).
+func AheadBehind(wt Worktree, mainBranch string) (ahead, behind int, ok bool) {
+	if wt.IsMain || mainBranch == "" {
+		return 0, 0, false
+	}
+	out, err := git(wt.Path, "rev-list", "--left-right", "--count", mainBranch+"...HEAD")
+	if err != nil {
+		return 0, 0, false
+	}
+	behind, ahead, ok = parseAheadBehind(out)
+	return ahead, behind, ok
+}
+
+// parseAheadBehind parses the two whitespace-separated integers of `git
+// rev-list --left-right --count` output (left = behind, right = ahead). ok is
+// false when the line isn't the expected two-number shape.
+func parseAheadBehind(out string) (behind, ahead int, ok bool) {
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return 0, 0, false
+	}
+	b, err1 := strconv.Atoi(fields[0])
+	a, err2 := strconv.Atoi(fields[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return b, a, true
+}
+
+// UncommittedDiffstat sums the line changes a worktree carries against HEAD —
+// staged and unstaged together — via `git diff HEAD --shortstat`. Untracked
+// files are intentionally excluded: their mere existence is already reported by
+// the dirty flag, and shortstat can't count lines in a file git isn't tracking.
+// Only meaningful for dirty worktrees, so callers gate on that. Returns 0/0 for
+// a clean tree (empty shortstat output).
+func UncommittedDiffstat(wt Worktree) (added, deleted int, err error) {
+	out, err := git(wt.Path, "diff", "HEAD", "--shortstat")
+	if err != nil {
+		return 0, 0, err
+	}
+	added, deleted = parseShortstat(out)
+	return added, deleted, nil
+}
+
+// parseShortstat pulls the insertion and deletion counts out of a git
+// --shortstat line ("N files changed, N insertions(+), N deletions(-)"),
+// tolerating a missing insertions or deletions segment (git omits whichever is
+// zero) and empty input (0/0).
+func parseShortstat(out string) (added, deleted int) {
+	for _, seg := range strings.Split(strings.TrimSpace(out), ",") {
+		seg = strings.TrimSpace(seg)
+		switch {
+		case strings.Contains(seg, "insertion"):
+			added = leadingInt(seg)
+		case strings.Contains(seg, "deletion"):
+			deleted = leadingInt(seg)
 		}
 	}
-	return tips, nil
+	return added, deleted
+}
+
+// leadingInt returns the integer at the start of a shortstat segment like
+// "3 insertions(+)", or 0 when it doesn't start with a number.
+func leadingInt(seg string) int {
+	fields := strings.Fields(seg)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(fields[0])
+	return n
+}
+
+// FileStat is one file's change summary from `git diff --numstat`: its path and
+// the added/deleted line counts. Binary files carry no line counts (git prints
+// "-\t-" for them), so Add/Del stay 0 and Binary is set instead. A rename shows
+// up in Path in git's own "old => new" (or "{a => b}") shorthand, passed through
+// verbatim.
+type FileStat struct {
+	Path     string
+	Add, Del int
+	Binary   bool
+}
+
+// DiffAgainstBase returns the unified diff of everything the worktree's branch
+// carries beyond base, via `git diff <base>...HEAD` (three-dot: the branch tip
+// against its merge-base with base, so unrelated commits base landed since the
+// fork don't show up as reverse changes). An empty base — no primary-worktree
+// branch to compare against — yields an empty diff and no error, so the caller
+// simply omits the section.
+func DiffAgainstBase(wt Worktree, base string) (string, error) {
+	if base == "" {
+		return "", nil
+	}
+	return git(wt.Path, "diff", base+"...HEAD")
+}
+
+// DiffUncommitted returns the unified diff of the worktree's uncommitted work —
+// staged and unstaged together — via `git diff HEAD`. Untracked files are not
+// included (git diff never shows them); UntrackedFiles lists those separately.
+func DiffUncommitted(wt Worktree) (string, error) {
+	return git(wt.Path, "diff", "HEAD")
+}
+
+// NumstatAgainstBase returns the per-file change summary of everything the
+// branch carries beyond base, parsed from `git diff --numstat <base>...HEAD`. An
+// empty base yields no files and no error, mirroring DiffAgainstBase.
+func NumstatAgainstBase(wt Worktree, base string) ([]FileStat, error) {
+	if base == "" {
+		return nil, nil
+	}
+	out, err := git(wt.Path, "diff", "--numstat", base+"...HEAD")
+	if err != nil {
+		return nil, err
+	}
+	return parseNumstat(out), nil
+}
+
+// NumstatUncommitted returns the per-file change summary of the worktree's
+// uncommitted work (staged+unstaged vs HEAD), parsed from `git diff --numstat
+// HEAD`.
+func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
+	out, err := git(wt.Path, "diff", "--numstat", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	return parseNumstat(out), nil
+}
+
+// parseNumstat parses `git diff --numstat` output: one tab-separated record per
+// line ("added\tdeleted\tpath"). A binary file has "-" for both counts, which we
+// surface as Binary with zero counts. Malformed lines (fewer than three fields)
+// are skipped; the path is taken verbatim, so a rename's "old => new" shorthand
+// passes straight through.
+func parseNumstat(out string) []FileStat {
+	var stats []FileStat
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) < 3 {
+			continue
+		}
+		fs := FileStat{Path: fields[2]}
+		if fields[0] == "-" && fields[1] == "-" {
+			fs.Binary = true
+		} else {
+			fs.Add, _ = strconv.Atoi(fields[0])
+			fs.Del, _ = strconv.Atoi(fields[1])
+		}
+		stats = append(stats, fs)
+	}
+	return stats
+}
+
+// UntrackedFiles returns the worktree's untracked file paths — the "?? " entries
+// of `git status --porcelain`. They carry no diff body (git can't diff a file it
+// isn't tracking); the diff viewer lists them in its index so the branch's new
+// files aren't invisible.
+func UntrackedFiles(wt Worktree) ([]string, error) {
+	out, err := git(wt.Path, "status", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	return parseUntracked(out), nil
+}
+
+// parseUntracked pulls the untracked-file paths ("?? path" lines) out of `git
+// status --porcelain` output, dropping the "?? " prefix. Every other status
+// code (tracked modifications, staged changes) is ignored — those show up in the
+// diff body instead.
+func parseUntracked(out string) []string {
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, "?? ") {
+			paths = append(paths, strings.TrimPrefix(line, "?? "))
+		}
+	}
+	return paths
 }
 
 // worktreeNameForbidden lists the punctuation git forbids inside a ref name
