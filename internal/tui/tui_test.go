@@ -1745,19 +1745,19 @@ func TestAttentionSweepOnPidReuse(t *testing.T) {
 	}
 }
 
-// TestSessionHelpHint covers the one-line help hint shown beneath a session
-// until the user's first keystroke: it reserves a row, names the help and
+// TestSessionHelpHint covers the two-line help hint shown beneath a session
+// until the user's first keystroke: it reserves two rows, names the help and
 // pane keys, and is retired (row reclaimed) once a key reaches the session.
 func TestSessionHelpHint(t *testing.T) {
 	m := modelWithAgents(1)
 	m.screen = screenTerminal
 
-	// Fresh session: the hint reserves exactly one row of the viewport.
-	if got := m.sessionFooterH(); got != 1 {
-		t.Fatalf("fresh session should reserve one hint row, got %d", got)
+	// Fresh session: the hint reserves exactly two rows of the viewport.
+	if got := m.sessionFooterH(); got != 2 {
+		t.Fatalf("fresh session should reserve two hint rows, got %d", got)
 	}
-	if _, h := m.sessionSize(); h != m.height-barHeight-1 {
-		t.Errorf("session height should drop the hint row, got %d want %d", h, m.height-barHeight-1)
+	if _, h := m.sessionSize(); h != m.height-barHeight-2 {
+		t.Errorf("session height should drop the hint rows, got %d want %d", h, m.height-barHeight-2)
 	}
 
 	// On the terminal screen it leads with the help key and surfaces panelling.
@@ -1768,9 +1768,9 @@ func TestSessionHelpHint(t *testing.T) {
 		}
 	}
 
-	// appendSessionFooter adds exactly the reserved row while the hint is live.
+	// appendSessionFooter adds exactly the reserved rows while the hint is live.
 	body := "a\nb"
-	if got, want := strings.Count(m.appendSessionFooter(body), "\n"), strings.Count(body, "\n")+1; got != want {
+	if got, want := strings.Count(m.appendSessionFooter(body), "\n"), strings.Count(body, "\n")+2; got != want {
 		t.Errorf("appended footer newline count = %d, want %d", got, want)
 	}
 
