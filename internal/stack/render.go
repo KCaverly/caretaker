@@ -1,0 +1,83 @@
+package stack
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Render returns a compact, human-readable view of a StackStatus: one aligned
+// row per commit followed by a summary line carrying the next action. It is the
+// non-JSON output of `ct stack status`, meant to be skimmed in a terminal.
+func Render(st StackStatus) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "%s/%s  (%s..%s)\n", st.Repo, st.Worktree, st.MainBranch, st.Branch)
+	if !st.GitHub.Available {
+		b.WriteString("  github: unavailable — PR status omitted\n")
+		for _, w := range st.GitHub.Warnings {
+			fmt.Fprintf(&b, "    ! %s\n", w)
+		}
+	}
+
+	if len(st.Commits) == 0 {
+		b.WriteString("  (no commits ahead of main)\n")
+	}
+	for _, c := range st.Commits {
+		fmt.Fprintf(&b, "  %d %s %-7s %-12s %-6s %-8s %s\n",
+			c.Position,
+			glyph(c.State),
+			c.ShortSHA,
+			c.State,
+			prLabel(c.PR),
+			checksLabel(c.PR),
+			c.Subject,
+		)
+	}
+
+	fmt.Fprintf(&b, "  stack: %d commit(s), base_chain=%s, next=%s\n",
+		st.Stack.Size, okLabel(st.Stack.BaseChainOK), st.Stack.NextAction)
+	for _, o := range st.Stack.Orphans {
+		fmt.Fprintf(&b, "  orphan PR #%d (%s) head=%s\n", o.Number, o.URL, o.Head)
+	}
+	return b.String()
+}
+
+// glyph is the single-character status mark for a commit state: a check for
+// good/landed, a cross for problems, a dotted circle for in-flight/todo, an
+// ellipsis for "moved, needs a push".
+func glyph(s State) string {
+	switch s {
+	case StateOpen, StateMerged:
+		return "✓"
+	case StateClosed, StateDuplicateID:
+		return "✗"
+	case StateDiverged:
+		return "…"
+	default: // unsubmitted, unpushed, missing-pr
+		return "◌"
+	}
+}
+
+// prLabel renders a PR reference ("#123") or a dash when there is no PR.
+func prLabel(pr *PR) string {
+	if pr == nil {
+		return "-"
+	}
+	return fmt.Sprintf("#%d", pr.Number)
+}
+
+// checksLabel renders a PR's check summary, or a dash when there is no PR.
+func checksLabel(pr *PR) string {
+	if pr == nil {
+		return "-"
+	}
+	return pr.Checks.Summary
+}
+
+// okLabel renders a boolean as "ok"/"broken" for the base-chain summary.
+func okLabel(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "broken"
+}

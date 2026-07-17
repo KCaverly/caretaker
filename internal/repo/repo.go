@@ -65,7 +65,7 @@ func isGitRepo(path string) bool {
 
 // ListWorktrees returns the worktrees of r, with the primary worktree first.
 func ListWorktrees(r Repo) ([]Worktree, error) {
-	out, err := git(r.Path, "worktree", "list", "--porcelain")
+	out, err := Git(r.Path, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func parseWorktreeList(out string) []Worktree {
 // subprocess. Commit times come separately from BranchTips, which covers a
 // whole repo in a single call.
 func WorktreeStatus(wt Worktree) (Status, error) {
-	out, err := git(wt.Path, "status", "--porcelain")
+	out, err := Git(wt.Path, "status", "--porcelain")
 	if err != nil {
 		return Status{}, err
 	}
@@ -142,7 +142,7 @@ func BranchTips(r Repo) (map[string]BranchTip, error) {
 	// name or subject can contain (a raw NUL can't be passed as an exec
 	// argument). Two of them fence three fields; a NUL beats spaces here because
 	// commit subjects contain spaces freely.
-	out, err := git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)%00%(subject)", "refs/heads")
+	out, err := Git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)%00%(subject)", "refs/heads")
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ func AheadBehind(wt Worktree, mainBranch string) (ahead, behind int, ok bool) {
 	if wt.IsMain || mainBranch == "" {
 		return 0, 0, false
 	}
-	out, err := git(wt.Path, "rev-list", "--left-right", "--count", mainBranch+"...HEAD")
+	out, err := Git(wt.Path, "rev-list", "--left-right", "--count", mainBranch+"...HEAD")
 	if err != nil {
 		return 0, 0, false
 	}
@@ -216,7 +216,7 @@ func parseAheadBehind(out string) (behind, ahead int, ok bool) {
 // Only meaningful for dirty worktrees, so callers gate on that. Returns 0/0 for
 // a clean tree (empty shortstat output).
 func UncommittedDiffstat(wt Worktree) (added, deleted int, err error) {
-	out, err := git(wt.Path, "diff", "HEAD", "--shortstat")
+	out, err := Git(wt.Path, "diff", "HEAD", "--shortstat")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -273,14 +273,14 @@ func DiffAgainstBase(wt Worktree, base string) (string, error) {
 	if base == "" {
 		return "", nil
 	}
-	return git(wt.Path, "diff", base+"...HEAD")
+	return Git(wt.Path, "diff", base+"...HEAD")
 }
 
 // DiffUncommitted returns the unified diff of the worktree's uncommitted work —
 // staged and unstaged together — via `git diff HEAD`. Untracked files are not
 // included (git diff never shows them); UntrackedFiles lists those separately.
 func DiffUncommitted(wt Worktree) (string, error) {
-	return git(wt.Path, "diff", "HEAD")
+	return Git(wt.Path, "diff", "HEAD")
 }
 
 // NumstatAgainstBase returns the per-file change summary of everything the
@@ -290,7 +290,7 @@ func NumstatAgainstBase(wt Worktree, base string) ([]FileStat, error) {
 	if base == "" {
 		return nil, nil
 	}
-	out, err := git(wt.Path, "diff", "--numstat", base+"...HEAD")
+	out, err := Git(wt.Path, "diff", "--numstat", base+"...HEAD")
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +301,7 @@ func NumstatAgainstBase(wt Worktree, base string) ([]FileStat, error) {
 // uncommitted work (staged+unstaged vs HEAD), parsed from `git diff --numstat
 // HEAD`.
 func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
-	out, err := git(wt.Path, "diff", "--numstat", "HEAD")
+	out, err := Git(wt.Path, "diff", "--numstat", "HEAD")
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +341,7 @@ func parseNumstat(out string) []FileStat {
 // isn't tracking); the diff viewer lists them in its index so the branch's new
 // files aren't invisible.
 func UntrackedFiles(wt Worktree) ([]string, error) {
-	out, err := git(wt.Path, "status", "--porcelain")
+	out, err := Git(wt.Path, "status", "--porcelain")
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +430,7 @@ func CreateWorktree(r Repo, relPath, branch, baseRef string) (Worktree, error) {
 	if baseRef != "" {
 		args = append(args, baseRef)
 	}
-	if _, err := git(r.Path, args...); err != nil {
+	if _, err := Git(r.Path, args...); err != nil {
 		return Worktree{}, err
 	}
 	return Worktree{
@@ -449,11 +449,11 @@ func RemoveWorktree(r Repo, wt Worktree, deleteBranch bool) error {
 	}
 	// --force so removal works even when the worktree has uncommitted or
 	// untracked changes; the caller confirms this destructive action.
-	if _, err := git(r.Path, "worktree", "remove", "--force", wt.Path); err != nil {
+	if _, err := Git(r.Path, "worktree", "remove", "--force", wt.Path); err != nil {
 		return err
 	}
 	if deleteBranch && wt.Branch != "" {
-		if _, err := git(r.Path, "branch", "-D", wt.Branch); err != nil {
+		if _, err := Git(r.Path, "branch", "-D", wt.Branch); err != nil {
 			return err
 		}
 	}
@@ -466,9 +466,11 @@ func RemoveWorktree(r Repo, wt Worktree, deleteBranch bool) error {
 // refresh it belongs to) forever.
 const gitTimeout = 30 * time.Second
 
-// git runs a git command in dir and returns combined stdout, or an error that
-// includes stderr.
-func git(dir string, args ...string) (string, error) {
+// Git runs a git command in dir and returns combined stdout, or an error that
+// includes stderr. It is exported so sibling packages (e.g. internal/stack)
+// reuse the same 30s-timeout, stderr-wrapping runner instead of shelling out
+// their own way.
+func Git(dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)

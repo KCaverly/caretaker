@@ -22,7 +22,7 @@ func TestWorktreeLifecycle(t *testing.T) {
 
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		if _, err := git(dir, args...); err != nil {
+		if _, err := Git(dir, args...); err != nil {
 			t.Fatalf("git %v: %v", args, err)
 		}
 	}
@@ -115,7 +115,7 @@ func TestAheadBehindAndDiffstat(t *testing.T) {
 	}
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		if _, err := git(dir, args...); err != nil {
+		if _, err := Git(dir, args...); err != nil {
 			t.Fatalf("git %v: %v", args, err)
 		}
 	}
@@ -185,7 +185,7 @@ func TestRemoveWorktreeKeepsBranch(t *testing.T) {
 	}
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		if _, err := git(dir, args...); err != nil {
+		if _, err := Git(dir, args...); err != nil {
 			t.Fatalf("git %v: %v", args, err)
 		}
 	}
