@@ -1532,7 +1532,7 @@ func (m Model) renderFooter() string {
 }
 
 // sessionFooterH is the number of rows reserved beneath a session body for the
-// one-line help hint: one until the user's first keystroke into a session,
+// two-line help hint: two until the user's first keystroke into a session,
 // zero after (see hintSeen). It is intentionally screen-independent so the
 // reserved size is stable across every session view — sessionSize is queried
 // before the target screen is even set.
@@ -1540,7 +1540,7 @@ func (m Model) sessionFooterH() int {
 	if m.hintSeen {
 		return 0
 	}
-	return 1
+	return 2
 }
 
 // appendSessionFooter tacks the help hint onto a session body while it is still
@@ -1553,31 +1553,31 @@ func (m Model) appendSessionFooter(body string) string {
 	return body + "\n" + m.sessionFooter()
 }
 
-// sessionFooter builds the dim one-line hint shown beneath a session until the
-// user first types. It always leads with the help key (which opens the full
-// overlay) and, on the terminal screen, surfaces the pane-management keys the
-// hint mainly exists to teach. Trailing hints are dropped rather than wrapped
-// so the line always fits the single reserved row.
+// sessionFooter builds the dim two-line hint shown beneath a session until the
+// user first types. The help key gets its own row; the second row surfaces
+// navigation or pane-management keys. Trailing hints are dropped so each row
+// stays within the viewport.
 func (m Model) sessionFooter() string {
-	hints := []string{keyhint(m.keys.Help, "help")}
+	first := "  " + keyhint(m.keys.Help, "help")
+	var hints []string
 	if m.screen == screenTerminal {
-		hints = append(hints,
+		hints = []string{
 			keyhint(m.keys.TermSplitV+" "+m.keys.TermSplitH, "split"),
 			keyhint(m.keys.TermZoom, "zoom"),
-			keyhint(m.keys.TermClose, "close"))
+			keyhint(m.keys.TermClose, "close")}
 	} else {
-		hints = append(hints,
+		hints = []string{
 			keyhint(m.keys.Cycle, "cycle view"),
-			keyhint(m.keys.Picker, "deck"))
+			keyhint(m.keys.Picker, "deck")}
 	}
 	sep := helpStyle.Render("  ·  ")
 	for n := len(hints); n >= 1; n-- {
-		line := "  " + strings.Join(hints[:n], sep)
-		if lipgloss.Width(line) <= m.width {
-			return line
+		second := "  " + strings.Join(hints[:n], sep)
+		if lipgloss.Width(second) <= m.width {
+			return first + "\n" + second
 		}
 	}
-	return "  " + hints[0]
+	return first + "\n"
 }
 
 // footerContent builds the two-row footer (status line + help line) before
