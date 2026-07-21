@@ -135,7 +135,7 @@ func TestActiveRowNarrowWidth(t *testing.T) {
 	for _, innerW := range []int{1, 5, 10, 18, 24, 40} {
 		_ = m.activeRow(it, false, innerW)
 		_ = m.activeRow(it, true, innerW)
-		_ = activeDetail(it.view, innerW)
+		_ = activeDetail(it.view, "", innerW)
 	}
 	// At a comfortable width the long name still yields a full-width row with
 	// the cluster present.
@@ -206,7 +206,7 @@ func TestActiveDetailSegments(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := activeDetail(tc.view, 80)
+			out := activeDetail(tc.view, "", 80)
 			for _, want := range tc.want {
 				if !strings.Contains(out, want) {
 					t.Errorf("detail missing %q:\n%s", want, out)
@@ -221,14 +221,14 @@ func TestActiveDetailSegments(t *testing.T) {
 	}
 
 	// Every segment empty → no line at all.
-	if out := activeDetail(WorktreeView{}, 68); out != "" {
+	if out := activeDetail(WorktreeView{}, "", 68); out != "" {
 		t.Errorf("empty view should yield no detail line, got:\n%s", out)
 	}
 
 	// A long subject flexes: it is the truncated segment, the age survives.
 	long := WorktreeView{HasBase: true, Ahead: 2, CommitTime: now,
 		Subject: strings.Repeat("wide subject ", 20)}
-	out := activeDetail(long, 48)
+	out := activeDetail(long, "", 48)
 	if w := lipgloss.Width(out); w > 48 {
 		t.Errorf("detail with long subject overflows: width %d", w)
 	}

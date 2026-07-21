@@ -52,6 +52,9 @@ var (
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
 	errStyle     = lipgloss.NewStyle().Foreground(cRed)
+	// stackWaitStyle colours the deck's "checks pending" stack glyph (yellow),
+	// kept distinct from the ahead/behind hues it sits beside in the row cluster.
+	stackWaitStyle = lipgloss.NewStyle().Foreground(cYellow)
 
 	// Non-bold accent/purple foregrounds for the bar's volatile context
 	// segments (pane indicator, agent position) and the accent split divider.
@@ -113,6 +116,8 @@ func (m Model) View() tea.View {
 		body = m.renderUsage(h - barHeight)
 	case m.diffOpen:
 		body = m.renderDiff(h - barHeight)
+	case m.stackOpen:
+		body = m.renderStack(h - barHeight)
 	case m.screen == screenPicker && m.confirmActive():
 		// A destructive-confirm panel is modal over the deck, layered like the
 		// other overlays (help/board) so its own footer legend shows instead of
@@ -1203,7 +1208,8 @@ func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
 		lines = append(lines, m.activeRow(it, selected, innerW))
 		rowItem = append(rowItem, i)
 		if selected {
-			if detail := activeDetail(it.view, innerW); detail != "" {
+			stackSeg := m.stackDetailSeg(wsKey(it.repo.Name, it.view.WT.Name))
+			if detail := activeDetail(it.view, stackSeg, innerW); detail != "" {
 				lines = append(lines, detail)
 				rowItem = append(rowItem, -1)
 			}
@@ -1287,6 +1293,13 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 	// it is truncated so the cluster keeps its column at the row's right edge, on
 	// selected and unselected rows alike.
 	cluster, clusterW := stateCluster(it.view)
+	// Append the stack glyph (when the cache has one) after the ahead/behind
+	// cluster, widening the reserved column so the name math stays in step. With
+	// no cache entry the width is 0 and the row is byte-identical to before.
+	if gl, glW := m.stackGlyph(key); glW > 0 {
+		cluster = cluster + " " + gl
+		clusterW += 1 + glW
+	}
 	nameMax := max(1, innerW-activeRowPrefixW-clusterW-1)
 	name := truncateTo(it.view.WT.Name, nameMax)
 	gap := max(1, innerW-activeRowPrefixW-lipgloss.Width(name)-clusterW)
@@ -1341,7 +1354,7 @@ func stateCluster(v WorktreeView) (string, int) {
 // segment omitted when it doesn't apply, joined by " · ". The subject is the
 // segment that flexes: it is truncated so the whole line fits innerW. Returns ""
 // when every segment is empty, so activeDisplay drops the line entirely.
-func activeDetail(v WorktreeView, innerW int) string {
+func activeDetail(v WorktreeView, stackSeg string, innerW int) string {
 	const prefix = "      └ "
 
 	// head holds the segments left of the subject (divergence, diffstat); tail
@@ -1364,6 +1377,12 @@ func activeDetail(v WorktreeView, innerW int) string {
 	}
 	if v.CommitTime > 0 {
 		tail = append(tail, humanDur(time.Since(time.Unix(v.CommitTime, 0))))
+	}
+	// The stack segment (when the cache has one) sits right of the subject with
+	// the age; the subject budget below already accounts for the whole tail, and
+	// the final truncate keeps it graceful on narrow widths.
+	if stackSeg != "" {
+		tail = append(tail, stackSeg)
 	}
 
 	subject := ""
@@ -1550,6 +1569,7 @@ func (m Model) renderHelp(h int) string {
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
+		"  "+stackLegend(),
 		"",
 		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keys.Help)+
 			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
@@ -1575,6 +1595,17 @@ func markLegend() string {
 	return strings.Join([]string{
 		dirtyStyle.Render("✷") + helpStyle.Render(" uncommitted"),
 		recentStyle.Render("1 2 3") + helpStyle.Render(" recently opened"),
+	}, helpStyle.Render("   "))
+}
+
+// stackLegend explains the deck's per-worktree stack glyphs (drawn after the
+// ahead/behind cluster) shown once cached `ct stack status` data is available.
+func stackLegend() string {
+	return strings.Join([]string{
+		aheadStyle.Render("✓") + helpStyle.Render(" stack passing"),
+		stackWaitStyle.Render("…") + helpStyle.Render(" checks pending"),
+		errStyle.Render("⟳") + helpStyle.Render(" restack"),
+		errStyle.Render("!") + helpStyle.Render(" attention"),
 	}, helpStyle.Render("   "))
 }
 

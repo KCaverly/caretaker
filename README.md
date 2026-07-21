@@ -229,6 +229,45 @@ Press **`alt+p`** (anywhere) for the **command palette**: a fuzzy-searchable lis
 with its live key shown alongside, so you can run any action — and passively learn its chord —
 without memorizing the reserved keys; `enter` runs the selected row, `esc` closes.
 
+## Stacked PRs
+
+ct treats each commit on a worktree branch as its own GitHub PR, chained bottom-to-top and
+identified by a `ct-stack-id` commit trailer. The `ct stack` CLI drives the workflow from a
+worktree:
+
+- `ct stack status` — read-only reconciliation of local commits, last-fetched remote branches, and
+  PR state into a per-commit status plus a stack-level `next_action` hint (`--json` for the machine
+  form). It never mutates anything.
+- `ct stack submit` — the additive half: assigns ids to new commits, pushes branches, and creates or
+  updates PRs (retarget/retitle/nav-table) to match the local stack. `--dry-run` prints the plan.
+- `ct stack restack` — repairs a stack after its bottom PRs squash-land: drops the landed commits
+  from the local branch, deletes their remote branches, and re-submits the survivors. `--dry-run`
+  prints the plan; because it rewrites branches, run the plan first.
+
+### Stacked PRs in the TUI
+
+The deck surfaces stack state passively, without ever running a subprocess on the render path (a
+cache is refreshed after each deck load and on `r`, and cleanly shows nothing until data lands or
+when GitHub is unavailable):
+
+- **Deck glyph** — after a worktree row's `↑N ↓M` cluster: a red `⟳` when the stack needs a restack
+  (commits landed below), a green `✓` when every commit is open with checks passing, a yellow `…`
+  when any PR's checks are pending, and a red `!` for escalations (closed PR, duplicate id, broken
+  base chain). Nothing shows for an unsubmitted stack or when GitHub is unavailable — the row stays
+  exactly as it was.
+- **Detail line** — the selected worktree's expanded line gains a stack segment: a single-commit
+  stack reads `PR #42 open · checks ✓`; a multi-commit stack reads `stack 3 · 1 merged · next:
+  restack`.
+- **Command palette** — per active worktree: `stack status: <repo>/<wt>` (always), `restack:
+  <repo>/<wt>` (only when a restack is needed, hinted with the landed count), and `submit stack:
+  <repo>/<wt>` (only with submit-able work).
+
+All three verbs open a read-only, scrollable **stack overlay** titled `STACK <repo> / <wt>` showing
+the same output as `ct stack status`. `submit` runs directly (it is additive) and reports the fresh
+status back into the overlay. `restack` shows its **dry-run plan first** with an `enter run · esc
+cancel` footer — `enter` executes it for real, `esc` cancels without touching your branches. Inside
+the overlay, `j`/`k` scroll, `r` re-fetches, and `esc`/`q` close.
+
 ## Layout
 
 - `cmd/ct` — the `ct` entrypoint.

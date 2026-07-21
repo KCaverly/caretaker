@@ -24,6 +24,7 @@ import (
 	"github.com/KCaverly/caretaker/internal/plasma"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/stack"
 	"github.com/KCaverly/caretaker/internal/state"
 	"github.com/KCaverly/caretaker/internal/usage"
 )
@@ -322,6 +323,19 @@ type Model struct {
 	diffOpen bool
 	diffView diffState
 
+	// Stacked-PR surfacing. stackInfo caches each active worktree's `ct stack
+	// status` (keyed by wsKey) so the deck can draw a passive glyph/detail without
+	// ever running a subprocess on the render path; the stackFetch/Submit/Restack
+	// funcs are the pipeline entry points (= stack.Status/Submit/Restack), injected
+	// so tests stub them. stackView backs the read-only overlay; it is the zero
+	// value while closed.
+	stackInfo    map[string]stackEntry
+	stackFetch   func(stack.Params) (stack.StackStatus, error)
+	stackSubmit  func(stack.SubmitOptions) (stack.SubmitResult, error)
+	stackRestack func(stack.RestackOptions) (stack.RestackResult, error)
+	stackOpen    bool
+	stackView    stackView
+
 	// Codex exposes its stable conversation history in a transcript overlay.
 	// Caretaker tracks its default Ctrl+T toggle per hosted session so the wheel
 	// can drive that overlay without switching Codex into jittery raw mode.
@@ -474,6 +488,10 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		attention:       map[int]attnEntry{},
 		removed:         map[int]int64{},
 		codexTranscript: map[*session.Session]bool{},
+		stackInfo:       map[string]stackEntry{},
+		stackFetch:      stack.Status,
+		stackSubmit:     stack.Submit,
+		stackRestack:    stack.Restack,
 	}
 }
 
@@ -880,7 +898,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // over the picker screen) and the terminal is wide enough for the split.
 func (m Model) plasmaShown() bool {
 	return m.screen == screenPicker && !m.helpOpen && !m.boardOpen && !m.usageOpen &&
-		!m.paletteOpen && !m.diffOpen && m.plasmaWidth() > 0
+		!m.paletteOpen && !m.diffOpen && !m.stackOpen && m.plasmaWidth() > 0
 }
 
 // syncVisible pushes the currently visible session set to the manager.
@@ -900,7 +918,7 @@ func (m Model) visibleSessions() []*session.Session {
 	// m.diffOpen is redundant today (the diff only opens over the picker, which
 	// already returns nil), but it is listed so a future entry point that opens
 	// the diff over a session can't leak that session's output onto the screen.
-	if m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen || m.screen == screenPicker || m.screen == screenSetup {
+	if m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen || m.stackOpen || m.screen == screenPicker || m.screen == screenSetup {
 		return nil
 	}
 	if m.current == nil || m.current.ws == nil {
@@ -922,7 +940,7 @@ func (m Model) visibleSessions() []*session.Session {
 }
 
 func (m Model) overlayOpen() bool {
-	return m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen
+	return m.helpOpen || m.boardOpen || m.usageOpen || m.paletteOpen || m.diffOpen || m.stackOpen
 }
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -959,7 +977,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recomputeMatches()
 		m.recomputeActive()
 		m.computeRecentRanks()
-		return m, nil
+		// Refresh the deck's stack cache for the active worktrees, respecting the
+		// freshness window (the deck's `r` re-kicks with force).
+		return m, tea.Batch(m.kickStackFetches(false)...)
 
 	case createdMsg:
 		if msg.err != nil {
@@ -991,6 +1011,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.diffView.loading = false
 		buildDiffContent(&m.diffView, msg, m.width)
+		return m, nil
+
+	case stackStatusMsg:
+		m.applyStackStatus(msg)
+		return m, nil
+
+	case stackSubmitMsg:
+		m.applyStackSubmit(msg)
+		return m, nil
+
+	case stackRestackMsg:
+		m.applyStackRestack(msg)
 		return m, nil
 
 	case plasmaTickMsg:
@@ -1338,7 +1370,7 @@ func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 //     bracketed-paste mode.
 func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 	onSession := m.screen != screenPicker && m.screen != screenSetup &&
-		!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen
+		!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen && !m.stackOpen
 	if onSession {
 		if s := m.activeSession(); s != nil {
 			m = m.dismissHint() // first input into a session retires the hint
@@ -1346,9 +1378,9 @@ func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	// The diff viewer has no input field, so a paste is swallowed rather than
-	// routed to the deck filter (which stays focused across screens).
-	if m.diffOpen {
+	// The diff and stack overlays have no input field, so a paste is swallowed
+	// rather than routed to the deck filter (which stays focused across screens).
+	if m.diffOpen || m.stackOpen {
 		return m, nil
 	}
 	// The palette owns its input exclusively while open. Routing by focus here
@@ -1877,6 +1909,51 @@ func (m Model) paletteCommands() []paletteCmd {
 		})
 	}
 
+	// 1c. Stack verbs — one status row per stackable active worktree, plus a
+	// restack row when the cached rollup calls for one and a submit row when it
+	// carries submit-able work. Running a row opens the stack overlay and issues
+	// the matching pipeline call (submit runs directly; restack shows its dry-run
+	// plan first).
+	for _, it := range m.active {
+		p, ok := stackParams(it)
+		if !ok {
+			continue
+		}
+		key := wsKey(it.repo.Name, it.view.WT.Name)
+		repoName, wtName := it.repo.Name, it.view.WT.Name
+		cmds = append(cmds, paletteCmd{
+			title: "stack status: " + repoName + "/" + wtName,
+			run: func(m Model) (tea.Model, tea.Cmd) {
+				m = m.enterStackOverlay(key, repoName, wtName, p)
+				m.markStackLoading(key)
+				return m, m.fetchStackCmd(key, p)
+			},
+		})
+		e, cached := m.stackInfo[key]
+		if !cached || e.loading || e.err != nil {
+			continue
+		}
+		if e.status.Stack.NextAction == "restack" {
+			cmds = append(cmds, paletteCmd{
+				title: "restack: " + repoName + "/" + wtName,
+				hint:  stackRestackReason(e.status),
+				run: func(m Model) (tea.Model, tea.Cmd) {
+					m = m.enterStackOverlay(key, repoName, wtName, p)
+					return m, m.restackStackCmd(key, p, true)
+				},
+			})
+		}
+		if stackHasSubmitWork(e.status) {
+			cmds = append(cmds, paletteCmd{
+				title: "submit stack: " + repoName + "/" + wtName,
+				run: func(m Model) (tea.Model, tea.Cmd) {
+					m = m.enterStackOverlay(key, repoName, wtName, p)
+					return m, m.submitStackCmd(key, p)
+				},
+			})
+		}
+	}
+
 	// 2. Create a new worktree — one row per known repo. Runs from any screen by
 	// returning to the deck first, then entering the same create flow the deck's
 	// enter key uses.
@@ -1958,7 +2035,9 @@ func (m Model) paletteCommands() []paletteCmd {
 	}
 	cmds = append(cmds,
 		paletteCmd{title: "refresh deck", hint: "r", run: func(m Model) (tea.Model, tea.Cmd) {
-			return m, m.loadCmd()
+			cmds := m.kickStackFetches(true)
+			cmds = append(cmds, m.loadCmd())
+			return m, tea.Batch(cmds...)
 		}},
 		paletteCmd{title: "help", hint: m.keys.Help, run: func(m Model) (tea.Model, tea.Cmd) {
 			m.helpOpen = true
@@ -2456,6 +2535,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.diffOpen {
 		return m.handleDiff(msg)
 	}
+	// The stack overlay is modal and read-only like the usage overlay: it owns its
+	// own routing (scroll, refresh, the restack-plan confirm) while open and
+	// swallows every other key so none leaks beneath it.
+	if m.stackOpen {
+		return m.handleStack(msg)
+	}
 	// The usage overlay is modal like the board, but read-only: it only closes
 	// on esc or its own key, and swallows everything else so no keystroke
 	// leaks into the session underneath.
@@ -2848,7 +2933,7 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 		if m.paneZoomAt(mo.X, mo.Y) {
 			return m.toggleZoom()
 		}
-		if m.screen == screenPicker && !m.helpOpen && !m.paletteOpen && !m.diffOpen {
+		if m.screen == screenPicker && !m.helpOpen && !m.paletteOpen && !m.diffOpen && !m.stackOpen {
 			if mm, cmd, ok := m.deckClick(mo.X, mo.Y); ok {
 				return mm, cmd
 			}
@@ -3196,7 +3281,11 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "r":
 		m.status = ""
-		return m, m.loadCmd()
+		// Re-kick the stack cache too, ignoring the freshness window, so an
+		// explicit refresh reflects fresh gh/git state alongside the deck reload.
+		cmds := m.kickStackFetches(true)
+		cmds = append(cmds, m.loadCmd())
+		return m, tea.Batch(cmds...)
 	case "enter":
 		if it, ok := m.selectedActive(); ok {
 			return m.activate(it.repo.Name, it.view.WT.Name, it.view.WT.Path)
