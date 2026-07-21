@@ -1,22 +1,198 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/stack"
 	"github.com/KCaverly/caretaker/internal/tui"
 )
 
 func main() {
+	// The `stack` command group runs headless, before any TUI setup: it prints to
+	// stdout and exits, so it must not touch the Bubble Tea program or config.
+	if len(os.Args) > 1 && os.Args[1] == "stack" {
+		os.Exit(runStack(os.Args[2:]))
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ct:", err)
 		os.Exit(1)
 	}
+}
+
+// runStack dispatches the `ct stack …` subcommands and returns a process exit
+// code. Only usage/resolution errors are non-zero; a successfully computed
+// status exits 0 regardless of how troubled the stack is, because the state
+// lives in the output, not the exit code.
+func runStack(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ct stack status [--json] [--fetch] [-C <dir>]")
+		return 2
+	}
+	switch args[0] {
+	case "status":
+		return runStackStatus(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
+		fmt.Fprintln(os.Stderr, "usage: ct stack status [--json] [--fetch] [-C <dir>]")
+		return 2
+	}
+}
+
+// runStackStatus resolves the containing worktree (and its repo's primary tree,
+// for main_branch), computes the read-only stack status, and prints it as JSON or
+// a compact table.
+func runStackStatus(args []string) int {
+	var (
+		asJSON bool
+		fetch  bool
+		dir    string
+	)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--fetch":
+			fetch = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack status: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack status: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack status:", err)
+			return 1
+		}
+		dir = cwd
+	}
+
+	params, err := resolveStackParams(dir, fetch)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack status:", err)
+		return 1
+	}
+
+	st, err := stack.Status(params)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack status:", err)
+		return 1
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(st); err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack status:", err)
+			return 1
+		}
+	} else {
+		fmt.Print(stack.Render(st))
+	}
+	return 0
+}
+
+// resolveStackParams locates the git worktree containing dir, confirms it is a
+// linked (non-primary) worktree with a branch checked out, and derives the
+// primary worktree's branch as main_branch. It reuses repo.ListWorktrees rather
+// than re-parsing `git worktree list`, since that output is repo-global and
+// lists the primary tree first.
+func resolveStackParams(dir string, fetch bool) (stack.Params, error) {
+	toplevel, err := repo.Git(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return stack.Params{}, fmt.Errorf("not inside a git worktree: %w", err)
+	}
+	toplevel = trimLine(toplevel)
+
+	branch, err := repo.Git(dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return stack.Params{}, err
+	}
+	branch = trimLine(branch)
+	if branch == "HEAD" {
+		return stack.Params{}, fmt.Errorf("worktree at %s has a detached HEAD", toplevel)
+	}
+
+	wts, err := repo.ListWorktrees(repo.Repo{Path: toplevel})
+	if err != nil {
+		return stack.Params{}, err
+	}
+	if len(wts) == 0 {
+		return stack.Params{}, fmt.Errorf("could not list worktrees for %s", toplevel)
+	}
+	primary := wts[0]
+
+	cur := findWorktree(wts, toplevel, branch)
+	if cur == nil {
+		return stack.Params{}, fmt.Errorf("could not locate the worktree for %s among the repo's worktrees", toplevel)
+	}
+	if cur.IsMain {
+		return stack.Params{}, fmt.Errorf("stack status must be run from a linked worktree, not the primary tree %s", toplevel)
+	}
+
+	return stack.Params{
+		RepoName:     filepath.Base(primary.Path),
+		WorktreeName: cur.Name,
+		WorktreeDir:  cur.Path,
+		Branch:       cur.Branch,
+		MainBranch:   primary.Branch,
+		Fetch:        fetch,
+	}, nil
+}
+
+// findWorktree picks the worktree matching the current tree, preferring a path
+// match (symlinks resolved, since macOS /tmp is a symlink) and falling back to a
+// branch match in ct's one-branch-per-worktree model.
+func findWorktree(wts []repo.Worktree, toplevel, branch string) *repo.Worktree {
+	target := resolveSymlinks(toplevel)
+	for i := range wts {
+		if resolveSymlinks(wts[i].Path) == target {
+			return &wts[i]
+		}
+	}
+	for i := range wts {
+		if wts[i].Branch == branch {
+			return &wts[i]
+		}
+	}
+	return nil
+}
+
+// resolveSymlinks canonicalises a path for comparison, falling back to the input
+// when it can't be resolved (e.g. a path that no longer exists).
+func resolveSymlinks(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+// trimLine strips the trailing newline git appends to single-line command output.
+func trimLine(s string) string {
+	if len(s) > 0 && s[len(s)-1] == '\n' {
+		s = s[:len(s)-1]
+	}
+	if len(s) > 0 && s[len(s)-1] == '\r' {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 func run() error {
