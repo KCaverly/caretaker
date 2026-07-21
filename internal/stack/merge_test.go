@@ -40,3 +40,28 @@ func TestMergeArgsGuardsAndMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestPostMergeSettled(t *testing.T) {
+	commit := func(state State, number int, base, mergeable string) Commit {
+		return Commit{State: state, PR: &PR{Number: number, Base: base, Mergeable: mergeable}}
+	}
+	cases := []struct {
+		name    string
+		st      StackStatus
+		settled bool
+	}{
+		{"merge not reflected", StackStatus{MainBranch: "main", Commits: []Commit{commit(StateOpen, 10, "main", "MERGEABLE")}}, false},
+		{"old base still present", StackStatus{MainBranch: "main", Stack: Stack{BaseChainOK: false}, Commits: []Commit{commit(StateMerged, 10, "main", "UNKNOWN"), commit(StateOpen, 11, "old", "UNKNOWN")}}, false},
+		{"retargeted but calculating", StackStatus{MainBranch: "main", Stack: Stack{BaseChainOK: true}, Commits: []Commit{commit(StateMerged, 10, "main", "UNKNOWN"), commit(StateOpen, 11, "main", "UNKNOWN")}}, false},
+		{"next PR ready", StackStatus{MainBranch: "main", Stack: Stack{BaseChainOK: true}, Commits: []Commit{commit(StateMerged, 10, "main", "UNKNOWN"), commit(StateOpen, 11, "main", "MERGEABLE")}}, true},
+		{"next PR conflicting", StackStatus{MainBranch: "main", Stack: Stack{BaseChainOK: true}, Commits: []Commit{commit(StateMerged, 10, "main", "UNKNOWN"), commit(StateOpen, 11, "main", "CONFLICTING")}}, true},
+		{"fully landed", StackStatus{MainBranch: "main", Stack: Stack{BaseChainOK: true}, Commits: []Commit{commit(StateMerged, 10, "main", "UNKNOWN")}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := postMergeSettled(tc.st, 10); got != tc.settled {
+				t.Fatalf("postMergeSettled = %v, want %v", got, tc.settled)
+			}
+		})
+	}
+}

@@ -1,6 +1,14 @@
 package stack
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
+
+const (
+	postMergeSettleTimeout  = 12 * time.Second
+	postMergeSettleInterval = 500 * time.Millisecond
+)
 
 type MergeOptions struct{ Params Params }
 
@@ -32,9 +40,54 @@ func mergeArgs(st StackStatus) ([]string, error) {
 	return []string{"pr", "merge", fmt.Sprint(h.Number), "--squash", "--subject", h.Subject, "--body", h.Body}, nil
 }
 
-// Merge refreshes status, revalidates the target, squash-merges it, and refreshes
-// status again for callers. Branch cleanup is deliberately left to GitHub's
-// repository-level setting so dependent stacked PRs are retargeted atomically.
+// postMergeSettled reports whether GitHub has fully reflected a merge and, when
+// another PR remains, finished retargeting it and calculating mergeability.
+// Before that, reconciliation can briefly say restack (deleted old base), then
+// wait (UNKNOWN mergeability), even though no user action is required.
+func postMergeSettled(st StackStatus, mergedNumber int) bool {
+	reflected := false
+	for _, c := range st.Commits {
+		if c.State == StateMerged && c.PR != nil && c.PR.Number == mergedNumber {
+			reflected = true
+			break
+		}
+	}
+	if !reflected {
+		return false
+	}
+	bottom := bottomOpenPR(st.Commits)
+	if bottom == nil {
+		return true // the stack is fully landed; restack is the durable next step
+	}
+	if !st.Stack.BaseChainOK || bottom.Base != st.MainBranch {
+		return false
+	}
+	return bottom.Mergeable != "" && bottom.Mergeable != "UNKNOWN"
+}
+
+// settledStatus polls through GitHub's eventually-consistent post-merge window.
+// The caller keeps the TUI in its working state until this returns, preventing a
+// transient restack → wait → merge sequence from being presented as real work.
+func settledStatus(p Params, mergedNumber int) (StackStatus, error) {
+	deadline := time.Now().Add(postMergeSettleTimeout)
+	var latest StackStatus
+	for {
+		st, err := Status(p)
+		if err != nil {
+			return st, err
+		}
+		latest = st
+		if postMergeSettled(st, mergedNumber) || time.Now().After(deadline) {
+			return latest, nil
+		}
+		time.Sleep(postMergeSettleInterval)
+	}
+}
+
+// Merge refreshes status, revalidates the target, squash-merges it, then waits
+// for GitHub's dependent-PR retargeting to settle before returning status.
+// Branch cleanup is deliberately left to GitHub's repository-level setting so
+// dependent stacked PRs are retargeted atomically.
 func Merge(o MergeOptions) (MergeResult, error) {
 	p := o.Params
 	p.Fetch = true
@@ -51,6 +104,6 @@ func Merge(o MergeOptions) (MergeResult, error) {
 		return res, fmt.Errorf("merging PR #%d: %w", st.MergeHint.Number, err)
 	}
 	res.Executed = append(res.Executed, fmt.Sprintf("merged PR #%d (squash)", st.MergeHint.Number))
-	res.Status, err = Status(o.Params)
+	res.Status, err = settledStatus(o.Params, st.MergeHint.Number)
 	return res, err
 }

@@ -246,7 +246,9 @@ worktree:
 - `ct stack merge` — squash-merges the bottom PR with its original commit message. It leaves branch
   cleanup to GitHub's repository setting so dependent stacked PRs are retargeted before the merged
   head branch is deleted. It re-fetches immediately before merging and refuses unless GitHub
-  reports `MERGEABLE` and the PR targets the repository's main branch.
+  reports `MERGEABLE` and the PR targets the repository's main branch. After merging, it waits
+  through GitHub's brief retargeting and mergeability-calculation window before publishing the next
+  stack status, so transient `restack`/`wait` states do not flash in the UI.
 
 ### Stacked PRs in the TUI
 
