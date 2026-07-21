@@ -151,8 +151,8 @@ worktree shows on the right.
   back to git commit time for ones you haven't opened yet. The three most-recently-opened
   worktrees overall get a `1`/`2`/`3` rank in the left column. Each row also shows how far its
   branch is ahead/behind the repo's main branch (`↑N ↓M`, right-aligned), and the selected row
-  expands a `└` detail line with the divergence, uncommitted diffstat, last commit subject, and
-  age. Last-opened times are persisted to
+  expands a `└` detail line with new context only: uncommitted diffstat, last commit subject, age,
+  and (when available) pull-request state. Last-opened times are persisted to
   `$XDG_STATE_HOME/ct/state.json` (default `~/.local/state/ct/state.json`).
 - Pressing **enter** on a worktree **activates** it: ct starts nvim + an agent from
   `agents.default` + a terminal in that worktree and drops you into the nvim view. The session
@@ -256,8 +256,8 @@ when GitHub is unavailable):
   base chain). Nothing shows for an unsubmitted stack or when GitHub is unavailable — the row stays
   exactly as it was.
 - **Detail line** — the selected worktree's expanded line gains a stack segment: a single-commit
-  stack reads `PR #42 open · checks ✓`; a multi-commit stack reads `stack 3 · 1 merged · next:
-  restack`.
+  stack reads `PR #42 open · checks ✓`; larger stacks skip the redundant size and state the useful
+  outcome directly, such as `1 merged · restack needed` or `waiting on checks`.
 - **Command palette** — per active worktree: `stack status: <repo>/<wt>` (always), `restack:
   <repo>/<wt>` (only when a restack is needed, hinted with the landed count), and `submit stack:
   <repo>/<wt>` (only with submit-able work).

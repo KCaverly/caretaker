@@ -154,12 +154,12 @@ func TestStackDetailSegment(t *testing.T) {
 		t.Errorf("single: want %q, got %q", want, got)
 	}
 
-	// Multi-commit stack rolls up size, merged count, and next action.
+	// Multi-commit stack omits the redundant size and states the useful outcome.
 	multi := statusWith(
 		stack.Stack{Size: 3, BaseChainOK: true, NextAction: "restack",
 			Counts: map[stack.State]int{stack.StateMerged: 1, stack.StateOpen: 2}},
 		stack.Commit{State: stack.StateMerged}, openPR(2, "passing"), openPR(3, "passing"))
-	if got, want := stackDetailSegment(multi), "stack 3 · 1 merged · next: restack"; got != want {
+	if got, want := stackDetailSegment(multi), "1 merged · restack needed"; got != want {
 		t.Errorf("multi: want %q, got %q", want, got)
 	}
 

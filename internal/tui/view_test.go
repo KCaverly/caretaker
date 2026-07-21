@@ -148,10 +148,9 @@ func TestActiveRowNarrowWidth(t *testing.T) {
 	}
 }
 
-// TestActiveDetailSegments checks the └ line's content: divergence spelled
-// out, the uncommitted diffstat, the quoted subject, and the age — each
-// omitted when not applicable, and the whole line dropped when every segment
-// is empty.
+// TestActiveDetailSegments checks that the └ line adds context not already
+// visible in the row: the uncommitted diffstat, quoted subject, and age. Branch
+// divergence stays exclusively in the row's ↑N/↓N cluster.
 func TestActiveDetailSegments(t *testing.T) {
 	now := time.Now().Add(-2 * time.Hour).Unix()
 	cases := []struct {
@@ -164,26 +163,14 @@ func TestActiveDetailSegments(t *testing.T) {
 			"full",
 			WorktreeView{HasBase: true, Ahead: 2, Dirty: true, Add: 614, Del: 12,
 				Subject: "Add plasma panel", CommitTime: now},
-			[]string{"└", "2 ahead", "+614 −12 uncommitted", `"Add plasma panel"`, "2h00m"},
-			[]string{"behind"},
+			[]string{"└", "+614 −12 uncommitted", `"Add plasma panel"`, "2h00m"},
+			[]string{"ahead", "behind"},
 		},
 		{
-			"diverged spells both",
+			"divergence omitted",
 			WorktreeView{HasBase: true, Ahead: 2, Behind: 3},
-			[]string{"2 ahead, 3 behind"},
 			nil,
-		},
-		{
-			"behind only",
-			WorktreeView{HasBase: true, Behind: 3},
-			[]string{"3 behind"},
-			[]string{"ahead"},
-		},
-		{
-			"level branch says no commits yet",
-			WorktreeView{HasBase: true},
-			[]string{"no commits yet"},
-			nil,
+			[]string{"ahead", "behind"},
 		},
 		{
 			"no base omits divergence entirely",
@@ -194,14 +181,14 @@ func TestActiveDetailSegments(t *testing.T) {
 		{
 			"clean tree omits diffstat",
 			WorktreeView{HasBase: true, Ahead: 1, Dirty: false, Add: 9, Del: 9},
-			[]string{"1 ahead"},
-			[]string{"uncommitted"},
+			nil,
+			[]string{"ahead", "uncommitted"},
 		},
 		{
 			"dirty with zero lines omits diffstat",
 			WorktreeView{HasBase: true, Ahead: 1, Dirty: true},
-			[]string{"1 ahead"},
-			[]string{"uncommitted"},
+			nil,
+			[]string{"ahead", "uncommitted"},
 		},
 	}
 	for _, tc := range cases {
@@ -247,6 +234,7 @@ func TestActiveDisplayDetailLine(t *testing.T) {
 	// detail line has content.
 	m.active[0].view.HasBase = true
 	m.active[0].view.Ahead = 2
+	m.active[0].view.Subject = "Add login flow"
 
 	// Focus elsewhere: no detail line anywhere.
 	m.focus = focusNew
@@ -268,7 +256,7 @@ func TestActiveDisplayDetailLine(t *testing.T) {
 	if rowItem[1] != 0 || rowItem[2] != -1 {
 		t.Fatalf("detail line should follow the cursor row with rowItem -1, got %v", rowItem)
 	}
-	if !strings.Contains(display[2], "└") || !strings.Contains(display[2], "2 ahead") {
+	if !strings.Contains(display[2], "└") || !strings.Contains(display[2], `"Add login flow"`) || strings.Contains(display[2], "ahead") {
 		t.Errorf("detail line content wrong:\n%s", display[2])
 	}
 	// No second detail line anywhere else.

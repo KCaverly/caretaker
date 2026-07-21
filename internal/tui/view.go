@@ -1349,29 +1349,18 @@ func stateCluster(v WorktreeView) (string, int) {
 }
 
 // activeDetail builds the dim "└" line shown directly beneath the focused
-// worktree row: the branch's divergence from main spelled out, its uncommitted
-// diffstat, the last-commit subject (in quotes), and the tip's age — each
-// segment omitted when it doesn't apply, joined by " · ". The subject is the
-// segment that flexes: it is truncated so the whole line fits innerW. Returns ""
-// when every segment is empty, so activeDisplay drops the line entirely.
+// worktree row. Branch divergence already lives in the row's compact ↑N/↓N
+// cluster, so the detail line only reveals new context: uncommitted diffstat,
+// the last-commit subject (in quotes), its age, and stack state. Each segment is
+// omitted when it doesn't apply and joined by " · ". The subject is the segment
+// that flexes: it is truncated so the whole line fits innerW. Returns "" when
+// every segment is empty, so activeDisplay drops the line entirely.
 func activeDetail(v WorktreeView, stackSeg string, innerW int) string {
 	const prefix = "      └ "
 
-	// head holds the segments left of the subject (divergence, diffstat); tail
+	// head holds the segments left of the subject (diffstat); tail
 	// holds those to its right (age). The subject slots between them.
 	var head, tail []string
-	if v.HasBase {
-		switch {
-		case v.Ahead > 0 && v.Behind > 0:
-			head = append(head, fmt.Sprintf("%d ahead, %d behind", v.Ahead, v.Behind))
-		case v.Ahead > 0:
-			head = append(head, fmt.Sprintf("%d ahead", v.Ahead))
-		case v.Behind > 0:
-			head = append(head, fmt.Sprintf("%d behind", v.Behind))
-		default:
-			head = append(head, "no commits yet")
-		}
-	}
 	if v.Dirty && v.Add+v.Del > 0 {
 		head = append(head, fmt.Sprintf("+%d −%d uncommitted", v.Add, v.Del))
 	}

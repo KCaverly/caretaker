@@ -359,9 +359,10 @@ func TestDeckClickDetailLineMisses(t *testing.T) {
 	m := sampleModel()
 	m.focus = focusActive
 	m.activeCursor = 0
-	// Give the cursor row work-state so its detail line actually renders.
+	// Give the cursor row genuine detail context so its detail line renders.
 	m.active[0].view.HasBase = true
 	m.active[0].view.Ahead = 2
+	m.active[0].view.Subject = "Add login flow"
 
 	L := m.deckLayout(m.height - barHeight)
 	display, rowItem := m.activeDisplay(m.width - 4)

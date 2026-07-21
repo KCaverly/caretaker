@@ -779,9 +779,9 @@ func (m Model) stackDetailSeg(key string) string {
 	return stackDetailSegment(e.status)
 }
 
-// stackDetailSegment spells out the stack facts for the detail line: a
-// single-commit stack reads "PR #42 open · checks ✓" (or its next action when it
-// has no PR yet); a multi-commit stack reads "stack 3 · 1 merged · next: restack".
+// stackDetailSegment spells out the useful stack outcome for the detail line.
+// A single-commit stack names its PR; larger stacks omit the redundant size and
+// translate the workflow's machine-facing next action into a short human state.
 // It returns "" when GitHub is unavailable or the stack is empty/unsubmitted, so
 // the deck stays byte-identical without data.
 func stackDetailSegment(st stack.StackStatus) string {
@@ -797,14 +797,36 @@ func stackDetailSegment(st stack.StackStatus) string {
 		if c.PR != nil {
 			return fmt.Sprintf("PR #%d %s · checks %s", c.PR.Number, c.State, checksMark(c.PR.Checks.Summary))
 		}
-		return "stack 1 · next: " + stk.NextAction
+		return stackActionLabel(stk.NextAction)
 	}
-	seg := fmt.Sprintf("stack %d", stk.Size)
+	var seg string
 	if merged := stk.Counts[stack.StateMerged]; merged > 0 {
-		seg += fmt.Sprintf(" · %d merged", merged)
+		seg = fmt.Sprintf("%d merged", merged)
 	}
-	seg += " · next: " + stk.NextAction
-	return seg
+	action := stackActionLabel(stk.NextAction)
+	if seg != "" && action != "" {
+		return seg + " · " + action
+	}
+	return seg + action
+}
+
+func stackActionLabel(action string) string {
+	switch action {
+	case "merge":
+		return "ready to merge"
+	case "wait":
+		return "waiting on checks"
+	case "restack":
+		return "restack needed"
+	case "submit":
+		return "submit needed"
+	case "escalate":
+		return "needs attention"
+	case "archive":
+		return "ready to archive"
+	default:
+		return action
+	}
 }
 
 // checksMark renders a check summary as a compact glyph for the detail line.
