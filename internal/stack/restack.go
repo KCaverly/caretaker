@@ -106,8 +106,9 @@ func rebaseOntoArgs(newBase, upstream, branch string) []string {
 }
 
 // pushDeleteArgs builds the argv to delete a landed remote branch. GitHub deletes
-// it automatically on a squash merge with --delete-branch, so this is a best-
-// effort cleanup whose "remote ref does not exist" is tolerated by the caller.
+// GitHub's repository-level cleanup may already have removed it after a squash
+// merge, so this is a best-effort cleanup whose "remote ref does not exist" is
+// tolerated by the caller.
 func pushDeleteArgs(branch string) []string {
 	return []string{"push", "origin", "--delete", branch}
 }
@@ -228,7 +229,7 @@ func fastForwardMain(dir, mainBranch string) error {
 }
 
 // deleteRemoteBranch deletes a landed remote branch, tolerating the case where
-// GitHub's --delete-branch already removed it (a squash merge does this). Any
+// GitHub's repository-level branch cleanup already removed it. Any
 // other push error is fatal.
 func deleteRemoteBranch(dir, branch string) error {
 	_, err := repo.Git(dir, pushDeleteArgs(branch)...)

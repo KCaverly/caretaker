@@ -39,7 +39,7 @@ func TestRestackIntegration(t *testing.T) {
 
 	// Squash-land A: a squash-equivalent A′ carrying A's message+trailer is
 	// committed onto main in a clone and pushed, then A's remote branch is deleted
-	// (as a squash merge with --delete-branch would do).
+	// (as GitHub's post-merge branch cleanup would do).
 	squashLand(t, h, "A\n\nct-stack-id: aaaaaaaa", "landed-a")
 	if err := deleteRemoteBranch(h.dir, "ct/feat/aaaaaaaa"); err != nil {
 		t.Fatalf("deleting landed branch: %v", err)

@@ -40,7 +40,7 @@ func Render(st StackStatus) string {
 		fmt.Fprintf(&b, "  orphan PR #%d (%s) head=%s\n", o.Number, o.URL, o.Head)
 	}
 	if h := st.MergeHint; h != nil {
-		fmt.Fprintf(&b, "  merge: gh pr merge %d --squash --delete-branch --subject %q --body %q\n",
+		fmt.Fprintf(&b, "  merge: gh pr merge %d --squash --subject %q --body %q\n",
 			h.Number, h.Subject, h.Body)
 	}
 	return b.String()
