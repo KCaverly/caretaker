@@ -100,6 +100,15 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: true,
 		},
 		{
+			name:        "open: conflicting PR -> resolve conflicts",
+			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
+			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
+			prs:         []prRecord{prm(1, "OPEN", br("aaaaaaaa"), main, "APPROVED", "passing", "CONFLICTING")},
+			wantStates:  []State{StateOpen},
+			wantAction:  "resolve-conflicts",
+			wantChainOK: true,
+		},
+		{
 			name:        "merged: PR merged but commit still local -> restack",
 			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
 			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
@@ -270,7 +279,7 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: true,
 		},
 		{
-			name: "cascade blocked: merged prefix + CONFLICTING bottom open -> restack",
+			name: "cascade blocked: merged prefix + CONFLICTING bottom open -> resolve conflicts",
 			commits: []LocalCommit{
 				commit("aaaaaaa1111", "aaaaaaaa", "one"),
 				commit("bbbbbbb2222", "bbbbbbbb", "two"),
@@ -281,7 +290,7 @@ func TestReconcile(t *testing.T) {
 				prm(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "passing", "CONFLICTING"),
 			},
 			wantStates:  []State{StateMerged, StateOpen},
-			wantAction:  "restack",
+			wantAction:  "resolve-conflicts",
 			wantChainOK: true,
 		},
 		{

@@ -1933,7 +1933,7 @@ func (m Model) paletteCommands() []paletteCmd {
 		if !cached || e.loading || e.err != nil {
 			continue
 		}
-		if e.status.Stack.NextAction == "restack" {
+		if stackCanRestack(e.status) {
 			cmds = append(cmds, paletteCmd{
 				title: "restack: " + repoName + "/" + wtName,
 				hint:  stackRestackReason(e.status),

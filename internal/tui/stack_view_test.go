@@ -85,6 +85,14 @@ func TestDeckStackGlyph(t *testing.T) {
 			glyph: "…",
 		},
 		{
+			name: "conflicting PR needs attention",
+			st: statusWith(
+				stack.Stack{Size: 1, BaseChainOK: true, NextAction: "resolve-conflicts",
+					Counts: map[stack.State]int{stack.StateOpen: 1}},
+				stack.Commit{State: stack.StateOpen, PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING"}}),
+			glyph: "!",
+		},
+		{
 			name: "closed PR escalates",
 			st: statusWith(
 				stack.Stack{Size: 1, BaseChainOK: true, NextAction: "escalate",
@@ -143,6 +151,51 @@ func TestDeckStackGlyph(t *testing.T) {
 	}
 }
 
+func TestStackCommitRowShowsConflicts(t *testing.T) {
+	m, _ := stackModel()
+	c := stack.Commit{State: stack.StateOpen, Subject: "conflicting change",
+		PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING", Checks: stack.Checks{Summary: "passing"}}}
+
+	for _, selected := range []bool{false, true} {
+		row := m.stackCommitRow(c, selected, 60)
+		if !strings.Contains(row, "PR #10 · conflicts") {
+			t.Errorf("selected=%v: conflict missing from row:\n%s", selected, row)
+		}
+		if strings.Contains(row, "checks") {
+			t.Errorf("selected=%v: checks should not obscure conflict:\n%s", selected, row)
+		}
+	}
+	if glyph := glyphFor(c); !strings.Contains(glyph, "✗") {
+		t.Errorf("conflicting PR should use the error glyph, got %q", glyph)
+	}
+}
+
+func TestConflictingCascadeOffersRestackHotkey(t *testing.T) {
+	m, key := stackModel()
+	st := statusWith(
+		stack.Stack{Size: 2, BaseChainOK: true, NextAction: "resolve-conflicts",
+			Counts: map[stack.State]int{stack.StateMerged: 1, stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateMerged, Subject: "landed"},
+		stack.Commit{State: stack.StateOpen, Subject: "conflicting",
+			PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING"}})
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{})
+	m.stackView.working = false
+	m.stackView.status = &st
+
+	out := m.renderStack(m.height - barHeight)
+	if !strings.Contains(out, "R") || !strings.Contains(out, "restack") {
+		t.Errorf("conflicting cascade should advertise the restack hotkey:\n%s", out)
+	}
+
+	m.stackRestack = func(stack.RestackOptions) (stack.RestackResult, error) {
+		return stack.RestackResult{}, nil
+	}
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	if !mm.(Model).stackView.working || cmd == nil {
+		t.Fatal("R should start the restack dry-run for a conflicting cascade")
+	}
+}
+
 func TestStackDetailSegment(t *testing.T) {
 	// Single-commit stack reads the PR number, state, and a check glyph.
 	single := statusWith(
@@ -161,6 +214,15 @@ func TestStackDetailSegment(t *testing.T) {
 		stack.Commit{State: stack.StateMerged}, openPR(2, "passing"), openPR(3, "passing"))
 	if got, want := stackDetailSegment(multi), "1 merged · restack needed"; got != want {
 		t.Errorf("multi: want %q, got %q", want, got)
+	}
+
+	conflict := statusWith(
+		stack.Stack{Size: 2, BaseChainOK: true, NextAction: "resolve-conflicts",
+			Counts: map[stack.State]int{stack.StateOpen: 2}},
+		openPR(9, "passing"),
+		stack.Commit{State: stack.StateOpen, PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING"}})
+	if got, want := stackDetailSegment(conflict), "resolve conflicts"; got != want {
+		t.Errorf("conflict: want %q, got %q", want, got)
 	}
 
 	// No segment without GitHub data.
@@ -256,8 +318,8 @@ func TestStackCacheKickAndFreshness(t *testing.T) {
 }
 
 // TestStackPaletteRows checks the verb rows appear and disappear with cached
-// state: status is always offered, restack only when the rollup calls for it, and
-// submit only when there is submit-able work.
+// state: status is always offered, restack when the rollup calls for it or a
+// landed-prefix conflict can be rebased, and submit only with submit-able work.
 func TestStackPaletteRows(t *testing.T) {
 	has := func(m Model, prefix string) bool {
 		for _, c := range m.paletteCommands() {
@@ -287,6 +349,27 @@ func TestStackPaletteRows(t *testing.T) {
 	}
 	if has(m, "submit stack: repo/wt") {
 		t.Error("submit row should be absent with no submit-able work")
+	}
+
+	// A conflicting cascade can use the same restack pipeline: drop the landed
+	// prefix and rebase the survivor onto current main.
+	m.stackInfo[key] = stackEntry{status: statusWith(
+		stack.Stack{Size: 2, BaseChainOK: true, NextAction: "resolve-conflicts",
+			Counts: map[stack.State]int{stack.StateMerged: 1, stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateMerged},
+		stack.Commit{State: stack.StateOpen, PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING"}}), fetchedAt: time.Now()}
+	if !has(m, "restack: repo/wt") {
+		t.Error("restack row should appear for a conflicting cascade")
+	}
+
+	// Without a landed prefix, restack has nothing to drop and must not be
+	// advertised as a recovery action.
+	m.stackInfo[key] = stackEntry{status: statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "resolve-conflicts",
+			Counts: map[stack.State]int{stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateOpen, PR: &stack.PR{Number: 10, Mergeable: "CONFLICTING"}}), fetchedAt: time.Now()}
+	if has(m, "restack: repo/wt") {
+		t.Error("restack row should stay hidden for a conflict without a landed prefix")
 	}
 
 	// Submit-able cache: submit row appears, restack does not.

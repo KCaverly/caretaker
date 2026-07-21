@@ -355,6 +355,9 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// Restack, dry-run first: the plan lands as a text body and arms the
 		// confirm state, exactly as the palette's restack row does.
 		if sv.status != nil && !sv.working {
+			if !stackCanRestack(*sv.status) {
+				return m, m.flashCmd("nothing to restack")
+			}
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
 			return m, m.restackStackCmd(sv.key, sv.params, true)
@@ -560,7 +563,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	if stackHasSubmitWork(st) {
 		parts = append(parts, keyhint("s", "submit"))
 	}
-	if st.Stack.NextAction == "restack" {
+	if stackCanRestack(st) {
 		parts = append(parts, keyhint("R", "restack"))
 	}
 	parts = append(parts, keyhint("v", "diff"), keyhint("o", "open PR"),
@@ -598,8 +601,11 @@ func (m Model) stackCommitRow(c stack.Commit, selected bool, innerW int) string 
 // glyphFor returns the styled single-glyph state marker for a commit list row: a
 // green ✓ for a landed/open PR (a dim ○ when that PR is a draft), a dim ○ for
 // work not yet in review, a yellow … for a diverged commit, and a red ✗ for a
-// closed or duplicate-id escalation.
+// conflicting PR, closed PR, or duplicate-id escalation.
 func glyphFor(c stack.Commit) string {
+	if c.PR != nil && c.PR.Mergeable == "CONFLICTING" {
+		return errStyle.Render("✗")
+	}
 	switch c.State {
 	case stack.StateMerged, stack.StateOpen:
 		if c.PR != nil && c.PR.Draft {
@@ -624,6 +630,9 @@ func facts(c stack.Commit) string {
 		return dimStyle.Render(factsPlain(c))
 	}
 	base := fmt.Sprintf("PR #%d %s", c.PR.Number, prWord(c))
+	if c.PR.Mergeable == "CONFLICTING" {
+		return errStyle.Render(fmt.Sprintf("PR #%d · conflicts", c.PR.Number))
+	}
 	switch c.State {
 	case stack.StateMerged:
 		return dimStyle.Render(base + " · landed")
@@ -653,6 +662,9 @@ func factsPlain(c stack.Commit) string {
 		}
 	}
 	base := fmt.Sprintf("PR #%d %s", c.PR.Number, prWord(c))
+	if c.PR.Mergeable == "CONFLICTING" {
+		return fmt.Sprintf("PR #%d · conflicts", c.PR.Number)
+	}
 	switch c.State {
 	case stack.StateMerged:
 		return base + " · landed"
@@ -739,7 +751,8 @@ func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 		return "", lipgloss.Style{}, false
 	}
 	if stk.Counts[stack.StateClosed] > 0 || stk.Counts[stack.StateDuplicateID] > 0 ||
-		len(stk.Orphans) > 0 || !stk.BaseChainOK || stk.NextAction == "escalate" {
+		len(stk.Orphans) > 0 || !stk.BaseChainOK || stk.NextAction == "escalate" ||
+		stk.NextAction == "resolve-conflicts" {
 		return "!", errStyle, true
 	}
 	if stk.NextAction == "restack" {
@@ -818,6 +831,8 @@ func stackActionLabel(action string) string {
 		return "waiting on checks"
 	case "restack":
 		return "restack needed"
+	case "resolve-conflicts":
+		return "resolve conflicts"
 	case "submit":
 		return "submit needed"
 	case "escalate":
@@ -851,6 +866,17 @@ func checksMark(summary string) string {
 func stackHasSubmitWork(st stack.StackStatus) bool {
 	c := st.Stack.Counts
 	return c[stack.StateUnsubmitted]+c[stack.StateUnpushed]+c[stack.StateDiverged]+c[stack.StateMissingPR] > 0
+}
+
+// stackCanRestack reports when the restack pipeline has a landed prefix to drop
+// and rebase away. A conflict is restackable only in that cascade shape; an
+// ordinary conflicting PR has no landed prefix, so restack would be a no-op.
+func stackCanRestack(st stack.StackStatus) bool {
+	if st.Stack.NextAction == "restack" {
+		return true
+	}
+	return st.Stack.NextAction == "resolve-conflicts" &&
+		st.Stack.Counts[stack.StateMerged] > 0
 }
 
 // stackRestackReason is the palette hint on the "restack" row: how many landed

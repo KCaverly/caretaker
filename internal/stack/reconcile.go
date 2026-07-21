@@ -224,15 +224,16 @@ func countStates(commits []Commit) map[State]int {
 // cascade-merge-aware priority order:
 //
 //  1. escalate — closed PR, duplicate-id, orphan, or a non-contiguous merged prefix
-//  2. merge    — the bottom open PR is independently landable (the cascade: this
+//  2. resolve-conflicts — the bottom open PR conflicts with its base
+//  3. merge    — the bottom open PR is independently landable (the cascade: this
 //     fires even when landed-local commits sit below it)
-//  3. restack  — landed-local commits exist and the cascade is blocked
-//  4. submit   — an unsubmitted/unpushed/diverged/missing-pr commit or a broken
+//  4. restack  — landed-local commits exist and the cascade is blocked
+//  5. submit   — an unsubmitted/unpushed/diverged/missing-pr commit or a broken
 //     base chain, with no landed-local commit involved
-//  5. fix-ci   — bottom open PR failing (no landed-local commits)
-//  6. wait     — bottom open PR pending, or passing but review outstanding
-//  7. archive  — empty stack with a landed ct/<wt>/ PR
-//  8. clean
+//  6. fix-ci   — bottom open PR failing (no landed-local commits)
+//  7. wait     — bottom open PR pending, or passing but review outstanding
+//  8. archive  — empty stack with a landed ct/<wt>/ PR
+//  9. clean
 func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) string {
 	var hasClosed, hasDup, hasMerged, hasSubmit bool
 	for _, c := range commits {
@@ -257,7 +258,14 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 
 	bottom := bottomOpenPR(commits)
 
-	// 2. Cascade merge: with landed-local commits below, a green/approved/main-
+	// A conflict is actionable regardless of whether this is an ordinary stack
+	// or a cascade with landed commits below it. Keep it ahead of submit/restack
+	// so neither workflow recommendation hides the conflict GitHub reported.
+	if bottom != nil && bottom.Mergeable == "CONFLICTING" {
+		return "resolve-conflicts"
+	}
+
+	// 3. Cascade merge: with landed-local commits below, a green/approved/main-
 	// based/non-conflicting bottom open PR on a well-formed chain keeps merging
 	// rather than restacking — that IS the cascade, so it beats the restack in
 	// step 3. (For a stack with no landed commits, merge is reached via the CI
@@ -267,12 +275,12 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 		return "merge"
 	}
 
-	// 3. Landed-local commits exist but the cascade is blocked: the bottom open PR
-	// is mis-based, conflicting, or failing; or there is no open PR left above the
+	// 4. Landed-local commits exist but the cascade is blocked: the bottom open PR
+	// is mis-based or failing; or there is no open PR left above the
 	// landed prefix yet unlanded commits remain. Restack repairs it.
 	if hasMerged {
 		if bottom != nil {
-			if !stk.BaseChainOK || bottom.Mergeable == "CONFLICTING" || bottom.Checks.Summary == "failing" {
+			if !stk.BaseChainOK || bottom.Checks.Summary == "failing" {
 				return "restack"
 			}
 			// Merely pending or awaiting review: CI may go green and the cascade
@@ -284,13 +292,13 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 		return "restack"
 	}
 
-	// 4. No landed-local commits: an out-of-sync commit or a broken chain is an
+	// 5. No landed-local commits: an out-of-sync commit or a broken chain is an
 	// ordinary submit.
 	if hasSubmit || !stk.BaseChainOK {
 		return "submit"
 	}
 
-	// 5/6. The bottom open PR drives the CI/review-gated actions.
+	// 6/7. The bottom open PR drives the CI/review-gated actions.
 	if bottom != nil {
 		switch bottom.Checks.Summary {
 		case "failing":
@@ -307,7 +315,7 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 		}
 	}
 
-	// 7/8. No commits and no open PRs: archive if something landed here, else clean.
+	// 8/9. No commits and no open PRs: archive if something landed here, else clean.
 	if len(commits) == 0 && landed {
 		return "archive"
 	}
