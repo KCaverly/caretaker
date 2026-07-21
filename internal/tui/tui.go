@@ -3307,6 +3307,17 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if it, ok := m.selectedActive(); ok {
 			return m.openDiff(it)
 		}
+	case "s":
+		// Open the stack screen for a stackable worktree, kicking a fresh status
+		// fetch that lands in both the cache and the open screen.
+		if it, ok := m.selectedActive(); ok {
+			if p, pok := stackParams(it); pok {
+				key := wsKey(it.repo.Name, it.view.WT.Name)
+				m = m.enterStackOverlay(key, it.repo.Name, it.view.WT.Name, p)
+				m.markStackLoading(key)
+				return m, m.fetchStackCmd(key, p)
+			}
+		}
 	case "x":
 		if it, ok := m.selectedActive(); ok && !it.view.WT.IsMain {
 			m = m.beginRemove(it)

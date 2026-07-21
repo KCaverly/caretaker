@@ -1535,6 +1535,7 @@ func (m Model) renderHelp(h int) string {
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
 		row("v", "view diff (deck)"),
+		row("s", "stack screen (j/k move · s submit · R restack · v diff · o open PR)"),
 		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
@@ -1735,7 +1736,7 @@ func (m Model) footerContent() string {
 	} else {
 		hints = []string{
 			keyhint("↑↓", "move"), keyhint("enter", "open"),
-			keyhint("1-3", "recent"), keyhint("d", "stop"), keyhint("x", "remove"),
+			keyhint("1-3", "recent"), keyhint("s", "stack"), keyhint("d", "stop"), keyhint("x", "remove"),
 			keyhint("tab", "new"), keyhint("?", "help"), keyhint("ctrl+c", "quit"),
 		}
 	}

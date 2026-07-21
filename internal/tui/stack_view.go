@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -27,14 +29,19 @@ type stackEntry struct {
 	fetchedAt time.Time
 }
 
-// stackView backs the read-only stack overlay. It stamps the target worktree and
-// the params a re-fetch/submit/restack reuses, holds the pre-split body lines and
-// scroll offset, and tracks two transient flags: working (a pipeline call is in
+// stackView backs the stack screen. It stamps the target worktree and the params
+// a re-fetch/submit/restack reuses. When status is non-nil it drives the
+// structured chain view (a cursor over the commit rows); otherwise the pre-split
+// body lines and scroll offset drive the text-window path (errors and the restack
+// dry-run plan). It tracks two transient flags: working (a pipeline call is in
 // flight, so the body shows a one-line "working…") and confirmRestack (a restack
 // dry-run plan is on screen awaiting enter, which runs it for real).
 type stackView struct {
 	repoName, wtName, key string
 	params                stack.Params
+
+	status *stack.StackStatus
+	cursor int
 
 	body   []string
 	offset int
@@ -189,10 +196,14 @@ func (m *Model) applyStackStatus(msg stackStatusMsg) {
 	m.stackView.confirmRestack = false
 	m.stackView.offset = 0
 	if msg.err != nil {
+		m.stackView.status = nil
 		m.stackView.body = stackErrorBody("status failed: "+msg.err.Error(), nil)
 		return
 	}
-	m.stackView.body = renderStackBody(stack.Render(msg.status))
+	st := msg.status
+	m.stackView.status = &st
+	m.stackView.body = nil
+	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 }
 
 // applyStackSubmit refreshes the deck cache from a submit result and, when the
@@ -215,10 +226,14 @@ func (m *Model) applyStackSubmit(msg stackSubmitMsg) {
 	m.stackView.confirmRestack = false
 	m.stackView.offset = 0
 	if msg.err != nil {
+		m.stackView.status = nil
 		m.stackView.body = stackErrorBody("submit failed: "+msg.err.Error(), msg.res.Executed)
 		return
 	}
-	m.stackView.body = renderStackBody(stack.Render(msg.res.Status))
+	st := msg.res.Status
+	m.stackView.status = &st
+	m.stackView.body = nil
+	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 }
 
 // applyStackRestack handles both restack phases. The dry-run shows the plan and
@@ -240,15 +255,32 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 	m.stackView.offset = 0
 	switch {
 	case msg.err != nil:
+		m.stackView.status = nil
 		m.stackView.body = stackErrorBody("restack failed: "+msg.err.Error(), msg.res.Executed)
 	case msg.res.Nothing:
-		m.stackView.body = renderStackBody(stack.Render(msg.res.Status))
+		st := msg.res.Status
+		m.stackView.status = &st
+		m.stackView.body = nil
+		m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 	case msg.dryRun:
+		m.stackView.status = nil
 		m.stackView.body = renderStackBody(stack.RenderRestackPlan(msg.res))
 		m.stackView.confirmRestack = true
 	default:
-		m.stackView.body = renderStackBody(stack.Render(msg.res.Status))
+		st := msg.res.Status
+		m.stackView.status = &st
+		m.stackView.body = nil
+		m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 	}
+}
+
+// clampCursor keeps a commit-row cursor inside a list of n rows, collapsing to 0
+// for an empty list.
+func clampCursor(c, n int) int {
+	if n == 0 {
+		return 0
+	}
+	return clamp(c, 0, n-1)
 }
 
 // renderStackBody splits a renderer's block into scrollable lines.
@@ -271,21 +303,32 @@ func stackErrorBody(msg string, executed []string) []string {
 
 // --- key routing ---
 
-// handleStack routes keys while the stack overlay is open, mirroring the usage
-// overlay's modal behavior: esc/q close, r re-fetches, j/k scroll (clamped, so
-// they no-op when the body fits), and — in the restack-confirm state — enter runs
-// the restack for real. Everything else is swallowed so no key leaks beneath.
+// handleStack routes keys while the stack screen is open, mirroring the usage
+// overlay's modal behavior and swallowing every other key so none leaks beneath.
+// esc/q close and r re-fetches in every state. The rest split on the render path:
+// with a structured status the cursor moves (j/k), submit (s), restack (R), diff
+// (v), and open PR (o) act on the stack, and g/G jump the cursor; enter is inert
+// here and only confirms a pending restack; with a text
+// body (an error or the restack dry-run plan) j/k scroll it and — in the
+// restack-confirm state — enter runs the restack for real.
 func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sv := m.stackView
 	avail := m.stackViewport()
 	maxOff := max(0, len(sv.body)-avail)
+	n := 0
+	if sv.status != nil {
+		n = len(sv.status.Commits)
+	}
 	switch msg.String() {
 	case "esc", "q":
 		// In the restack-confirm state esc cancels without executing; either way
-		// the overlay closes.
+		// the screen closes.
 		m.stackOpen = false
 		m.stackView = stackView{}
 	case "enter":
+		// The only enter action is confirming a pending restack. On a plain status
+		// there is nothing per-row to open — every commit belongs to the one
+		// worktree — so enter is intentionally inert there.
 		if sv.confirmRestack && !sv.working {
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
@@ -298,16 +341,109 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.markStackLoading(sv.key)
 			return m, m.fetchStackCmd(sv.key, sv.params)
 		}
+	case "s":
+		// Submit the stack, but only when the rollup carries submit-able work.
+		if sv.status != nil && !sv.working {
+			if stackHasSubmitWork(*sv.status) {
+				m.stackView.working = true
+				m.stackView.confirmRestack = false
+				return m, m.submitStackCmd(sv.key, sv.params)
+			}
+			return m, m.flashCmd("nothing to submit")
+		}
+	case "R":
+		// Restack, dry-run first: the plan lands as a text body and arms the
+		// confirm state, exactly as the palette's restack row does.
+		if sv.status != nil && !sv.working {
+			m.stackView.working = true
+			m.stackView.confirmRestack = false
+			return m, m.restackStackCmd(sv.key, sv.params, true)
+		}
+	case "v":
+		// Jump to the deck's read-only diff of everything the branch carries.
+		if sv.status != nil {
+			if it, ok := m.activeByKey(sv.key); ok {
+				m.stackOpen = false
+				m.stackView = stackView{}
+				m.screen = screenPicker
+				m.focus = focusActive
+				for i, a := range m.active {
+					if wsKey(a.repo.Name, a.view.WT.Name) == sv.key {
+						m.activeCursor = i
+						break
+					}
+				}
+				return m.openDiff(it)
+			}
+		}
+	case "o":
+		// Open the selected commit's PR in the browser.
+		if sv.status != nil && n > 0 {
+			c := sv.status.Commits[clamp(sv.cursor, 0, n-1)]
+			if c.PR != nil && c.PR.URL != "" {
+				return m, openURLCmd(c.PR.URL)
+			}
+			return m, m.flashCmd("no PR for this commit")
+		}
 	case "j", "down":
-		m.stackView.offset = clamp(sv.offset+1, 0, maxOff)
+		if sv.status != nil {
+			m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
+		} else {
+			m.stackView.offset = clamp(sv.offset+1, 0, maxOff)
+		}
 	case "k", "up":
-		m.stackView.offset = clamp(sv.offset-1, 0, maxOff)
+		if sv.status != nil {
+			m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
+		} else {
+			m.stackView.offset = clamp(sv.offset-1, 0, maxOff)
+		}
 	case "g":
-		m.stackView.offset = 0
+		if sv.status != nil {
+			m.stackView.cursor = 0
+		} else {
+			m.stackView.offset = 0
+		}
 	case "G":
-		m.stackView.offset = maxOff
+		if sv.status != nil {
+			m.stackView.cursor = max(0, n-1)
+		} else {
+			m.stackView.offset = maxOff
+		}
 	}
 	return m, nil
+}
+
+// openURLCmd opens url in the platform browser off the UI goroutine. Success is
+// silent — the browser is the feedback; a launch failure flashes as a sticky
+// error via the shared actionDoneMsg path.
+func openURLCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		var name string
+		var args []string
+		switch runtime.GOOS {
+		case "darwin":
+			name = "open"
+		case "windows":
+			name, args = "rundll32", []string{"url.dll,FileProtocolHandler"}
+		default:
+			name = "xdg-open"
+		}
+		if err := exec.Command(name, append(args, url)...).Start(); err != nil {
+			return actionDoneMsg{err: fmt.Errorf("open PR: %w", err)}
+		}
+		return nil
+	}
+}
+
+// activeByKey finds the active item whose repo/worktree matches key, so the stack
+// screen's open/diff actions can route through the deck's activate/openDiff.
+func (m Model) activeByKey(key string) (activeItem, bool) {
+	for _, it := range m.active {
+		if wsKey(it.repo.Name, it.view.WT.Name) == key {
+			return it, true
+		}
+	}
+	return activeItem{}, false
 }
 
 // --- rendering ---
@@ -328,23 +464,38 @@ func (m Model) stackViewport() int {
 	return min(budget, stackMaxBodyRows)
 }
 
-// renderStack draws the read-only stack overlay: a centered box titled
-// "STACK <repo> / <wt>" over the windowed Render/plan body, a one-line "working…"
-// while a pipeline call is in flight, and a footer that switches to
-// "enter run · esc cancel" while a restack plan awaits confirmation.
+// renderStack draws the stack screen, selecting among five states: a one-line
+// "working…" while a pipeline call is in flight; the restack dry-run plan with an
+// "enter run · esc cancel" confirm footer; the structured chain view (when a
+// status is loaded); the text-window error body; and a "(no stack data)"
+// placeholder. The working, confirm, error, and placeholder states share the
+// text-window renderer; the structured view is its own layout.
 func (m Model) renderStack(h int) string {
+	sv := m.stackView
+	confirmFooter := keyhint("enter", "run") + "   " + keyhint("esc", "cancel")
+	closeFooter := keyhint("j/k", "scroll") + "   " + keyhint("r", "refresh") + "   " + keyhint("esc", "close")
+	switch {
+	case sv.working:
+		return m.renderStackText([]string{dimStyle.Render("working…")}, closeFooter, h)
+	case sv.confirmRestack:
+		return m.renderStackText(sv.body, confirmFooter, h)
+	case sv.status != nil:
+		return m.renderStackStatus(*sv.status, sv.cursor, h)
+	case len(sv.body) > 0:
+		return m.renderStackText(sv.body, closeFooter, h)
+	default:
+		return m.renderStackText([]string{dimStyle.Render("(no stack data)")}, closeFooter, h)
+	}
+}
+
+// renderStackText draws the shared text-window path: the "STACK <repo> / <wt>"
+// title, the body windowed by the scroll offset, and the given footer, inside the
+// same centered box as the structured view.
+func (m Model) renderStackText(body []string, footer string, h int) string {
 	sv := m.stackView
 	innerW := clamp(m.width-8, 40, 84)
 
 	rows := []string{header("stack "+sv.repoName+" / "+sv.wtName, -1), ""}
-
-	body := sv.body
-	switch {
-	case sv.working:
-		body = []string{dimStyle.Render("working…")}
-	case len(body) == 0:
-		body = []string{dimStyle.Render("(no stack data)")}
-	}
 
 	avail := m.stackViewport()
 	start := clamp(sv.offset, 0, max(0, len(body)-1))
@@ -356,15 +507,204 @@ func (m Model) renderStack(h int) string {
 		rows = append(rows, "")
 	}
 
-	rows = append(rows, "")
-	if sv.confirmRestack && !sv.working {
-		rows = append(rows, "  "+keyhint("enter", "run")+"   "+keyhint("esc", "cancel"))
-	} else {
-		rows = append(rows, "  "+keyhint("j/k", "scroll")+"   "+keyhint("r", "refresh")+"   "+keyhint("esc", "close"))
-	}
+	rows = append(rows, "", "  "+footer)
 
 	boxStr := box(rows, innerW, len(rows), true)
 	return centerBlock(boxStr, m.width, h)
+}
+
+// renderStackStatus draws the structured stack screen: a titled header, a chain
+// row from main through each commit's subject, a cursored (and, for a tall stack,
+// scrollable) commit list with per-commit PR facts, a one-line rollup summary,
+// and an action footer whose submit/restack hints appear only when the rollup
+// calls for them. It shares renderStack's centered box container.
+func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
+	innerW := clamp(m.width-8, 40, 84)
+	trunc := func(s string) string { return ansi.Truncate(s, innerW, "") }
+
+	var rows []string
+
+	// Title: "STACK  <repo> / <wt>" left, "base: <main>" right-justified.
+	left := headerStyle.Render("STACK") + "  " + repoHdrStyle.Render(st.Repo) +
+		dimStyle.Render(" / ") + nameStyle.Render(st.Worktree)
+	right := dimStyle.Render("base: " + st.MainBranch)
+	rows = append(rows, trunc(stackJustify(left, right, innerW)), "")
+
+	// Commit list, windowed to keep the cursor visible. Each row gives the whole
+	// subject the width its facts don't need, with the facts flush right.
+	if len(st.Commits) == 0 {
+		rows = append(rows, trunc(dimStyle.Render("(no commits ahead of main)")))
+	} else {
+		chrome := 6
+		budget := clamp(m.height-barHeight-chrome, 1, stackMaxBodyRows)
+		listH := min(len(st.Commits), budget)
+		start, end := windowBounds(len(st.Commits), cursor, listH)
+		for i := start; i < end; i++ {
+			rows = append(rows, m.stackCommitRow(st.Commits[i], i == cursor, innerW))
+		}
+	}
+	rows = append(rows, "")
+
+	// Rollup summary (or a note when GitHub is unavailable).
+	if !st.GitHub.Available {
+		rows = append(rows, trunc(dimStyle.Render("github unavailable — PR status omitted")))
+	} else {
+		rows = append(rows, trunc(dimStyle.Render(fmt.Sprintf("base %s · next: %s",
+			okWord(st.Stack.BaseChainOK), st.Stack.NextAction))))
+	}
+	rows = append(rows, "")
+
+	// Action footer: move always, submit/restack conditionally, then the rest.
+	// refresh trails so it is the first to drop if the row must be truncated.
+	parts := []string{keyhint("j/k", "move")}
+	if stackHasSubmitWork(st) {
+		parts = append(parts, keyhint("s", "submit"))
+	}
+	if st.Stack.NextAction == "restack" {
+		parts = append(parts, keyhint("R", "restack"))
+	}
+	parts = append(parts, keyhint("v", "diff"), keyhint("o", "open PR"),
+		keyhint("esc", "deck"), keyhint("r", "refresh"))
+	rows = append(rows, trunc("  "+strings.Join(parts, "   ")))
+
+	boxStr := box(rows, innerW, len(rows), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// stackJustify lays left and right on one row innerW wide with the gap between
+// them, falling back to left alone when the two won't fit.
+func stackJustify(left, right string, innerW int) string {
+	gap := innerW - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		return left
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// stackCommitRow lays out one commit line: a state glyph (or the ▸ cursor
+// marker), the subject given all the width its facts leave, and the PR/state
+// facts flush right. The selected row is drawn as a full-width selection bar.
+func (m Model) stackCommitRow(c stack.Commit, selected bool, innerW int) string {
+	factsP := factsPlain(c)
+	factsW := lipgloss.Width(factsP)
+	name := ansi.Truncate(c.Subject, max(4, innerW-2-factsW-2), "")
+	gap := max(1, innerW-2-lipgloss.Width(name)-factsW)
+	if selected {
+		return selBar("▸ "+name+strings.Repeat(" ", gap)+factsP, innerW)
+	}
+	return glyphFor(c) + " " + nameStyle.Render(name) + strings.Repeat(" ", gap) + facts(c)
+}
+
+// glyphFor returns the styled single-glyph state marker for a commit list row: a
+// green ✓ for a landed/open PR (a dim ○ when that PR is a draft), a dim ○ for
+// work not yet in review, a yellow … for a diverged commit, and a red ✗ for a
+// closed or duplicate-id escalation.
+func glyphFor(c stack.Commit) string {
+	switch c.State {
+	case stack.StateMerged, stack.StateOpen:
+		if c.PR != nil && c.PR.Draft {
+			return dimStyle.Render("○")
+		}
+		return aheadStyle.Render("✓")
+	case stack.StateUnsubmitted, stack.StateUnpushed, stack.StateMissingPR:
+		return dimStyle.Render("○")
+	case stack.StateDiverged:
+		return stackWaitStyle.Render("…")
+	case stack.StateClosed, stack.StateDuplicateID:
+		return errStyle.Render("✗")
+	default:
+		return dimStyle.Render("○")
+	}
+}
+
+// facts renders a commit's PR/state facts for a list row, dim with a colored
+// check mark; factsPlain is the unstyled variant for the selection bar.
+func facts(c stack.Commit) string {
+	if c.PR == nil {
+		return dimStyle.Render(factsPlain(c))
+	}
+	base := fmt.Sprintf("PR #%d %s", c.PR.Number, prWord(c))
+	switch c.State {
+	case stack.StateMerged:
+		return dimStyle.Render(base + " · landed")
+	case stack.StateClosed:
+		return errStyle.Render(base)
+	default:
+		if s := c.PR.Checks.Summary; s != "" && s != "none" {
+			return dimStyle.Render(base+" · checks ") + coloredCheckMark(s)
+		}
+		return dimStyle.Render(base)
+	}
+}
+
+// factsPlain is the unstyled fact string, used for the selection bar (which
+// styles the whole row) and as the source facts() colors.
+func factsPlain(c stack.Commit) string {
+	if c.PR == nil {
+		switch c.State {
+		case stack.StateUnsubmitted:
+			return "unsubmitted"
+		case stack.StateUnpushed:
+			return "unpushed"
+		case stack.StateMissingPR:
+			return "pushed · no PR"
+		default:
+			return string(c.State)
+		}
+	}
+	base := fmt.Sprintf("PR #%d %s", c.PR.Number, prWord(c))
+	switch c.State {
+	case stack.StateMerged:
+		return base + " · landed"
+	case stack.StateClosed:
+		return base
+	default:
+		if s := c.PR.Checks.Summary; s != "" && s != "none" {
+			return base + " · checks " + checksMark(s)
+		}
+		return base
+	}
+}
+
+// prWord names a PR's state for the fact string: its lifecycle for a
+// merged/closed/diverged commit, else draft vs open.
+func prWord(c stack.Commit) string {
+	switch c.State {
+	case stack.StateMerged:
+		return "merged"
+	case stack.StateClosed:
+		return "closed"
+	case stack.StateDiverged:
+		return "diverged"
+	default:
+		if c.PR != nil && c.PR.Draft {
+			return "draft"
+		}
+		return "open"
+	}
+}
+
+// coloredCheckMark renders a checks summary as a colored glyph: green ✓ passing,
+// yellow … pending, red ✗ failing, reusing checksMark for the glyph itself.
+func coloredCheckMark(summary string) string {
+	switch summary {
+	case "passing":
+		return aheadStyle.Render(checksMark(summary))
+	case "pending":
+		return stackWaitStyle.Render(checksMark(summary))
+	case "failing":
+		return errStyle.Render(checksMark(summary))
+	default:
+		return dimStyle.Render(checksMark(summary))
+	}
+}
+
+// okWord renders a boolean base-chain health as its summary word.
+func okWord(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "broken"
 }
 
 // --- deck glyph + detail derivation ---

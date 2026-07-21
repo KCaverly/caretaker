@@ -8,7 +8,9 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
+	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/stack"
 )
 
@@ -320,8 +322,11 @@ func TestStackOverlayStatus(t *testing.T) {
 	if !strings.Contains(out, "STACK") || !strings.Contains(strings.ToLower(out), "repo") {
 		t.Errorf("overlay should show the STACK title:\n%s", out)
 	}
-	if !strings.Contains(out, "next=merge") {
-		t.Errorf("overlay body should include the rendered status:\n%s", out)
+	if !strings.Contains(out, "next: merge") {
+		t.Errorf("overlay should show the rollup summary:\n%s", out)
+	}
+	if !strings.Contains(out, "#7") {
+		t.Errorf("overlay should show the commit's PR ref:\n%s", out)
 	}
 }
 
@@ -413,6 +418,155 @@ func TestStackOverlayScroll(t *testing.T) {
 	m = mm.(Model)
 	if m.stackView.offset != 1 {
 		t.Fatalf("down should scroll by one, got %d", m.stackView.offset)
+	}
+}
+
+// TestStackScreenStructured renders the structured chain view from a loaded
+// status and checks the subjects, a PR ref, the rollup, the cursor marker, and
+// the action footer (restack hint present, submit absent for this rollup).
+func TestStackScreenStructured(t *testing.T) {
+	m, key := stackModel()
+	st := statusWith(
+		stack.Stack{Size: 3, BaseChainOK: true, NextAction: "restack",
+			Counts: map[stack.State]int{stack.StateMerged: 1, stack.StateOpen: 2}},
+		stack.Commit{Position: 1, State: stack.StateMerged, Subject: "tokens core",
+			PR: &stack.PR{Number: 36}},
+		stack.Commit{Position: 2, State: stack.StateOpen, Subject: "auth tokens",
+			PR: &stack.PR{Number: 38, Checks: stack.Checks{Summary: "passing"}}},
+		stack.Commit{Position: 3, State: stack.StateOpen, Subject: "refresh flow",
+			PR: &stack.PR{Number: 41, Draft: true}})
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{})
+	m.stackView.working = false
+	m.stackView.status = &st
+
+	out := m.renderStack(m.height - barHeight)
+	for _, want := range []string{"tokens core", "auth tokens", "refresh flow", "#38", "next:", "▸", "move"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("structured view missing %q:\n%s", want, out)
+		}
+	}
+	// A restack rollup advertises the restack action but not submit (no work).
+	if !strings.Contains(out, "restack") {
+		t.Errorf("restack rollup should advertise the restack action:\n%s", out)
+	}
+	if strings.Contains(out, "submit") {
+		t.Errorf("no submit-able work, so submit should not appear:\n%s", out)
+	}
+}
+
+// stackNavModel builds a stack screen open on a structured status with both
+// submit-able work and an open PR, backed by a cheap cat/sh workspace so the
+// enter→activate path runs without touching git/gh. The active item's key
+// matches the overlay so the open/diff actions resolve it.
+func stackNavModel(t *testing.T) (Model, string) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh",
+		Keys: config.Default().Keys,
+	}}
+	mgr := session.NewManager()
+	t.Cleanup(mgr.CloseAll)
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 72, Height: 24})
+	m = mm.(Model)
+
+	dir := t.TempDir()
+	m.focus = focusActive
+	m.active = []activeItem{{
+		repo: repo.Repo{Name: "repo"},
+		view: WorktreeView{
+			WT:         repo.Worktree{Repo: "repo", Name: "wt", Branch: "wt", Path: dir},
+			HasBase:    true,
+			BaseBranch: "main",
+			Ahead:      2,
+		},
+	}}
+	m.activeCursor = 0
+
+	key := wsKey("repo", "wt")
+	st := statusWith(
+		stack.Stack{Size: 2, BaseChainOK: true, NextAction: "restack",
+			Counts: map[stack.State]int{stack.StateUnpushed: 1, stack.StateOpen: 1}},
+		stack.Commit{Position: 1, State: stack.StateUnpushed, Subject: "core"},
+		stack.Commit{Position: 2, State: stack.StateOpen, Subject: "flow",
+			PR: &stack.PR{Number: 9, URL: "https://example.test/pr/9", Checks: stack.Checks{Summary: "passing"}}})
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{
+		RepoName: "repo", WorktreeName: "wt", WorktreeDir: dir, Branch: "wt", MainBranch: "main"})
+	m.stackView.working = false
+	m.stackView.status = &st
+	m.stackSubmit = func(stack.SubmitOptions) (stack.SubmitResult, error) { return stack.SubmitResult{}, nil }
+	m.stackRestack = func(stack.RestackOptions) (stack.RestackResult, error) { return stack.RestackResult{}, nil }
+	return m, key
+}
+
+// TestStackScreenNav walks the structured view's actions: j moves the cursor, s
+// submits, R restacks (dry-run), v jumps to the diff, and enter opens the
+// worktree — each with stubbed pipelines so nothing real runs.
+func TestStackScreenNav(t *testing.T) {
+	// j moves the cursor down.
+	m, _ := stackNavModel(t)
+	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyDown})
+	if got := mm.(Model).stackView.cursor; got != 1 {
+		t.Fatalf("down should move the cursor to 1, got %d", got)
+	}
+
+	// s submits (submit-able work present): working set, command issued.
+	m, _ = stackNavModel(t)
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: 's', Text: "s"})
+	m = mm.(Model)
+	if !m.stackView.working || cmd == nil {
+		t.Fatalf("s should submit: working=%v cmd=%v", m.stackView.working, cmd != nil)
+	}
+
+	// R restacks (dry-run): working set, command issued.
+	m, _ = stackNavModel(t)
+	mm, cmd = m.handleStack(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	m = mm.(Model)
+	if !m.stackView.working || cmd == nil {
+		t.Fatalf("R should restack: working=%v cmd=%v", m.stackView.working, cmd != nil)
+	}
+
+	// v jumps to the deck's diff viewer.
+	m, _ = stackNavModel(t)
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: 'v', Text: "v"})
+	m = mm.(Model)
+	if m.stackOpen || !m.diffOpen || m.screen != screenPicker {
+		t.Fatalf("v should open the diff: stackOpen=%v diffOpen=%v screen=%v", m.stackOpen, m.diffOpen, m.screen)
+	}
+
+	// enter is inert on a plain status: every row is the same worktree, so there
+	// is nothing per-row to open; the screen stays put.
+	m, _ = stackNavModel(t)
+	mm, cmd = m.handleStack(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if !m.stackOpen || cmd != nil {
+		t.Fatalf("enter on a status should be a no-op: open=%v cmd=%v", m.stackOpen, cmd != nil)
+	}
+
+	// o on the PR-bearing commit issues the browser-open command; the command is
+	// only asserted, never run, so no browser launches during the test.
+	m, _ = stackNavModel(t)
+	m.stackView.cursor = 1
+	_, cmd = m.handleStack(tea.KeyPressMsg{Code: 'o', Text: "o"})
+	if cmd == nil {
+		t.Fatal("o on a commit with a PR should issue the open-PR command")
+	}
+}
+
+// TestStackDeckOpensScreen checks the deck's `s` key opens the stack screen for a
+// stackable worktree and kicks a fetch.
+func TestStackDeckOpensScreen(t *testing.T) {
+	m, key := stackModel()
+	m.stackFetch = func(stack.Params) (stack.StackStatus, error) {
+		return statusWith(stack.Stack{Size: 1, NextAction: "merge",
+			Counts: map[stack.State]int{stack.StateOpen: 1}}, openPR(1, "passing")), nil
+	}
+	mm, cmd := m.handleActiveKey(tea.KeyPressMsg{Code: 's', Text: "s"})
+	m = mm.(Model)
+	if !m.stackOpen || m.stackView.key != key || cmd == nil {
+		t.Fatalf("s should open the stack screen and fetch: open=%v key=%q cmd=%v",
+			m.stackOpen, m.stackView.key, cmd != nil)
 	}
 }
 
