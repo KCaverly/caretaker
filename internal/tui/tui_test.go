@@ -1365,6 +1365,87 @@ func TestAttentionTransitionDetection(t *testing.T) {
 	}
 }
 
+// TestRemovedAgentNotResurrectedByPoll guards the phantom-notification bug: an
+// agent deleted while waiting on a permission prompt can linger in
+// `claude agents --json` for a few polls, and the replace-all Claude poll would
+// otherwise re-raise the "!" badge that clearAgentTracking just cleared.
+func TestRemovedAgentNotResurrectedByPoll(t *testing.T) {
+	m := sampleModel()
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
+	}
+
+	// Agent pid 1 is waiting on a permission prompt in r/a — the "!" is live.
+	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "waiting", Cwd: "/r/a", StartedAt: 1000},
+	}})
+	m = result.(Model)
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnWaiting {
+		t.Fatalf("precondition: r/a should be waiting, got %v", got)
+	}
+
+	// The user deletes the agent. Its tracking is cleared and it's tombstoned.
+	m.clearAgentTracking(1)
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnNone {
+		t.Fatalf("after delete: r/a attention should clear, got %v", got)
+	}
+
+	// The daemon still lists the killed agent on the next poll. It must not
+	// resurrect the badge, and it must not leak back into agentStatus.
+	result, _ = m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "waiting", Cwd: "/r/a", StartedAt: 1000},
+	}})
+	m = result.(Model)
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnNone {
+		t.Errorf("lingering poll entry resurrected the badge: got %v", got)
+	}
+	if _, ok := m.agentStatus[1]; ok {
+		t.Error("tombstoned pid leaked back into agentStatus")
+	}
+	if waiting, _ := m.attnSummary(); waiting != 0 {
+		t.Errorf("bar still counts the deleted agent: waiting=%d", waiting)
+	}
+
+	// Once the process is finally gone, the tombstone is retired so a brand-new
+	// agent that reuses the pid is honored again.
+	result, _ = m.update(statusMsg{byPid: map[int]AgentStatus{}})
+	m = result.(Model)
+	if _, tombstoned := m.removed[1]; tombstoned {
+		t.Error("tombstone should retire once the poll stops reporting the pid")
+	}
+	result, _ = m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "waiting", Cwd: "/r/a", StartedAt: 2000},
+	}})
+	m = result.(Model)
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnWaiting {
+		t.Errorf("a fresh agent reusing the pid should raise the badge, got %v", got)
+	}
+}
+
+// TestRemovedAgentRecycledPidHonored checks that if the same pid is immediately
+// reused by a different agent (different StartedAt) the tombstone steps aside
+// rather than suppressing the newcomer.
+func TestRemovedAgentRecycledPidHonored(t *testing.T) {
+	m := sampleModel()
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: "/r/a"}}},
+	}
+	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: "/r/a", StartedAt: 1000}}
+	m.clearAgentTracking(1)
+
+	// Next poll reports pid 1, but it's a new process (StartedAt differs).
+	result, _ := m.update(statusMsg{byPid: map[int]AgentStatus{
+		1: {Status: "waiting", Cwd: "/r/a", StartedAt: 5000},
+	}})
+	m = result.(Model)
+	if _, tombstoned := m.removed[1]; tombstoned {
+		t.Error("a recycled pid should retire the tombstone")
+	}
+	if got := m.worktreeAttn(wsKey("r", "a")); got != attnWaiting {
+		t.Errorf("recycled-pid agent should raise the badge, got %v", got)
+	}
+}
+
 func TestAttentionPrecedence(t *testing.T) {
 	m := sampleModel()
 	m.active = []activeItem{

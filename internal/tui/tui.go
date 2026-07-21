@@ -265,6 +265,17 @@ type Model struct {
 	// derived live from agentStatus and never stored here
 	attention map[int]attnEntry
 
+	// removed tombstones pids of agents ct has deleted, mapping each to the
+	// StartedAt it carried at removal (0 if never polled). The Claude status
+	// poll is a replace-all snapshot, and `claude agents --json` keeps listing a
+	// killed agent for one or more polls when it was blocked on a permission
+	// prompt — long enough to resurrect the live "waiting" status (and every
+	// badge derived from it) that clearAgentTracking just cleared. Suppressing a
+	// tombstoned pid in the poll keeps a deleted agent gone; each tombstone is
+	// dropped once the poll stops corroborating it, so a recycled pid is never
+	// held down.
+	removed map[int]int64
+
 	// Plan usage-limit gauges: one snapshot and session-window sample ring per
 	// provider. The gauges degrade silently — failures only leave that
 	// provider's snapshot to go stale, which hides its bar segment on its own.
@@ -389,6 +400,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		focus:           focusNew,
 		agentPrevStatus: map[int]string{},
 		attention:       map[int]attnEntry{},
+		removed:         map[int]int64{},
 		codexTranscript: map[*session.Session]bool{},
 	}
 }
@@ -1037,6 +1049,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err == nil {
 			m.pollFails = 0
+			// Retire tombstones the poll no longer corroborates: the deleted
+			// agent's pid is finally absent, or now carries a different StartedAt
+			// (the pid was recycled to a new agent). Either way the suppression
+			// below must stop so the fresh entry is honored. Done against the raw
+			// poll before any entry is dropped from msg.byPid.
+			for pid, startedAt := range m.removed {
+				st, ok := msg.byPid[pid]
+				if !ok || (startedAt != 0 && st.StartedAt != startedAt) {
+					delete(m.removed, pid)
+				}
+			}
 			// Claude polling is a replace-all snapshot for Claude only. Preserve
 			// Codex statuses, which arrive independently from App Server events.
 			nextStatus := make(map[int]AgentStatus, len(m.agentStatus)+len(msg.byPid))
@@ -1046,6 +1069,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			for pid, st := range msg.byPid {
+				// A tombstoned pid is an agent ct deleted that the daemon still
+				// lists. Drop it from the snapshot entirely so it can neither
+				// re-raise the "waiting" badge nor trigger the bell / done-marker
+				// loops below, which also read msg.byPid.
+				if _, tombstoned := m.removed[pid]; tombstoned {
+					delete(msg.byPid, pid)
+					continue
+				}
 				st.Provider = agent.Claude
 				msg.byPid[pid] = st
 				nextStatus[pid] = st
@@ -3386,6 +3417,15 @@ func (m *Model) stopWorkspace(key string) {
 }
 
 func (m *Model) clearAgentTracking(pid int) {
+	if pid == 0 {
+		return
+	}
+	if m.removed == nil {
+		m.removed = map[int]int64{}
+	}
+	// Remember the StartedAt so the poll can tell this dead agent from a future
+	// one that reuses the pid (see the removed field and the statusMsg handler).
+	m.removed[pid] = m.agentStatus[pid].StartedAt
 	delete(m.attention, pid)
 	delete(m.agentStatus, pid)
 	delete(m.agentPrevStatus, pid)
