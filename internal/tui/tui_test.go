@@ -14,6 +14,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/codex"
@@ -2088,8 +2089,18 @@ func TestQuitGuardBusyConfirms(t *testing.T) {
 	if isQuit(cmd) {
 		t.Fatal("ctrl+c with a busy agent must not quit yet")
 	}
-	if !strings.Contains(m.status, "quit anyway") {
-		t.Fatalf("expected a quit-confirm prompt, got %q", m.status)
+	if m.confirm.title != "QUIT CT" {
+		t.Fatalf("expected the QUIT CT panel, got title %q", m.confirm.title)
+	}
+	if len(m.confirm.context) == 0 || !strings.Contains(m.confirm.context[0], "quitting kills them") {
+		t.Fatalf("expected a quit-guard context line, got %q", m.confirm.context)
+	}
+	// The safe "cancel" row is the default, so a reflexive enter must not quit.
+	if key := m.confirm.options[m.confirm.cursor].key; key != "esc" {
+		t.Fatalf("quit panel should default to the cancel row, got key %q", key)
+	}
+	if _, cmd := m.handlePicker(tea.KeyPressMsg{Code: tea.KeyEnter}); isQuit(cmd) {
+		t.Fatal("enter on the default (cancel) row must not quit")
 	}
 
 	// 'y' quits.
@@ -2135,8 +2146,19 @@ func TestStopGuardBusyConfirms(t *testing.T) {
 	if !m.mgr.Has("repo/a") {
 		t.Fatal("workspace must not be stopped before confirmation")
 	}
-	if !strings.Contains(m.status, "stop anyway") {
-		t.Fatalf("expected a stop-confirm prompt, got %q", m.status)
+	if m.confirm.title != "STOP WORKSPACE" {
+		t.Fatalf("expected the STOP WORKSPACE panel, got title %q", m.confirm.title)
+	}
+	if len(m.confirm.context) == 0 || !strings.Contains(m.confirm.context[0], "stopping kills it") {
+		t.Fatalf("expected a stop-guard context line, got %q", m.confirm.context)
+	}
+	// The safe "cancel" row is the default, so a reflexive enter must not stop.
+	if key := m.confirm.options[m.confirm.cursor].key; key != "esc" {
+		t.Fatalf("stop panel should default to the cancel row, got key %q", key)
+	}
+	mm, _ = m.handlePicker(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if defaultCancel := mm.(Model); defaultCancel.mode != modeNormal || !defaultCancel.mgr.Has("repo/a") {
+		t.Fatal("enter on the default (cancel) row should cancel and leave the workspace running")
 	}
 
 	// A non-'y' key cancels, leaving the workspace running.
@@ -2174,8 +2196,19 @@ func removePromptModel() Model {
 	return m
 }
 
+// confirmHasContext reports whether any of the panel's context lines contains
+// sub (comparing against the plain, ANSI-stripped text).
+func confirmHasContext(c confirmState, sub string) bool {
+	for _, ln := range c.context {
+		if strings.Contains(ansi.Strip(ln), sub) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRemovePromptDirtyAware(t *testing.T) {
-	// Dirty worktree: the prompt must warn that uncommitted work is lost.
+	// Dirty worktree: the panel must warn that uncommitted work is lost.
 	m := removePromptModel()
 	m.activeCursor = 0
 	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
@@ -2183,11 +2216,18 @@ func TestRemovePromptDirtyAware(t *testing.T) {
 	if m.mode != modeConfirmRemove {
 		t.Fatalf("'x' should enter modeConfirmRemove, got %v", m.mode)
 	}
-	if !strings.Contains(m.status, "UNCOMMITTED") {
-		t.Fatalf("dirty worktree prompt must mention uncommitted changes, got %q", m.status)
+	if m.confirm.title != "REMOVE WORKTREE" {
+		t.Fatalf("expected the REMOVE WORKTREE panel, got title %q", m.confirm.title)
 	}
-	if !strings.Contains(m.status, "keep branch") {
-		t.Fatalf("prompt should offer the keep-branch choice, got %q", m.status)
+	if !confirmHasContext(m.confirm, "uncommitted changes will be lost") {
+		t.Fatalf("dirty worktree panel must warn of uncommitted changes, got %q", m.confirm.context)
+	}
+	// The cursor starts on the safe "keep branch" row.
+	if key := m.confirm.options[m.confirm.cursor].key; key != "b" {
+		t.Fatalf("remove panel should default to the keep-branch row, got key %q", key)
+	}
+	if !confirmHasOption(m.confirm, "b") || !confirmHasOption(m.confirm, "y") {
+		t.Fatalf("panel should offer both the keep-branch and delete-branch choices, got %+v", m.confirm.options)
 	}
 
 	// Clean worktree: same choices, but no data-loss warning.
@@ -2198,12 +2238,22 @@ func TestRemovePromptDirtyAware(t *testing.T) {
 	if m.mode != modeConfirmRemove {
 		t.Fatalf("'x' should enter modeConfirmRemove, got %v", m.mode)
 	}
-	if strings.Contains(m.status, "UNCOMMITTED") {
-		t.Fatalf("clean worktree prompt must not warn of uncommitted changes, got %q", m.status)
+	if confirmHasContext(m.confirm, "uncommitted changes will be lost") {
+		t.Fatalf("clean worktree panel must not warn of uncommitted changes, got %q", m.confirm.context)
 	}
-	if !strings.Contains(m.status, "keep branch") {
-		t.Fatalf("prompt should offer the keep-branch choice, got %q", m.status)
+	if !confirmHasOption(m.confirm, "b") {
+		t.Fatalf("panel should offer the keep-branch choice, got %+v", m.confirm.options)
 	}
+}
+
+// confirmHasOption reports whether the panel offers an option bound to key.
+func confirmHasOption(c confirmState, key string) bool {
+	for _, o := range c.options {
+		if o.key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRemovePromptCancels(t *testing.T) {
@@ -2342,6 +2392,137 @@ func TestRemoveConfirmBKeepsBranch(t *testing.T) {
 	// The working tree itself must still be gone.
 	if wts, _ := repo.ListWorktrees(repo.Repo{Name: "demo", Path: repoDir}); len(wts) != 1 {
 		t.Fatalf("expected only main worktree after remove, got %+v", wts)
+	}
+}
+
+// TestRemoveConfirmEnterKeepsBranch: the cursor starts on the safe row, so a
+// reflexive enter removes the worktree but keeps its branch.
+func TestRemoveConfirmEnterKeepsBranch(t *testing.T) {
+	m, repoDir, branch := removeGitModel(t)
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if key := m.confirm.options[m.confirm.cursor].key; key != "b" {
+		t.Fatalf("cursor should start on the keep-branch row, got key %q", key)
+	}
+	_, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter on the default row should schedule a removal command")
+	}
+	if msg := actionDoneFromBatch(t, cmd); msg.err != nil {
+		t.Fatalf("remove failed: %v", msg.err)
+	}
+	if !branchExists(t, repoDir, branch) {
+		t.Fatalf("enter on the default (keep-branch) row should keep branch %q", branch)
+	}
+}
+
+// TestRemoveConfirmArrowToDangerDeletesBranch: arrowing onto the destructive
+// row and pressing enter deletes the branch, matching the direct "y".
+func TestRemoveConfirmArrowToDangerDeletesBranch(t *testing.T) {
+	m, repoDir, branch := removeGitModel(t)
+
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	// Move down onto the "remove + delete branch" (danger) row.
+	mm, _ = m.handleConfirmKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	if opt := m.confirm.options[m.confirm.cursor]; opt.key != "y" || !opt.danger {
+		t.Fatalf("down should land on the danger delete-branch row, got %+v", opt)
+	}
+	_, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter on the danger row should schedule a removal command")
+	}
+	if msg := actionDoneFromBatch(t, cmd); msg.err != nil {
+		t.Fatalf("remove failed: %v", msg.err)
+	}
+	if branchExists(t, repoDir, branch) {
+		t.Fatalf("enter on the danger row should delete branch %q", branch)
+	}
+}
+
+// TestRemoveConfirmNavDoesNotCancel: j/k move the cursor without dismissing the
+// panel — the "anything else cancels" fallback must never sweep them up.
+func TestRemoveConfirmNavDoesNotCancel(t *testing.T) {
+	m := removePromptModel()
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if m.confirm.cursor != 0 {
+		t.Fatalf("cursor should start at 0, got %d", m.confirm.cursor)
+	}
+	mm, _ = m.handleConfirmKey(tea.KeyPressMsg{Code: 'j', Text: "j"})
+	m = mm.(Model)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'j' must not cancel the panel, got mode %v", m.mode)
+	}
+	if m.confirm.cursor != 1 {
+		t.Fatalf("'j' should move the cursor down, got %d", m.confirm.cursor)
+	}
+	mm, _ = m.handleConfirmKey(tea.KeyPressMsg{Code: 'k', Text: "k"})
+	m = mm.(Model)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'k' must not cancel the panel, got mode %v", m.mode)
+	}
+	if m.confirm.cursor != 0 {
+		t.Fatalf("'k' should move the cursor back up, got %d", m.confirm.cursor)
+	}
+}
+
+// TestRemoveConfirmStrayKeyCancels: a key bound to nothing (e.g. 'q') cancels
+// the panel, preserving the old "anything else cancels" behavior.
+func TestRemoveConfirmStrayKeyCancels(t *testing.T) {
+	m := removePromptModel()
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	mm, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	m = mm.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("'q' should cancel back to normal mode, got %v", m.mode)
+	}
+	if m.confirm.title != "" {
+		t.Fatalf("cancel should clear the panel state, got title %q", m.confirm.title)
+	}
+	if cmd != nil {
+		t.Fatal("cancel must not schedule a removal command")
+	}
+}
+
+// TestConfirmPanelRender is a golden-ish check that the remove panel draws its
+// title, context, options, and a selection marker on the cursor row.
+func TestConfirmPanelRender(t *testing.T) {
+	m := removePromptModel()
+	m.activeCursor = 0
+	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+
+	out := renderToTerminal(t, m.renderConfirm(m.height-barHeight), m.width, m.height-barHeight)
+	for _, want := range []string{
+		"REMOVE WORKTREE",                  // header title
+		"r / dirtywt",                      // repo / worktree context
+		"uncommitted changes will be lost", // dirty warning
+		"remove worktree, keep branch",     // safe option
+		"remove worktree + delete branch",  // danger option
+		"view diff first",
+		"cancel",
+		"move", "confirm", // footer legend
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("confirm panel render missing %q:\n%s", want, out)
+		}
+	}
+	// The cursor row is drawn with the full-width selection bar (the same marker
+	// the board uses): it spans the whole inner width and its styling differs
+	// from the same row rendered unselected.
+	innerW := clamp(m.width-8, 32, 56)
+	sel := m.confirmOptionLine(m.confirm.options[0], true, innerW)
+	if w := lipgloss.Width(sel); w != innerW {
+		t.Errorf("selected row width = %d, want full inner width %d", w, innerW)
+	}
+	if unsel := m.confirmOptionLine(m.confirm.options[0], false, innerW); sel == unsel {
+		t.Error("selected row should carry a distinct selection marker vs unselected")
 	}
 }
 
@@ -2864,8 +3045,11 @@ func TestDiffXEntersRemoveFlow(t *testing.T) {
 	if m.mode != modeConfirmRemove {
 		t.Fatalf("x should enter the remove confirm, got mode %v", m.mode)
 	}
-	if !strings.Contains(m.status, "UNCOMMITTED CHANGES") || !strings.Contains(m.status, "view diff") {
-		t.Errorf("dirty remove prompt should warn and offer view diff, got %q", m.status)
+	if !confirmHasContext(m.confirm, "uncommitted changes will be lost") {
+		t.Errorf("dirty remove panel should warn of uncommitted changes, got %q", m.confirm.context)
+	}
+	if !confirmHasOption(m.confirm, "v") {
+		t.Errorf("remove panel should offer the view-diff option, got %+v", m.confirm.options)
 	}
 }
 

@@ -209,9 +209,18 @@ gauge follows the focused agent, so a Claude session never shows Codex usage and
 
 Picker keys: `tab` switch section · `enter` open · `d` stop · `v` view diff · `x` remove · `r` refresh · `?` help · `ctrl+c` quit.
 
+`x` opens a centered **remove** panel rather than a one-line prompt: it shows the worktree's
+divergence and uncommitted diffstat (with a red warning when the tree is dirty) above a vertical
+list of options — `remove worktree, keep branch` (the safe default the cursor starts on),
+`remove worktree + delete branch` (destructive, red), `view diff first`, and `cancel`. Arrow
+keys (or `j`/`k`) move and `enter` fires the highlighted option, while the mnemonics still work
+directly, so the old `x` `b` (keep branch) and `x` `y` (delete branch) muscle memory is
+unchanged. The quit and stop guards use the same panel, defaulting to `cancel`.
+
 `v` opens a read-only diff of everything the branch carries beyond main (committed + uncommitted;
-`u` narrows it to just the uncommitted changes), also offered from the remove prompt so you can
-review a worktree before deleting it.
+`u` narrows it to just the uncommitted changes), also offered from the remove panel (`view diff
+first`) so you can review a worktree before deleting it — and `x` from the diff loops back to the
+panel.
 
 Press **`?`** (in the deck) or **`f1`** (anywhere, including inside a session) for a key + legend
 overlay; any key closes it.

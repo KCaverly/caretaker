@@ -113,6 +113,11 @@ func (m Model) View() tea.View {
 		body = m.renderUsage(h - barHeight)
 	case m.diffOpen:
 		body = m.renderDiff(h - barHeight)
+	case m.screen == screenPicker && m.confirmActive():
+		// A destructive-confirm panel is modal over the deck, layered like the
+		// other overlays (help/board) so its own footer legend shows instead of
+		// the deck's key hints.
+		body = m.renderConfirm(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
@@ -1396,6 +1401,98 @@ func activeDetail(v WorktreeView, innerW int) string {
 	return dimStyle.Render(truncateTo(prefix+strings.Join(segs, " · "), innerW))
 }
 
+// renderConfirm draws the centered panel that replaces the old status-line
+// prompts for the three destructive picker modes. It reuses the board/help
+// overlays' visual language: a pink header title, the pre-styled context lines,
+// a blank spacer, then one arrow-selectable row per option — the cursor row
+// gets the selection bar, danger rows render red, and every row shows its
+// mnemonic key right-aligned and dim. A footer legend advertises the keys.
+func (m Model) renderConfirm(h int) string {
+	c := m.confirm
+	innerW := clamp(m.width-8, 32, 56)
+
+	lines := []string{header(c.title, -1), ""}
+	for _, ctx := range c.context {
+		lines = append(lines, "  "+ctx)
+	}
+	lines = append(lines, "")
+	for i, opt := range c.options {
+		lines = append(lines, m.confirmOptionLine(opt, i == c.cursor, innerW))
+	}
+	lines = append(lines, "", "  "+strings.Join([]string{
+		keyhint("↑↓", "move"), keyhint("enter", "confirm"), keyhint("esc", "cancel"),
+	}, helpStyle.Render("  ·  ")))
+
+	boxStr := box(lines, innerW, len(lines), true)
+	return centerBlock(boxStr, m.width, h)
+}
+
+// confirmOptionLine renders one option row: the label on the left and its
+// mnemonic key right-aligned dim on the right. Danger rows paint both red; the
+// cursor row gets the full-width selection bar (matching the board's rows).
+func (m Model) confirmOptionLine(opt confirmOption, selected bool, innerW int) string {
+	labelSt, keySt := nameStyle, dimStyle
+	if opt.danger {
+		labelSt, keySt = errStyle, errStyle
+	}
+	left := "  " + labelSt.Render(opt.label)
+	right := keySt.Render(opt.key)
+	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right)-2)
+	row := left + strings.Repeat(" ", gap) + right + "  "
+	if selected {
+		return selBar(row, innerW)
+	}
+	return row
+}
+
+// removeConfirmContext builds the context lines shown atop the remove-worktree
+// panel: the repo / worktree identity (bright), a one-line summary of the
+// branch's divergence from its base and its uncommitted diffstat (reusing the
+// deck detail line's data sources — Ahead/Behind and the vs-HEAD Add/Del), and
+// — only when the tree is dirty — a red warning that the uncommitted work will
+// be lost. Pieces that aren't available are omitted rather than triggering a
+// fresh git call to fill them in.
+func removeConfirmContext(it activeItem) []string {
+	v := it.view
+	lines := []string{repoHdrStyle.Render(it.repo.Name + " / " + v.WT.Name)}
+
+	var summary []string
+	if v.HasBase && (v.Ahead > 0 || v.Behind > 0) {
+		summary = append(summary, divergencePhrase(v))
+	}
+	if v.Dirty && v.Add+v.Del > 0 {
+		summary = append(summary, fmt.Sprintf("+%d −%d uncommitted", v.Add, v.Del))
+	}
+	if len(summary) > 0 {
+		lines = append(lines, dimStyle.Render(strings.Join(summary, " · ")))
+	}
+	if v.Dirty {
+		lines = append(lines, errStyle.Render("✷ uncommitted changes will be lost"))
+	}
+	return lines
+}
+
+// divergencePhrase spells out a branch's divergence from its base for the
+// remove panel, e.g. "↑23 ahead of main" — naming the base when known and
+// falling back to the bare count otherwise. The caller gates it on HasBase and
+// a non-zero divergence.
+func divergencePhrase(v WorktreeView) string {
+	switch {
+	case v.Ahead > 0 && v.Behind > 0:
+		return fmt.Sprintf("↑%d ahead, ↓%d behind", v.Ahead, v.Behind)
+	case v.Ahead > 0:
+		if v.BaseBranch != "" {
+			return fmt.Sprintf("↑%d ahead of %s", v.Ahead, v.BaseBranch)
+		}
+		return fmt.Sprintf("↑%d ahead", v.Ahead)
+	default:
+		if v.BaseBranch != "" {
+			return fmt.Sprintf("↓%d behind %s", v.Behind, v.BaseBranch)
+		}
+		return fmt.Sprintf("↓%d behind", v.Behind)
+	}
+}
+
 // renderHelp draws the key + legend overlay, centered in the body area. The
 // session bindings are read from the model so the overlay can never drift from
 // the real (configurable) keys.
@@ -1583,7 +1680,9 @@ func (m Model) sessionFooter() string {
 }
 
 // footerContent builds the two-row footer (status line + help line) before
-// centering.
+// centering. The destructive-confirm modes never reach here — they replace the
+// whole deck body with their own panel (see View) — so only the create form
+// needs its own status-styled footer.
 func (m Model) footerContent() string {
 	switch m.mode {
 	case modeCreateName:
@@ -1593,8 +1692,6 @@ func (m Model) footerContent() string {
 			return "\n" + errStyle.Render(m.status)
 		}
 		return "\n" + helpStyle.Render(m.status)
-	case modeConfirmRemove, modeConfirmQuit, modeConfirmStop:
-		return "\n" + errStyle.Render(m.status)
 	}
 
 	var hints []string

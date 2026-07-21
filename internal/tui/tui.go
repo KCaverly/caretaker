@@ -91,6 +91,73 @@ const (
 	modeConfirmStop // guarding "d" while the target worktree has a busy agent
 )
 
+// confirmOption is one selectable row of a destructive-confirm panel: a
+// human-readable label, the mnemonic key that fires it directly (so the old
+// muscle memory — `x` then `y`/`b` — keeps working), and whether it performs a
+// destructive action and should render red.
+type confirmOption struct {
+	label  string // "remove worktree, keep branch"
+	key    string // mnemonic that fires it directly: "b", "y", "v", "esc", "n"
+	danger bool   // render red (both label and mnemonic)
+}
+
+// confirmState carries everything the centered confirm panel draws for the
+// three destructive prompts. The active picker mode (modeConfirmRemove/Quit/
+// Stop) still decides which confirm is live and which handler resolves the
+// keys; this only holds the panel's content, so it replaces the old
+// status-line sentence entirely. cursor starts on the SAFE option.
+type confirmState struct {
+	title   string          // "REMOVE WORKTREE", "QUIT CT", "STOP WORKSPACE"
+	context []string        // pre-styled context lines drawn above the options
+	options []confirmOption // vertical, arrow-selectable
+	cursor  int             // index into options; starts on the safe row
+}
+
+// confirmActive reports whether one of the three destructive-confirm panels is
+// up, so the view can layer it over the deck and the key router can keep it
+// modal.
+func (m Model) confirmActive() bool {
+	return m.mode == modeConfirmRemove || m.mode == modeConfirmQuit || m.mode == modeConfirmStop
+}
+
+// confirmIsNav reports whether key moves the confirm panel's cursor rather than
+// resolving it. It is what keeps j/k (and the arrow/ctrl aliases) from being
+// swept up by the "anything else cancels" fallback the mnemonic handlers keep.
+func confirmIsNav(key string) bool {
+	switch key {
+	case "up", "down", "k", "j", "ctrl+p", "ctrl+n":
+		return true
+	}
+	return false
+}
+
+// confirmMove returns the cursor position after applying a navigation key,
+// clamped to the option list. Shared by all three confirm handlers.
+func (m Model) confirmMove(key string) int {
+	cur := m.confirm.cursor
+	switch key {
+	case "up", "k", "ctrl+p":
+		if cur > 0 {
+			cur--
+		}
+	case "down", "j", "ctrl+n":
+		if cur < len(m.confirm.options)-1 {
+			cur++
+		}
+	}
+	return cur
+}
+
+// confirmSelectedKey maps an "enter" press to the mnemonic of the option under
+// the cursor, so the arrow-selectable rows resolve through the exact same key
+// paths as the direct mnemonics.
+func (m Model) confirmSelectedKey() string {
+	if m.confirm.cursor < 0 || m.confirm.cursor >= len(m.confirm.options) {
+		return ""
+	}
+	return m.confirm.options[m.confirm.cursor].key
+}
+
 // attnLevel ranks an agent's attention state, highest first when sorting.
 // attnWaiting is derived live from the polled agent status and never stored;
 // attnDone is an unread marker recorded when a transition is observed and
@@ -210,6 +277,11 @@ type Model struct {
 
 	focus focus
 	mode  mode
+
+	// confirm backs the centered panel drawn for the destructive-confirm modes.
+	// Populated on entry (beginRemove, the quit guard, the stop guard) and
+	// cleared when the prompt resolves; the zero value while no confirm is up.
+	confirm confirmState
 
 	// "new" section
 	filter      textinput.Model
@@ -1895,8 +1967,7 @@ func (m Model) paletteCommands() []paletteCmd {
 		paletteCmd{title: "quit ct", hint: "ctrl+c", run: func(m Model) (tea.Model, tea.Cmd) {
 			if n := m.busyHostedAgents(""); n > 0 {
 				m.screen = screenPicker
-				m.mode = modeConfirmQuit
-				m.status = fmt.Sprintf("%d busy agent(s) running — quit anyway? (y/n)", n)
+				m = m.beginQuitConfirm(n)
 				return m, nil
 			}
 			return m, tea.Quit
@@ -3025,8 +3096,7 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// agent and nvim. Guard it only when a hosted agent is mid-task; the
 		// common (nothing busy) case quits with no friction.
 		if n := m.busyHostedAgents(""); n > 0 {
-			m.mode = modeConfirmQuit
-			m.status = fmt.Sprintf("%d busy agent(s) running — quit anyway? (y/n)", n)
+			m = m.beginQuitConfirm(n)
 			return m, nil
 		}
 		return m, tea.Quit
@@ -3137,8 +3207,7 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			// Stopping hard-kills this workspace's sessions. Guard it when the
 			// worktree has a busy agent; otherwise stop instantly as before.
 			if m.busyHostedAgents(key) > 0 {
-				m.mode = modeConfirmStop
-				m.status = fmt.Sprintf("%q has a busy agent — stop anyway? (y/n)", it.view.WT.Name)
+				m = m.beginStopConfirm(it.view.WT.Name)
 				return m, nil
 			}
 			m.stopWorkspace(key)
@@ -3163,18 +3232,58 @@ func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// beginRemove enters the remove-worktree confirm prompt for it, with a
-// dirty-aware status line (git worktree remove --force discards uncommitted work
-// silently, so the prompt must warn when the tree is dirty). Both the deck's `x`
-// key and the diff viewer's `x` (the review loop) route through here so the two
-// prompt texts can never drift. The caller guards against the main worktree,
-// which can't be removed.
+// beginRemove enters the remove-worktree confirm panel for it. The panel is
+// dirty-aware (git worktree remove --force discards uncommitted work silently,
+// so a dirty tree gets an explicit red warning above the destructive option),
+// and its cursor starts on the safe "keep branch" row so the reflexive enter
+// keeps the branch. Both the deck's `x` key and the diff viewer's `x` (the
+// review loop) route through here so the two prompts can never drift. The
+// caller guards against the main worktree, which can't be removed.
 func (m Model) beginRemove(it activeItem) Model {
 	m.mode = modeConfirmRemove
-	if it.view.Dirty {
-		m.status = fmt.Sprintf("remove worktree %q? UNCOMMITTED CHANGES will be lost. (y = remove + delete branch / b = keep branch / v = view diff / n)", it.view.WT.Name)
-	} else {
-		m.status = fmt.Sprintf("remove worktree %q? (y = remove + delete branch / b = keep branch / v = view diff / n)", it.view.WT.Name)
+	m.status = ""
+	m.confirm = confirmState{
+		title:   "REMOVE WORKTREE",
+		context: removeConfirmContext(it),
+		options: []confirmOption{
+			{label: "remove worktree, keep branch", key: "b"},
+			{label: "remove worktree + delete branch", key: "y", danger: true},
+			{label: "view diff first", key: "v"},
+			{label: "cancel", key: "esc"},
+		},
+	}
+	return m
+}
+
+// beginQuitConfirm enters the quit guard's confirm panel, warning that n busy
+// hosted agents are still running. The cursor starts on the safe "cancel" row.
+func (m Model) beginQuitConfirm(n int) Model {
+	m.mode = modeConfirmQuit
+	m.status = ""
+	m.confirm = confirmState{
+		title:   "QUIT CT",
+		context: []string{dimStyle.Render(fmt.Sprintf("%d busy agent(s) still running — quitting kills them", n))},
+		options: []confirmOption{
+			{label: "cancel", key: "esc"},
+			{label: "quit anyway", key: "y", danger: true},
+		},
+	}
+	return m
+}
+
+// beginStopConfirm enters the stop guard's confirm panel for the named
+// worktree, whose busy agent stopping would kill. The cursor starts on the safe
+// "cancel" row.
+func (m Model) beginStopConfirm(name string) Model {
+	m.mode = modeConfirmStop
+	m.status = ""
+	m.confirm = confirmState{
+		title:   "STOP WORKSPACE",
+		context: []string{dimStyle.Render(fmt.Sprintf("%q has a busy agent — stopping kills it", name))},
+		options: []confirmOption{
+			{label: "cancel", key: "esc"},
+			{label: "stop anyway", key: "y", danger: true},
+		},
 	}
 	return m
 }
@@ -3228,18 +3337,26 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleConfirmKey resolves the remove-worktree prompt: "y" removes the
-// worktree and deletes its branch, "b" removes the worktree but keeps the
-// branch, anything else cancels. The target is re-read from the cursor (it
-// can't move while the prompt is modal), mirroring the other confirm handlers.
+// handleConfirmKey resolves the remove-worktree confirm panel. Navigation keys
+// (arrows / j / k / ctrl+p / ctrl+n) move the cursor and enter fires the option
+// under it; every other key is dispatched by mnemonic, so the direct-key paths
+// are byte-identical to the old status-line prompt: "y" removes the worktree
+// and deletes its branch, "b" removes it but keeps the branch, "v" opens the
+// diff for the review loop, and anything else cancels.
 func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
 	// "v" exits the prompt and opens the diff for the same worktree; from the
 	// diff, `x` loops back to this prompt (the review loop).
 	if key == "v" {
 		it, ok := m.selectedActive()
-		m.mode = modeNormal
-		m.status = ""
+		m = m.clearConfirm()
 		if !ok {
 			return m, nil
 		}
@@ -3248,9 +3365,8 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key == "y" || key == "b" {
 		deleteBranch := key == "y"
 		it, ok := m.selectedActive()
-		m.mode = modeNormal
+		m = m.clearConfirm()
 		if !ok {
-			m.status = ""
 			return m, nil
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
@@ -3264,39 +3380,62 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		remove := func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt, deleteBranch)} }
 		return m, tea.Batch(remove, flashTick)
 	}
-	m.mode = modeNormal
-	m.status = ""
+	m = m.clearConfirm()
 	return m, nil
 }
 
-// handleConfirmQuitKey resolves the quit guard: "y" quits (running CloseAll,
-// which kills every hosted pty), anything else cancels back to the picker.
+// handleConfirmQuitKey resolves the quit guard: navigation moves the cursor,
+// enter fires the option under it, "y" quits directly (running CloseAll, which
+// kills every hosted pty), and anything else cancels back to the picker.
 func (m Model) handleConfirmQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "y" {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	if key == "y" {
 		return m, tea.Quit
 	}
-	m.mode = modeNormal
-	m.status = ""
+	m = m.clearConfirm()
 	return m, nil
 }
 
-// handleConfirmStopKey resolves the stop guard: "y" stops the selected
-// worktree, anything else cancels. The target is re-read from the cursor here
-// (it can't move while the prompt is modal), mirroring handleConfirmKey.
+// handleConfirmStopKey resolves the stop guard: navigation moves the cursor,
+// enter fires the option under it, "y" stops the selected worktree directly,
+// and anything else cancels. The target is re-read from the cursor here (it
+// can't move while the prompt is modal), mirroring handleConfirmKey.
 func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "y" {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	if key == "y" {
 		it, ok := m.selectedActive()
-		m.mode = modeNormal
+		m = m.clearConfirm()
 		if !ok {
-			m.status = ""
 			return m, nil
 		}
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+it.view.WT.Name))
 	}
+	m = m.clearConfirm()
+	return m, nil
+}
+
+// clearConfirm dismisses whichever confirm panel is up: back to normal mode,
+// cleared panel state, and no lingering status text.
+func (m Model) clearConfirm() Model {
 	m.mode = modeNormal
 	m.status = ""
-	return m, nil
+	m.confirm = confirmState{}
+	return m
 }
 
 // --- diff viewer ---
