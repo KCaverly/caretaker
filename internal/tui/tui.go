@@ -1572,6 +1572,9 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case m.keys.Prompt:
 		return m.openQuickPrompt()
+	case m.keys.Attention:
+		// The jump works from within the board too: focusBoardAgent closes it.
+		return m.jumpAttention()
 	case "up", "k", "ctrl+p":
 		if m.boardCursor > 0 {
 			m.boardCursor--
@@ -1691,6 +1694,54 @@ func (m Model) focusBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 	return model, cmd
 }
 
+// jumpAttention drops the user straight into the session of the agent that most
+// needs them, collapsing the board's open→scan→arrow→enter flow — the app's most
+// common action — into one reserved chord. The candidate list is every agent
+// with pending attention taken in board order, which already floats live-waiting
+// worktrees above unread-done ones and sorts the most urgent agent first within
+// each group, so buildBoard's ordering is reused rather than re-derived: the
+// first candidate is always the most pressing.
+//
+// Repeated presses walk the queue. When the user is already parked on a
+// candidate's agent screen the jump advances to the next candidate (wrapping);
+// otherwise it lands on the first. With nothing pending it is a silent no-op —
+// no flash, no error — so the key is safe to lean on. The jump itself routes
+// through focusBoardAgent so workspace activation, attention-clearing, and
+// persistence can never drift from the board's own enter behavior.
+func (m Model) jumpAttention() (tea.Model, tea.Cmd) {
+	rows, nav := m.buildBoard()
+	var candidates []boardRow
+	for _, ri := range nav {
+		if r := rows[ri]; r.isAgent && r.attn > attnNone {
+			candidates = append(candidates, r)
+		}
+	}
+	if len(candidates) == 0 {
+		return m, nil
+	}
+	// Default to the most pressing candidate. When already on the agent screen
+	// and the focused agent is itself a candidate, advance past it so successive
+	// presses cycle through the queue and wrap.
+	target := 0
+	if m.screen == screenAgent && m.current != nil && m.current.ws != nil {
+		if a := m.current.ws.ActiveAgentSession(); a != nil {
+			for i, c := range candidates {
+				if c.pid == a.Pid() {
+					target = (i + 1) % len(candidates)
+					break
+				}
+			}
+		}
+	}
+	// Land on a bare agent screen: clear any overlay open at the call site so the
+	// jump doesn't leave one stacked over the destination. focusBoardAgent resets
+	// boardOpen itself; the invocation from handleBoard relies on that.
+	m.helpOpen = false
+	m.usageOpen = false
+	m.diffOpen = false
+	return m.focusBoardAgent(candidates[target])
+}
+
 // --- command palette ---
 
 // paletteCmd is one executable row of the command palette: a verb-phrase
@@ -1782,8 +1833,12 @@ func (m Model) paletteCommands() []paletteCmd {
 		}
 	}
 
-	// 4. Agents — the board, the new-agent launchers, agent rotation (only with a
-	// pool worth rotating), and the home workspace.
+	// 4. Agents — the attention jump (only while something is pending, mirroring
+	// the bar badge), the board, the new-agent launchers, agent rotation (only
+	// with a pool worth rotating), and the home workspace.
+	if waiting, done := m.attnSummary(); waiting+done > 0 {
+		cmds = append(cmds, paletteCmd{title: "jump to waiting agent", hint: m.keys.Attention, run: func(m Model) (tea.Model, tea.Cmd) { return m.jumpAttention() }})
+	}
 	cmds = append(cmds,
 		paletteCmd{title: "open agent board", hint: m.keys.Palette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
 		paletteCmd{title: "new agent…", run: func(m Model) (tea.Model, tea.Cmd) { return m.openNewAgentForm(), nil }},
@@ -2348,6 +2403,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == m.keys.Prompt {
 		return m.openQuickPrompt()
 	}
+	// The attention-jump chord fires from session screens and from the picker.
+	// It sits below the modal overlays handled above (palette/diff/usage/board),
+	// so those keep their precedence, and mirrors keys.Prompt's placement in the
+	// global chain. jumpAttention is a no-op when nothing is pending.
+	if msg.String() == m.keys.Attention {
+		return m.jumpAttention()
+	}
 	if msg.String() == m.keys.GlobalConfig {
 		return m.activateGlobalConfig()
 	}
@@ -2392,8 +2454,8 @@ func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
 func (m Model) isReservedActionKey(s string) bool {
 	switch s {
 	case m.keys.Cycle, m.keys.CycleBack, m.keys.Picker, m.keys.Palette, m.keys.Prompt,
-		m.keys.GlobalConfig, m.keys.NextAgent, m.keys.PrevAgent, m.keys.CommandPalette,
-		m.keys.GotoEditor, m.keys.GotoAgent, m.keys.GotoTerm:
+		m.keys.Attention, m.keys.GlobalConfig, m.keys.NextAgent, m.keys.PrevAgent,
+		m.keys.CommandPalette, m.keys.GotoEditor, m.keys.GotoAgent, m.keys.GotoTerm:
 		return true
 	}
 	if s == m.keys.Usage && m.screen == screenAgent && m.usageEnabled() {
@@ -2704,7 +2766,9 @@ func (m Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 			return m.selectTab(s)
 		}
 		if m.notifZoneAt(mo.X, mo.Y) {
-			return m.openBoard()
+			// The badge is a one-click shortcut to the agent that needs attention,
+			// the same destination (and cycling) as the attention-jump chord.
+			return m.jumpAttention()
 		}
 		if m.usageZoneAt(mo.X, mo.Y) {
 			m.usageOpen = true

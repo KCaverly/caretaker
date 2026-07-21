@@ -180,7 +180,8 @@ func (m Model) renderBar() string {
 // renderNotifZone builds the right-side attention summary: "! N" (red) for
 // worktrees where an agent is waiting on input and "* N" (green) for worktrees
 // with unread completions. Returns "" when nothing is pending. Clicking it
-// opens the agent board.
+// jumps straight to the agent needing attention (the attention-jump chord's
+// destination), cycling to the next on each click.
 func (m Model) renderNotifZone() string {
 	waiting, done := m.attnSummary()
 	var parts []string
@@ -1432,6 +1433,7 @@ func (m Model) renderHelp(h int) string {
 		row(m.keys.CommandPalette, "command palette (every action)"),
 	)
 	rows = append(rows,
+		row(m.keys.Attention, "jump to agent needing attention"),
 		row(m.keys.PrevAgent+" / "+m.keys.NextAgent, "prev / next agent"),
 	)
 	if m.usageEnabled() {

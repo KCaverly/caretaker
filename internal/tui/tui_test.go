@@ -1519,6 +1519,161 @@ func TestAttentionClearedOnAgentView(t *testing.T) {
 	}
 }
 
+// activateAgents registers a workspace under key at dir with n live (cheap-exit)
+// agents, so buildBoard groups it and each agent carries a real pid to key
+// agentStatus/attention against.
+func activateAgents(t *testing.T, m Model, key, dir string, n int) *session.Workspace {
+	t.Helper()
+	specs := make([]session.Spec, n)
+	for i := range specs {
+		specs[i] = session.Spec{Kind: session.Agent, Argv: []string{"/usr/bin/true"}, Provider: agent.Claude}
+	}
+	ws, err := m.mgr.Activate(key, dir, specs, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ws
+}
+
+// TestJumpAttentionNoop: with nothing pending the jump is a silent no-op — no
+// screen change, no workspace switch, no command.
+func TestJumpAttentionNoop(t *testing.T) {
+	m := sampleModel() // picker, no workspaces, no attention
+	mm, cmd := m.jumpAttention()
+	m2 := mm.(Model)
+	if m2.screen != screenPicker || m2.current != nil || m2.boardOpen {
+		t.Fatalf("jump with nothing pending should be a no-op, got screen=%v current=%v board=%v",
+			m2.screen, m2.current, m2.boardOpen)
+	}
+	if cmd != nil {
+		t.Error("no-op jump should not emit a command")
+	}
+}
+
+// TestJumpAttentionFocusesWaitingAgent: a waiting agent in a non-current
+// worktree is jumped to directly — the workspace switches and the agent screen
+// comes up.
+func TestJumpAttentionFocusesWaitingAgent(t *testing.T) {
+	m := sampleModel()
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	wsA := activateAgents(t, m, "r/a", dirA, 1)
+	wsB := activateAgents(t, m, "r/b", dirB, 1)
+	defer m.mgr.CloseAll()
+	m.active = []activeItem{
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dirA}}},
+		{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "b", Path: dirB}}},
+	}
+	m.current = &workspaceRef{repo: "r", worktree: "a", key: "r/a", path: dirA, ws: wsA}
+	m.screen = screenEditor
+	// Only the r/b agent is waiting.
+	m.agentStatus = map[int]AgentStatus{wsB.Agents[0].Pid(): {Status: "waiting", Cwd: dirB}}
+
+	mm, _ := m.jumpAttention()
+	m2 := mm.(Model)
+	if m2.screen != screenAgent {
+		t.Fatalf("jump should land on the agent screen, got %v", m2.screen)
+	}
+	if m2.current == nil || m2.current.key != "r/b" {
+		t.Fatalf("jump should switch to r/b, got %+v", m2.current)
+	}
+}
+
+// TestJumpAttentionWaitingBeatsDone: with one done and one waiting agent, the
+// first press lands on the waiting one — buildBoard already sorts waiting ahead
+// of done within a group and the jump reuses that order.
+func TestJumpAttentionWaitingBeatsDone(t *testing.T) {
+	m := sampleModel()
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	ws := activateAgents(t, m, "r/a", dir, 2)
+	defer m.mgr.CloseAll()
+	m.active = []activeItem{{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dir}}}}
+	m.current = &workspaceRef{repo: "r", worktree: "a", key: "r/a", path: dir, ws: ws}
+	m.screen = screenEditor
+	donePid, waitPid := ws.Agents[0].Pid(), ws.Agents[1].Pid()
+	m.attention = map[int]attnEntry{donePid: {level: attnDone, key: "r/a"}}
+	m.agentStatus = map[int]AgentStatus{waitPid: {Status: "waiting", Cwd: dir}}
+
+	mm, _ := m.jumpAttention()
+	m2 := mm.(Model)
+	if m2.screen != screenAgent || m2.current.ws.ActiveAgent != 1 {
+		t.Fatalf("waiting agent (index 1) should win the first jump, got screen=%v active=%d",
+			m2.screen, m2.current.ws.ActiveAgent)
+	}
+}
+
+// TestJumpAttentionCycles: with two waiting agents, repeated presses walk the
+// queue and wrap — first press → agent 0, again → agent 1, again → back to 0.
+func TestJumpAttentionCycles(t *testing.T) {
+	m := sampleModel()
+	m.state = &state.State{LastOpened: map[string]int64{}, Workspaces: map[string]*state.WorkspaceState{}}
+	dir := t.TempDir()
+	ws := activateAgents(t, m, "r/a", dir, 2)
+	defer m.mgr.CloseAll()
+	m.active = []activeItem{{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dir}}}}
+	m.current = &workspaceRef{repo: "r", worktree: "a", key: "r/a", path: dir, ws: ws}
+	m.screen = screenEditor
+	m.agentStatus = map[int]AgentStatus{
+		ws.Agents[0].Pid(): {Status: "waiting", Cwd: dir},
+		ws.Agents[1].Pid(): {Status: "waiting", Cwd: dir},
+	}
+
+	jump := func(m Model) Model {
+		mm, _ := m.jumpAttention()
+		return mm.(Model)
+	}
+	m = jump(m) // not on an agent yet → most pressing candidate (agent 0)
+	if m.screen != screenAgent || m.current.ws.ActiveAgent != 0 {
+		t.Fatalf("first press should focus agent 0, got screen=%v active=%d", m.screen, m.current.ws.ActiveAgent)
+	}
+	m = jump(m) // focused on a candidate → advance to agent 1
+	if m.current.ws.ActiveAgent != 1 {
+		t.Fatalf("second press should advance to agent 1, got %d", m.current.ws.ActiveAgent)
+	}
+	m = jump(m) // last candidate → wrap back to agent 0
+	if m.current.ws.ActiveAgent != 0 {
+		t.Fatalf("third press should wrap back to agent 0, got %d", m.current.ws.ActiveAgent)
+	}
+}
+
+// TestAttentionKeyReserved: the attention chord defaults to alt+n and fires
+// through the help overlay like the other global action keys.
+func TestAttentionKeyReserved(t *testing.T) {
+	m := sampleModel()
+	if m.keys.Attention != "alt+n" {
+		t.Fatalf("default attention key = %q, want alt+n", m.keys.Attention)
+	}
+	if !m.isReservedActionKey(m.keys.Attention) {
+		t.Error("attention key should be a reserved action key")
+	}
+}
+
+// TestPaletteJumpRowGatedOnAttention: the "jump to waiting agent" palette row
+// appears only while something is pending.
+func TestPaletteJumpRowGatedOnAttention(t *testing.T) {
+	has := func(m Model) bool {
+		for _, c := range m.paletteCommands() {
+			if c.title == "jump to waiting agent" {
+				return true
+			}
+		}
+		return false
+	}
+
+	m := sampleModel()
+	if has(m) {
+		t.Fatal("no attention pending should not offer the jump row")
+	}
+
+	dir := t.TempDir()
+	m.active = []activeItem{{repo: repo.Repo{Name: "r"}, view: WorktreeView{WT: repo.Worktree{Name: "a", Path: dir}}}}
+	m.agentStatus = map[int]AgentStatus{1: {Status: "waiting", Cwd: dir}}
+	if !has(m) {
+		t.Fatal("a waiting agent should offer the jump row")
+	}
+}
+
 // waitForSession polls a session's rendered screen until it contains want.
 func waitForSession(t *testing.T, s *session.Session, want string) {
 	t.Helper()

@@ -85,6 +85,7 @@ next_agent  = "f4"     # next agent in the active worktree
 prev_agent  = "f3"     # previous agent in the active worktree
 global_config = "alt+g" # open the home-directory workspace
 prompt      = "alt+y"  # new-agent form, pre-set to background + home
+attention   = "alt+n"  # jump to the agent needing attention (cycles on repeat)
 usage       = "alt+u"  # plan usage for enabled agent providers
 help        = "f1"     # toggle the key/legend overlay (also "?" in the deck)
 command_palette = "alt+p" # fuzzy-searchable list of every action + its key
@@ -168,7 +169,12 @@ worktree shows on the right.
 ### Agent providers and lifecycle
 
 Press **`alt+a`** to open the agent board for every active worktree. From there, `n` creates an
-agent, `enter` focuses one, `r` restarts it in place, and `d` closes it. When more than one provider
+agent, `enter` focuses one, `r` restarts it in place, and `d` closes it.
+
+Press **`alt+n`** (from anywhere) to jump straight into the session of the agent that most needs
+you — agents waiting on input first, then unread completions — without opening the board; pressing
+it again cycles to the next agent needing attention. Clicking the `! N` badge in the status bar does
+the same thing. When more than one provider
 is enabled, the new-agent form adds a Claude/Codex selector; when only one is enabled, that row is
 hidden. Each time the form opens it starts on `agents.default`. Board and status-bar labels include
 the provider so mixed pools remain easy to distinguish.
