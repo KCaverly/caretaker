@@ -118,6 +118,15 @@ func fetchOrigin(dir string) error {
 // github.available=false and warnings, so the local stack shape still renders.
 // Only a failure to read local git state (the log or the refs) returns an error.
 func Status(p Params) (StackStatus, error) {
+	st, _, err := gatherStatus(p)
+	return st, err
+}
+
+// gatherStatus is the shared engine behind Status and Submit: it runs the gather
+// steps and reconciles them, returning both the public StackStatus and the raw
+// prRecords (which carry PR titles and bodies the public view omits, and which
+// Submit's planner needs to decide retitles and nav-body splices).
+func gatherStatus(p Params) (StackStatus, []prRecord, error) {
 	st := StackStatus{
 		Schema:      1,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
@@ -137,15 +146,15 @@ func Status(p Params) (StackStatus, error) {
 
 	commits, err := localCommits(p.WorktreeDir, p.MainBranch)
 	if err != nil {
-		return st, err
+		return st, nil, err
 	}
 	remotes, err := remoteBranches(p.WorktreeDir, p.WorktreeName)
 	if err != nil {
-		return st, err
+		return st, nil, err
 	}
 	prs, gh := gatherGitHub(p.WorktreeDir, p.WorktreeName)
 	st.GitHub = gh
 
 	st.Stack, st.Commits = reconcile(p.WorktreeName, p.MainBranch, commits, remotes, prs)
-	return st, nil
+	return st, prs, nil
 }

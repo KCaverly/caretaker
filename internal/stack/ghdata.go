@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,7 @@ type prRecord struct {
 	Number   int
 	URL      string
 	Title    string
+	Body     string // PR body, needed to splice the nav table on submit
 	State    string // OPEN, CLOSED, MERGED
 	Draft    bool
 	Head     string // headRefName
@@ -32,6 +34,7 @@ type ghPR struct {
 	Number            int       `json:"number"`
 	URL               string    `json:"url"`
 	Title             string    `json:"title"`
+	Body              string    `json:"body"`
 	State             string    `json:"state"`
 	IsDraft           bool      `json:"isDraft"`
 	HeadRefName       string    `json:"headRefName"`
@@ -72,7 +75,7 @@ func gatherGitHub(dir, worktree string) ([]prRecord, GitHub) {
 
 	out, err := runGH(dir,
 		"pr", "list", "--state", "all", "--limit", "200",
-		"--json", "number,url,title,state,isDraft,headRefName,baseRefName,reviewDecision,statusCheckRollup,mergedAt")
+		"--json", "number,url,title,body,state,isDraft,headRefName,baseRefName,reviewDecision,statusCheckRollup,mergedAt")
 	if err != nil {
 		gh.Warnings = append(gh.Warnings, "gh pr list failed (missing auth or repo?): "+err.Error())
 		return nil, gh
@@ -103,6 +106,7 @@ func filterStackPRs(prs []ghPR, worktree string) []prRecord {
 			Number:   p.Number,
 			URL:      p.URL,
 			Title:    p.Title,
+			Body:     p.Body,
 			State:    p.State,
 			Draft:    p.IsDraft,
 			Head:     p.HeadRefName,
@@ -200,6 +204,72 @@ func checkName(ck ghCheck) string {
 	default:
 		return "(unnamed check)"
 	}
+}
+
+// requireGH is submit's hard precondition: gh must be on PATH. Status soft-fails
+// when gh is missing, but submit cannot open or edit PRs without it, so it fails
+// early with a clear message. (Authentication is verified implicitly by the
+// status gather, which reports github.available=false when gh is unauthed.)
+func requireGH() error {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return fmt.Errorf("gh CLI not found on PATH; stack submit needs GitHub access")
+	}
+	return nil
+}
+
+// ghCreateArgs builds the argv for creating a stack PR: it heads the given
+// branch, bases on the previous commit's branch (or main for the bottom), and
+// carries the title and full body. --draft is appended when requested. Kept pure
+// and separate from the runner so the exact argv is unit-testable without ever
+// invoking gh.
+func ghCreateArgs(head, base, title, body string, draft bool) []string {
+	args := []string{"pr", "create", "--head", head, "--base", base, "--title", title, "--body", body}
+	if draft {
+		args = append(args, "--draft")
+	}
+	return args
+}
+
+// ghEditBaseArgs builds the argv to retarget a PR onto a new base branch.
+func ghEditBaseArgs(number int, base string) []string {
+	return []string{"pr", "edit", strconv.Itoa(number), "--base", base}
+}
+
+// ghEditTitleArgs builds the argv to update a PR's title after a commit subject
+// changed.
+func ghEditTitleArgs(number int, title string) []string {
+	return []string{"pr", "edit", strconv.Itoa(number), "--title", title}
+}
+
+// ghEditBodyArgs builds the argv to replace a PR's body (used for the nav-table
+// splice).
+func ghEditBodyArgs(number int, body string) []string {
+	return []string{"pr", "edit", strconv.Itoa(number), "--body", body}
+}
+
+// ghCreatePR creates a PR via the gh CLI. Mutating: never called under
+// --dry-run.
+func ghCreatePR(dir, head, base, title, body string, draft bool) error {
+	_, err := runGH(dir, ghCreateArgs(head, base, title, body, draft)...)
+	return err
+}
+
+// ghEditBase retargets a PR's base branch. Mutating.
+func ghEditBase(dir string, number int, base string) error {
+	_, err := runGH(dir, ghEditBaseArgs(number, base)...)
+	return err
+}
+
+// ghEditTitle updates a PR's title. Mutating.
+func ghEditTitle(dir string, number int, title string) error {
+	_, err := runGH(dir, ghEditTitleArgs(number, title)...)
+	return err
+}
+
+// ghEditBody replaces a PR's body. Mutating.
+func ghEditBody(dir string, number int, body string) error {
+	_, err := runGH(dir, ghEditBodyArgs(number, body)...)
+	return err
 }
 
 // runGH runs a gh command in dir with the same 30s-timeout, stderr-wrapping

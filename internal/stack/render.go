@@ -42,6 +42,43 @@ func Render(st StackStatus) string {
 	return b.String()
 }
 
+// RenderPlan returns a human-readable dry-run plan: one line per action, grouped
+// by kind, bottom-first within each group. An empty plan reports that the remote
+// already matches the local stack.
+func RenderPlan(st StackStatus, plan Plan) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s/%s  submit plan (dry-run)\n", st.Repo, st.Worktree)
+
+	if plan.IsEmpty() {
+		b.WriteString("  everything is in sync — nothing to submit\n")
+		return b.String()
+	}
+
+	for _, a := range plan.Assigns {
+		fmt.Fprintf(&b, "  would assign id   commit %d %s %q\n", a.Position, a.ShortSHA, a.Subject)
+	}
+	for _, p := range plan.Pushes {
+		verb := "force-update"
+		if p.Create {
+			verb = "create"
+		}
+		fmt.Fprintf(&b, "  would push %-12s %s (position %d)\n", verb, p.Branch, p.Position)
+	}
+	for _, c := range plan.Creates {
+		fmt.Fprintf(&b, "  would create PR   head %s base %s title %q\n", c.Head, c.Base, c.Title)
+	}
+	for _, r := range plan.Retargets {
+		fmt.Fprintf(&b, "  would retarget PR #%d  %s -> %s\n", r.Number, r.OldBase, r.NewBase)
+	}
+	for _, r := range plan.Retitles {
+		fmt.Fprintf(&b, "  would retitle PR  #%d  %q -> %q\n", r.Number, r.OldTitle, r.NewTitle)
+	}
+	for _, r := range plan.Bodies {
+		fmt.Fprintf(&b, "  would update body PR #%d  (nav table)\n", r.Number)
+	}
+	return b.String()
+}
+
 // glyph is the single-character status mark for a commit state: a check for
 // good/landed, a cross for problems, a dotted circle for in-flight/todo, an
 // ellipsis for "moved, needs a push".

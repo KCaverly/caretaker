@@ -34,17 +34,121 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack status [--json] [--fetch] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
 	case "status":
 		return runStackStatus(args[1:])
+	case "submit":
+		return runStackSubmit(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack status [--json] [--fetch] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+// runStackSubmit resolves the containing worktree, then runs the submit pipeline
+// (fetch, guard, trailer injection, push, PR create/retarget/retitle, nav-table
+// splice), converging the remote to the local stack. --dry-run plans without
+// mutating; --draft opens PRs as drafts; --json emits the schema-1 status (plus a
+// top-level "plan" field under --dry-run). Any usage/resolution/pipeline failure
+// exits non-zero.
+func runStackSubmit(args []string) int {
+	var (
+		asJSON bool
+		dryRun bool
+		draft  bool
+		dir    string
+	)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--dry-run":
+			dryRun = true
+		case "--draft":
+			draft = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack submit: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack submit: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack submit:", err)
+			return 1
+		}
+		dir = cwd
+	}
+
+	// Submit always fetches internally; the resolve step needn't.
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack submit:", err)
+		return 1
+	}
+
+	res, err := stack.Submit(stack.SubmitOptions{Params: params, DryRun: dryRun, Draft: draft})
+	if err != nil {
+		for _, done := range res.Executed {
+			fmt.Fprintln(os.Stderr, "  did:", done)
+		}
+		fmt.Fprintln(os.Stderr, "ct stack submit:", err)
+		return 1
+	}
+
+	if res.Nothing {
+		if asJSON {
+			return encodeStackJSON(res.Status, nil)
+		}
+		fmt.Println("nothing to submit")
+		return 0
+	}
+
+	if dryRun {
+		if asJSON {
+			return encodeStackJSON(res.Status, &res.Plan)
+		}
+		fmt.Print(stack.RenderPlan(res.Status, res.Plan))
+		return 0
+	}
+
+	if asJSON {
+		return encodeStackJSON(res.Status, nil)
+	}
+	fmt.Print(stack.Render(res.Status))
+	return 0
+}
+
+// encodeStackJSON prints a StackStatus as indented JSON. When plan is non-nil (a
+// dry-run), it adds a top-level "plan" field — additive to schema 1 — by
+// embedding the status so its fields stay at the top level.
+func encodeStackJSON(st stack.StackStatus, plan *stack.Plan) int {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	var payload any = st
+	if plan != nil {
+		payload = struct {
+			stack.StackStatus
+			Plan stack.Plan `json:"plan"`
+		}{st, *plan}
+	}
+	if err := enc.Encode(payload); err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack submit:", err)
+		return 1
+	}
+	return 0
 }
 
 // runStackStatus resolves the containing worktree (and its repo's primary tree,
