@@ -34,7 +34,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -42,11 +42,92 @@ func runStack(args []string) int {
 		return runStackStatus(args[1:])
 	case "submit":
 		return runStackSubmit(args[1:])
+	case "restack":
+		return runStackRestack(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+// runStackRestack resolves the containing worktree, then runs the restack
+// pipeline: guards, fetch, a rebase --onto that drops the landed bottom prefix,
+// deletion of the landed remote branches, and the submit convergence pipeline for
+// the survivors. --dry-run plans without mutating (the fetch aside); --json emits
+// the schema-1 status (plus a top-level "plan" field under --dry-run). Any
+// usage/resolution/pipeline failure exits non-zero.
+func runStackRestack(args []string) int {
+	var (
+		asJSON bool
+		dryRun bool
+		dir    string
+	)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--dry-run":
+			dryRun = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack restack: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack restack: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack restack:", err)
+			return 1
+		}
+		dir = cwd
+	}
+
+	// Restack always fetches internally; the resolve step needn't.
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack restack:", err)
+		return 1
+	}
+
+	res, err := stack.Restack(stack.RestackOptions{Params: params, DryRun: dryRun})
+	if err != nil {
+		for _, done := range res.Executed {
+			fmt.Fprintln(os.Stderr, "  did:", done)
+		}
+		fmt.Fprintln(os.Stderr, "ct stack restack:", err)
+		return 1
+	}
+
+	if res.Nothing {
+		if asJSON {
+			return encodeStackJSON(res.Status, nil)
+		}
+		fmt.Println("nothing to restack")
+		return 0
+	}
+
+	if dryRun {
+		if asJSON {
+			return encodeStackJSON(res.Status, &res.Plan)
+		}
+		fmt.Print(stack.RenderRestackPlan(res))
+		return 0
+	}
+
+	if asJSON {
+		return encodeStackJSON(res.Status, nil)
+	}
+	fmt.Print(stack.Render(res.Status))
+	return 0
 }
 
 // runStackSubmit resolves the containing worktree, then runs the submit pipeline

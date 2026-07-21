@@ -39,6 +39,10 @@ func Render(st StackStatus) string {
 	for _, o := range st.Stack.Orphans {
 		fmt.Fprintf(&b, "  orphan PR #%d (%s) head=%s\n", o.Number, o.URL, o.Head)
 	}
+	if h := st.MergeHint; h != nil {
+		fmt.Fprintf(&b, "  merge: gh pr merge %d --squash --delete-branch --subject %q --body %q\n",
+			h.Number, h.Subject, h.Body)
+	}
 	return b.String()
 }
 
@@ -75,6 +79,54 @@ func RenderPlan(st StackStatus, plan Plan) string {
 	}
 	for _, r := range plan.Bodies {
 		fmt.Fprintf(&b, "  would update body PR #%d  (nav table)\n", r.Number)
+	}
+	return b.String()
+}
+
+// RenderRestackPlan returns a human-readable dry-run plan for a restack: the
+// landed commits that would be dropped, the exact rebase command, the remote
+// branches that would be deleted, and the post-rebase submit actions (whose SHAs
+// are post-rebase, so pushes are flagged "rebased").
+func RenderRestackPlan(res RestackResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s/%s  restack plan (dry-run)\n", res.Status.Repo, res.Status.Worktree)
+
+	for _, d := range res.Drops {
+		ref := "no PR"
+		if d.Number > 0 {
+			ref = fmt.Sprintf("#%d", d.Number)
+		}
+		fmt.Fprintf(&b, "  would drop landed  %s %s (position %d) %q\n", d.ShortSHA, ref, d.Position, d.Subject)
+	}
+	fmt.Fprintf(&b, "  would rebase       %s\n", strings.Join(res.RebaseCmd, " "))
+	for _, br := range res.BranchDeletes {
+		fmt.Fprintf(&b, "  would delete branch origin/%s\n", br)
+	}
+
+	plan := res.Plan
+	if plan.IsEmpty() {
+		b.WriteString("  survivors already converge — no post-rebase submit actions\n")
+		return b.String()
+	}
+	b.WriteString("  post-rebase submit:\n")
+	for _, a := range plan.Assigns {
+		fmt.Fprintf(&b, "    would assign id   commit %d %s %q\n", a.Position, a.ShortSHA, a.Subject)
+	}
+	for _, pa := range plan.Pushes {
+		verb := "force-update"
+		if pa.Create {
+			verb = "create"
+		}
+		fmt.Fprintf(&b, "    would push %-12s %s (rebased, position %d)\n", verb, pa.Branch, pa.Position)
+	}
+	for _, c := range plan.Creates {
+		fmt.Fprintf(&b, "    would create PR   head %s base %s title %q\n", c.Head, c.Base, c.Title)
+	}
+	for _, r := range plan.Retargets {
+		fmt.Fprintf(&b, "    would retarget PR #%d  %s -> %s\n", r.Number, r.OldBase, r.NewBase)
+	}
+	for _, r := range plan.Bodies {
+		fmt.Fprintf(&b, "    would update body PR #%d  (nav table)\n", r.Number)
 	}
 	return b.String()
 }

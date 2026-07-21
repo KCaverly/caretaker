@@ -14,17 +14,18 @@ import (
 // public PR type by carrying the head ref and raw state — fields used to match
 // PRs to commits and to classify them — that the JSON output does not expose.
 type prRecord struct {
-	Number   int
-	URL      string
-	Title    string
-	Body     string // PR body, needed to splice the nav table on submit
-	State    string // OPEN, CLOSED, MERGED
-	Draft    bool
-	Head     string // headRefName
-	Base     string // baseRefName
-	Review   string // reviewDecision
-	MergedAt string // "" when never merged
-	Checks   Checks
+	Number    int
+	URL       string
+	Title     string
+	Body      string // PR body, needed to splice the nav table on submit
+	State     string // OPEN, CLOSED, MERGED
+	Draft     bool
+	Head      string // headRefName
+	Base      string // baseRefName
+	Review    string // reviewDecision
+	Mergeable string // MERGEABLE, CONFLICTING, UNKNOWN
+	MergedAt  string // "" when never merged
+	Checks    Checks
 }
 
 // ghPR mirrors one element of `gh pr list --json …`. statusCheckRollup is a
@@ -40,6 +41,7 @@ type ghPR struct {
 	HeadRefName       string    `json:"headRefName"`
 	BaseRefName       string    `json:"baseRefName"`
 	ReviewDecision    string    `json:"reviewDecision"`
+	Mergeable         string    `json:"mergeable"`
 	StatusCheckRollup []ghCheck `json:"statusCheckRollup"`
 	MergedAt          string    `json:"mergedAt"`
 }
@@ -75,7 +77,7 @@ func gatherGitHub(dir, worktree string) ([]prRecord, GitHub) {
 
 	out, err := runGH(dir,
 		"pr", "list", "--state", "all", "--limit", "200",
-		"--json", "number,url,title,body,state,isDraft,headRefName,baseRefName,reviewDecision,statusCheckRollup,mergedAt")
+		"--json", "number,url,title,body,state,isDraft,headRefName,baseRefName,reviewDecision,mergeable,statusCheckRollup,mergedAt")
 	if err != nil {
 		gh.Warnings = append(gh.Warnings, "gh pr list failed (missing auth or repo?): "+err.Error())
 		return nil, gh
@@ -103,17 +105,18 @@ func filterStackPRs(prs []ghPR, worktree string) []prRecord {
 			continue
 		}
 		records = append(records, prRecord{
-			Number:   p.Number,
-			URL:      p.URL,
-			Title:    p.Title,
-			Body:     p.Body,
-			State:    p.State,
-			Draft:    p.IsDraft,
-			Head:     p.HeadRefName,
-			Base:     p.BaseRefName,
-			Review:   p.ReviewDecision,
-			MergedAt: p.MergedAt,
-			Checks:   summarizeChecks(p.StatusCheckRollup),
+			Number:    p.Number,
+			URL:       p.URL,
+			Title:     p.Title,
+			Body:      p.Body,
+			State:     p.State,
+			Draft:     p.IsDraft,
+			Head:      p.HeadRefName,
+			Base:      p.BaseRefName,
+			Review:    p.ReviewDecision,
+			Mergeable: p.Mergeable,
+			MergedAt:  p.MergedAt,
+			Checks:    summarizeChecks(p.StatusCheckRollup),
 		})
 	}
 	return records

@@ -26,6 +26,14 @@ func pr(num int, state, head, base, review, checksSummary string) prRecord {
 	}
 }
 
+// prm is pr() plus an explicit mergeable value (MERGEABLE / CONFLICTING /
+// UNKNOWN), for the cascade cases that turn on it.
+func prm(num int, state, head, base, review, checksSummary, mergeable string) prRecord {
+	r := pr(num, state, head, base, review, checksSummary)
+	r.Mergeable = mergeable
+	return r
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
@@ -229,6 +237,124 @@ func TestReconcile(t *testing.T) {
 			wantAction:  "wait",
 			wantChainOK: true,
 		},
+		{
+			// The cascade: A landed (still local as merged), B is green/approved and
+			// auto-retargeted onto main. Keep merging — do NOT restack.
+			name: "cascade: merged prefix + green approved main-based open -> merge",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "passing"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "merge",
+			wantChainOK: true,
+		},
+		{
+			name: "cascade blocked: merged prefix + failing bottom open -> restack",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "failing"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "restack",
+			wantChainOK: true,
+		},
+		{
+			name: "cascade blocked: merged prefix + CONFLICTING bottom open -> restack",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				prm(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "passing", "CONFLICTING"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "restack",
+			wantChainOK: true,
+		},
+		{
+			// Auto-retarget hasn't happened: B still bases on the landed branch, so
+			// the chain is broken and the cascade is blocked -> restack (not merge).
+			name: "cascade blocked: merged prefix + mis-based bottom open -> restack",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), br("aaaaaaaa"), "APPROVED", "passing"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "restack",
+			wantChainOK: false,
+		},
+		{
+			// Merged below, bottom open merely pending: CI may go green and the
+			// cascade continue, so wait rather than restack.
+			name: "cascade pending: merged prefix + pending bottom open -> wait",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "pending"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "wait",
+			wantChainOK: true,
+		},
+		{
+			// Passing but review still outstanding: wait for the reviewer, the
+			// cascade may still complete.
+			name: "cascade review: merged prefix + passing REVIEW_REQUIRED bottom open -> wait",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), main, "REVIEW_REQUIRED", "passing"),
+			},
+			wantStates:  []State{StateMerged, StateOpen},
+			wantAction:  "wait",
+			wantChainOK: true,
+		},
+		{
+			// A landed commit sitting above an unlanded one is an out-of-order land.
+			name: "non-contiguous merged prefix -> escalate",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "one"),
+				commit("bbbbbbb2222", "bbbbbbbb", "two"),
+				commit("ccccccc3333", "cccccccc", "three"),
+			},
+			remotes: map[string]string{
+				"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222", "cccccccc": "ccccccc3333",
+			},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+				pr(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "passing"),
+				pr(3, "MERGED", br("cccccccc"), br("bbbbbbbb"), "APPROVED", "passing"),
+			},
+			wantStates:  []State{StateMerged, StateOpen, StateMerged},
+			wantAction:  "escalate",
+			wantChainOK: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -295,6 +421,50 @@ func TestReconcilePRProjection(t *testing.T) {
 	}
 	if got2[0].StackID == nil || *got2[0].StackID != "aaaaaaaa" {
 		t.Errorf("stack_id = %v, want aaaaaaaa", got2[0].StackID)
+	}
+}
+
+// TestMergeHintContents verifies the squash subject/body hint: it targets the
+// bottom open PR, carries the commit subject, and keeps the message body verbatim
+// (ct-stack-id trailer included, unlike a PR body which strips it).
+func TestMergeHintContents(t *testing.T) {
+	const wt, main = "wt", "main"
+	br := func(id string) string { return "ct/" + wt + "/" + id }
+	commits := []LocalCommit{
+		commit("aaaaaaa1111", "aaaaaaaa", "one"),
+		commit("bbbbbbb2222", "bbbbbbbb", "add the widget"),
+	}
+	remotes := map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"}
+	prs := []prRecord{
+		pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+		pr(2, "OPEN", br("bbbbbbbb"), main, "APPROVED", "passing"),
+	}
+	stk, out := reconcile(wt, main, commits, remotes, prs)
+	if stk.NextAction != "merge" {
+		t.Fatalf("precondition: next_action = %q, want merge", stk.NextAction)
+	}
+
+	c := bottomOpenCommit(out)
+	if c == nil {
+		t.Fatal("bottomOpenCommit returned nil for a merge-eligible stack")
+	}
+	if c.PR == nil || c.PR.Number != 2 {
+		t.Fatalf("bottom open commit PR = %+v, want #2", c.PR)
+	}
+
+	body := "why the widget is needed\n\nct-stack-id: bbbbbbbb"
+	hint := makeMergeHint(c, body+"\n")
+	if hint == nil {
+		t.Fatal("makeMergeHint returned nil")
+	}
+	if hint.Number != 2 {
+		t.Errorf("hint number = %d, want 2", hint.Number)
+	}
+	if hint.Subject != "add the widget" {
+		t.Errorf("hint subject = %q, want %q", hint.Subject, "add the widget")
+	}
+	if hint.Body != body {
+		t.Errorf("hint body = %q, want %q (trailer retained, trailing newline trimmed)", hint.Body, body)
 	}
 }
 

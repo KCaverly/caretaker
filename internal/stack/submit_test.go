@@ -161,7 +161,7 @@ func TestPlanSubmitRetargetRetitleBody(t *testing.T) {
 	remotes := map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"}
 	// PR1 correct. PR2 bases on main (wrong: should be ct/wt/aaaaaaaa), has a
 	// stale title, and an empty body (missing nav).
-	region1 := renderNavRegion([]int{1, 2}, 0)
+	region1 := renderNavRegion(navNums(1, 2), 0)
 	prs := []prRecord{
 		prFull(1, "OPEN", br("aaaaaaaa"), main, "one", region1),
 		prFull(2, "OPEN", br("bbbbbbbb"), main, "old subject", ""),
@@ -198,8 +198,8 @@ func TestPlanSubmitIdempotentNoop(t *testing.T) {
 		commit("bbbbbbb2222", "bbbbbbbb", "two"),
 	}
 	remotes := map[string]string{"aaaaaaaa": "aaaaaaa1111", "bbbbbbbb": "bbbbbbb2222"}
-	body0 := spliceNav("", renderNavRegion([]int{1, 2}, 0))
-	body1 := spliceNav("", renderNavRegion([]int{1, 2}, 1))
+	body0 := spliceNav("", renderNavRegion(navNums(1, 2), 0))
+	body1 := spliceNav("", renderNavRegion(navNums(1, 2), 1))
 	prs := []prRecord{
 		prFull(1, "OPEN", br("aaaaaaaa"), main, "one", body0),
 		prFull(2, "OPEN", br("bbbbbbbb"), br("aaaaaaaa"), "two", body1),

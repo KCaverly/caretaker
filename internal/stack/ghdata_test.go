@@ -20,6 +20,7 @@ const ghFixture = `[
     "headRefName": "ct/wt/aaaaaaaa",
     "baseRefName": "main",
     "reviewDecision": "APPROVED",
+    "mergeable": "CONFLICTING",
     "mergedAt": "",
     "statusCheckRollup": [
       {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -36,6 +37,7 @@ const ghFixture = `[
     "headRefName": "ct/wt/bbbbbbbb",
     "baseRefName": "main",
     "reviewDecision": "APPROVED",
+    "mergeable": "MERGEABLE",
     "mergedAt": "2026-07-10T12:00:00Z",
     "statusCheckRollup": []
   },
@@ -74,10 +76,16 @@ func TestDecodeAndFilterGHPRs(t *testing.T) {
 	if recs[0].Checks.Summary != "pending" {
 		t.Errorf("PR 10 checks summary = %q, want pending", recs[0].Checks.Summary)
 	}
+	if recs[0].Mergeable != "CONFLICTING" {
+		t.Errorf("PR 10 mergeable = %q, want CONFLICTING", recs[0].Mergeable)
+	}
 
 	// PR 9: merged with a real timestamp.
 	if recs[1].Number != 9 || recs[1].State != "MERGED" || recs[1].MergedAt != "2026-07-10T12:00:00Z" {
 		t.Errorf("record[1] = %+v", recs[1])
+	}
+	if recs[1].Mergeable != "MERGEABLE" {
+		t.Errorf("PR 9 mergeable = %q, want MERGEABLE", recs[1].Mergeable)
 	}
 }
 

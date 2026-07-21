@@ -28,7 +28,7 @@ func reconcile(worktree, mainBranch string, commits []LocalCommit, remotes map[s
 		Counts:      countStates(out),
 		Orphans:     findOrphans(out, worktree, prs),
 	}
-	stk.NextAction = nextAction(out, stk, anyMergedPR(prs))
+	stk.NextAction = nextAction(out, stk, mainBranch, anyMergedPR(prs))
 	return stk, out
 }
 
@@ -145,12 +145,13 @@ func matchPRs(prs []prRecord, branch string) (merged, open, closed *prRecord) {
 // honoured.
 func publicPR(p *prRecord) *PR {
 	pr := &PR{
-		Number: p.Number,
-		URL:    p.URL,
-		Base:   p.Base,
-		Draft:  p.Draft,
-		Review: p.Review,
-		Checks: p.Checks,
+		Number:    p.Number,
+		URL:       p.URL,
+		Base:      p.Base,
+		Draft:     p.Draft,
+		Review:    p.Review,
+		Mergeable: p.Mergeable,
+		Checks:    p.Checks,
 	}
 	if p.MergedAt != "" {
 		m := p.MergedAt
@@ -159,13 +160,20 @@ func publicPR(p *prRecord) *PR {
 	return pr
 }
 
-// baseChainOK walks the open PRs bottom-up: the lowest open PR must target
-// mainBranch, and every open PR above it must target the branch of the previous
-// open-PR commit (ct/<wt>/<id>). Any mismatch breaks the chain. A stack with no
-// open PRs is vacuously OK.
+// baseChainOK walks the open PRs of the non-merged commits bottom-up: the lowest
+// such PR must target mainBranch, and every open PR above it must target the
+// branch of the previous non-merged open-PR commit (ct/<wt>/<id>). Merged commits
+// are skipped entirely — their branches are being deleted by the squash-land, so
+// the expected base never advances through them. This is what makes a lowest
+// non-merged PR that still bases on a landed commit's branch (auto-retarget not
+// yet applied) break the chain, routing it to restack rather than merge. A stack
+// with no open PRs is vacuously OK.
 func baseChainOK(commits []Commit, worktree, mainBranch string) bool {
 	expected := mainBranch
 	for _, c := range commits {
+		if c.State == StateMerged {
+			continue
+		}
 		if c.State != StateOpen || c.PR == nil {
 			continue
 		}
@@ -213,8 +221,19 @@ func countStates(commits []Commit) map[State]int {
 }
 
 // nextAction picks the single most urgent hint, first match wins, in the fixed
-// priority order: escalate, restack, submit, fix-ci, merge, wait, archive, clean.
-func nextAction(commits []Commit, stk Stack, landed bool) string {
+// cascade-merge-aware priority order:
+//
+//  1. escalate — closed PR, duplicate-id, orphan, or a non-contiguous merged prefix
+//  2. merge    — the bottom open PR is independently landable (the cascade: this
+//     fires even when landed-local commits sit below it)
+//  3. restack  — landed-local commits exist and the cascade is blocked
+//  4. submit   — an unsubmitted/unpushed/diverged/missing-pr commit or a broken
+//     base chain, with no landed-local commit involved
+//  5. fix-ci   — bottom open PR failing (no landed-local commits)
+//  6. wait     — bottom open PR pending, or passing but review outstanding
+//  7. archive  — empty stack with a landed ct/<wt>/ PR
+//  8. clean
+func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) string {
 	var hasClosed, hasDup, hasMerged, hasSubmit bool
 	for _, c := range commits {
 		switch c.State {
@@ -228,19 +247,51 @@ func nextAction(commits []Commit, stk Stack, landed bool) string {
 			hasSubmit = true
 		}
 	}
+	contiguous := mergedPrefixContiguous(commits)
 
-	switch {
-	case hasClosed || hasDup || len(stk.Orphans) > 0:
+	// 1. Escalations, including a merged commit sitting above a non-merged one
+	// (an out-of-order land the human must untangle).
+	if hasClosed || hasDup || len(stk.Orphans) > 0 || (hasMerged && !contiguous) {
 		return "escalate"
-	case hasMerged:
+	}
+
+	bottom := bottomOpenPR(commits)
+
+	// 2. Cascade merge: with landed-local commits below, a green/approved/main-
+	// based/non-conflicting bottom open PR on a well-formed chain keeps merging
+	// rather than restacking — that IS the cascade, so it beats the restack in
+	// step 3. (For a stack with no landed commits, merge is reached via the CI
+	// ladder in step 5, which still lets an ordinary submit in step 4 win first —
+	// leaving no-merged behavior unchanged.)
+	if hasMerged && bottom != nil && stk.BaseChainOK && mergeEligible(bottom, mainBranch) {
+		return "merge"
+	}
+
+	// 3. Landed-local commits exist but the cascade is blocked: the bottom open PR
+	// is mis-based, conflicting, or failing; or there is no open PR left above the
+	// landed prefix yet unlanded commits remain. Restack repairs it.
+	if hasMerged {
+		if bottom != nil {
+			if !stk.BaseChainOK || bottom.Mergeable == "CONFLICTING" || bottom.Checks.Summary == "failing" {
+				return "restack"
+			}
+			// Merely pending or awaiting review: CI may go green and the cascade
+			// continues, so wait rather than restack.
+			return "wait"
+		}
+		// No open PR above the landed prefix — drop it (and re-submit anything
+		// still stranded above the landed commits).
 		return "restack"
-	case hasSubmit || !stk.BaseChainOK:
+	}
+
+	// 4. No landed-local commits: an out-of-sync commit or a broken chain is an
+	// ordinary submit.
+	if hasSubmit || !stk.BaseChainOK {
 		return "submit"
 	}
 
-	// From here the stack is either all-open or empty. The bottom open PR drives
-	// the CI/review-gated actions.
-	if bottom := bottomOpenPR(commits); bottom != nil {
+	// 5/6. The bottom open PR drives the CI/review-gated actions.
+	if bottom != nil {
 		switch bottom.Checks.Summary {
 		case "failing":
 			return "fix-ci"
@@ -256,22 +307,83 @@ func nextAction(commits []Commit, stk Stack, landed bool) string {
 		}
 	}
 
-	// No commits and no open PRs: archive if something landed here, else clean.
+	// 7/8. No commits and no open PRs: archive if something landed here, else clean.
 	if len(commits) == 0 && landed {
 		return "archive"
 	}
 	return "clean"
 }
 
+// mergeEligible reports whether a bottom open PR is independently landable: based
+// on main, not conflicting, checks passing (or none), and either approved or with
+// no review requested. The caller additionally gates on a well-formed base chain.
+func mergeEligible(pr *PR, mainBranch string) bool {
+	if pr == nil {
+		return false
+	}
+	if pr.Base != mainBranch {
+		return false
+	}
+	if pr.Mergeable == "CONFLICTING" {
+		return false
+	}
+	if pr.Checks.Summary != "passing" && pr.Checks.Summary != "none" {
+		return false
+	}
+	return pr.Review == "APPROVED" || pr.Review == ""
+}
+
+// mergedPrefixContiguous reports whether every merged commit forms an unbroken
+// bottom prefix of the stack: once a non-merged commit is seen, no merged commit
+// may follow. A merged commit above a non-merged one is an out-of-order land.
+func mergedPrefixContiguous(commits []Commit) bool {
+	seenNonMerged := false
+	for _, c := range commits {
+		if c.State == StateMerged {
+			if seenNonMerged {
+				return false
+			}
+			continue
+		}
+		seenNonMerged = true
+	}
+	return true
+}
+
 // bottomOpenPR returns the PR of the lowest open commit (the bottom of the
 // stack), or nil when no commit is open.
 func bottomOpenPR(commits []Commit) *PR {
+	if c := bottomOpenCommit(commits); c != nil {
+		return c.PR
+	}
+	return nil
+}
+
+// bottomOpenCommit returns the lowest open commit (the bottom of the stack that
+// still needs landing), or nil when no commit is open.
+func bottomOpenCommit(commits []Commit) *Commit {
 	for i := range commits {
 		if commits[i].State == StateOpen && commits[i].PR != nil {
-			return commits[i].PR
+			return &commits[i]
 		}
 	}
 	return nil
+}
+
+// makeMergeHint builds the squash subject/body hint for a merge-eligible bottom
+// commit. body is the commit's raw message body (ct-stack-id trailer included),
+// which the merging agent passes to `gh pr merge --squash --body` so a multi-
+// commit squash keeps this commit's message verbatim. It returns nil when the
+// commit has no PR.
+func makeMergeHint(c *Commit, body string) *MergeHint {
+	if c == nil || c.PR == nil {
+		return nil
+	}
+	return &MergeHint{
+		Number:  c.PR.Number,
+		Subject: c.Subject,
+		Body:    strings.TrimRight(body, "\n"),
+	}
 }
 
 // validStackID reports whether s is a clean stack id: exactly 8 lowercase hex

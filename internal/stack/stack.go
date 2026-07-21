@@ -54,13 +54,14 @@ type Checks struct {
 // PR is the GitHub pull-request view attached to a commit in the JSON output. It
 // is nil for commits that have no PR (unsubmitted/unpushed/missing-pr).
 type PR struct {
-	Number   int     `json:"number"`
-	URL      string  `json:"url"`
-	Base     string  `json:"base"`      // baseRefName the PR targets
-	Draft    bool    `json:"draft"`     // isDraft
-	Review   string  `json:"review"`    // reviewDecision (APPROVED, REVIEW_REQUIRED, "", …)
-	MergedAt *string `json:"merged_at"` // RFC3339 when merged, else nil
-	Checks   Checks  `json:"checks"`
+	Number    int     `json:"number"`
+	URL       string  `json:"url"`
+	Base      string  `json:"base"`      // baseRefName the PR targets
+	Draft     bool    `json:"draft"`     // isDraft
+	Review    string  `json:"review"`    // reviewDecision (APPROVED, REVIEW_REQUIRED, "", …)
+	Mergeable string  `json:"mergeable"` // MERGEABLE, CONFLICTING, UNKNOWN, "" when unknown
+	MergedAt  *string `json:"merged_at"` // RFC3339 when merged, else nil
+	Checks    Checks  `json:"checks"`
 }
 
 // Commit is one commit in the stack, bottom-first (Position 1 is the oldest
@@ -105,19 +106,30 @@ type GitHub struct {
 	Warnings  []string `json:"warnings"`
 }
 
+// MergeHint is the exact squash subject/body the merging agent should pass to
+// `gh pr merge --squash` so a multi-commit squash keeps this commit's message
+// verbatim (trailer included) instead of concatenating stale messages. It is
+// present only when next_action is "merge".
+type MergeHint struct {
+	Number  int    `json:"number"`
+	Subject string `json:"subject"`
+	Body    string `json:"body"` // commit message body, ct-stack-id trailer included
+}
+
 // StackStatus is the top-level JSON contract (schema 1). Additive fields do not
 // bump the schema; renames or removals do.
 type StackStatus struct {
-	Schema      int      `json:"schema"`
-	GeneratedAt string   `json:"generated_at"` // RFC3339 UTC
-	Repo        string   `json:"repo"`         // repo directory name
-	Worktree    string   `json:"worktree"`     // worktree name
-	Branch      string   `json:"branch"`       // worktree branch
-	MainBranch  string   `json:"main_branch"`
-	Fetched     bool     `json:"fetched"`
-	GitHub      GitHub   `json:"github"`
-	Stack       Stack    `json:"stack"`
-	Commits     []Commit `json:"commits"`
+	Schema      int        `json:"schema"`
+	GeneratedAt string     `json:"generated_at"` // RFC3339 UTC
+	Repo        string     `json:"repo"`         // repo directory name
+	Worktree    string     `json:"worktree"`     // worktree name
+	Branch      string     `json:"branch"`       // worktree branch
+	MainBranch  string     `json:"main_branch"`
+	Fetched     bool       `json:"fetched"`
+	GitHub      GitHub     `json:"github"`
+	Stack       Stack      `json:"stack"`
+	Commits     []Commit   `json:"commits"`
+	MergeHint   *MergeHint `json:"merge_hint,omitempty"`
 }
 
 // Params configures a status computation. Every git and gh subprocess runs in

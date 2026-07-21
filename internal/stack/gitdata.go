@@ -156,5 +156,30 @@ func gatherStatus(p Params) (StackStatus, []prRecord, error) {
 	st.GitHub = gh
 
 	st.Stack, st.Commits = reconcile(p.WorktreeName, p.MainBranch, commits, remotes, prs)
+
+	// When the engine recommends a merge, attach the exact squash subject/body the
+	// merging agent should pass. It needs the commit's full message body (trailer
+	// included), a git read the pure reconciler cannot do, so it is filled in here.
+	if st.Stack.NextAction == "merge" {
+		if c := bottomOpenCommit(st.Commits); c != nil {
+			body, err := rawCommitBody(p.WorktreeDir, c.SHA)
+			if err != nil {
+				return st, prs, err
+			}
+			st.MergeHint = makeMergeHint(c, body)
+		}
+	}
 	return st, prs, nil
+}
+
+// rawCommitBody returns a commit's message body (everything after the subject),
+// verbatim — including the ct-stack-id trailer. It differs from commitBody, which
+// strips the trailer for a PR body; the merge hint keeps it so a squash merge's
+// message round-trips the trailer.
+func rawCommitBody(dir, sha string) (string, error) {
+	out, err := repo.Git(dir, "show", "-s", "--format=%b", sha)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(out, "\n"), nil
 }

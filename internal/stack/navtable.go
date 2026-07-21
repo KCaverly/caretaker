@@ -14,25 +14,39 @@ const (
 	navEndMarker   = "<!-- ct-stack-end -->"
 )
 
+// navEntry is one row of the nav table: a PR number (0 when the PR does not yet
+// exist) and whether that PR has already landed (squash-merged). A merged entry
+// renders with a ✓ and a "(merged)" tag so a reader can see, from any PR in the
+// stack, which links below it are already in.
+type navEntry struct {
+	Number int
+	Merged bool
+}
+
 // renderNavRegion builds the marker-delimited nav block for a stack of PRs,
-// bottom-first. numbers[i] is the PR number at stack position i+1 (0 means the
-// PR does not exist yet — rendered as "#?", which only happens transiently
-// during a dry-run plan or a first create pass). currentIdx is the 0-based index
-// of the PR whose body this region is being spliced into, marked "← this PR".
+// bottom-first. entries[i] is the PR at stack position i+1 (Number 0 means the PR
+// does not exist yet — rendered as "#?", which only happens transiently during a
+// dry-run plan or a first create pass). currentIdx is the 0-based index of the PR
+// whose body this region is being spliced into, marked "← this PR".
 //
 // The returned string has no trailing newline after the end marker so spliceNav
 // can drop it into a body without accumulating blank lines on repeated splices.
-func renderNavRegion(numbers []int, currentIdx int) string {
+func renderNavRegion(entries []navEntry, currentIdx int) string {
 	var b strings.Builder
 	b.WriteString(navBeginMarker + "\n")
 	b.WriteString("---\n")
 	b.WriteString("**Stack** (bottom → top):\n")
-	for i, n := range numbers {
+	for i, e := range entries {
 		ref := "#?"
-		if n > 0 {
-			ref = "#" + strconv.Itoa(n)
+		if e.Number > 0 {
+			ref = "#" + strconv.Itoa(e.Number)
 		}
-		b.WriteString(strconv.Itoa(i+1) + ". " + ref)
+		b.WriteString(strconv.Itoa(i+1) + ". ")
+		if e.Merged {
+			b.WriteString("✓ " + ref + " (merged)")
+		} else {
+			b.WriteString(ref)
+		}
 		if i == currentIdx {
 			b.WriteString(" ← this PR")
 		}
@@ -40,6 +54,19 @@ func renderNavRegion(numbers []int, currentIdx int) string {
 	}
 	b.WriteString(navEndMarker)
 	return b.String()
+}
+
+// navEntriesFor projects a stack's commits into nav entries: each PR's number (0
+// when it has none yet) and whether it has already landed.
+func navEntriesFor(commits []Commit) []navEntry {
+	entries := make([]navEntry, len(commits))
+	for i, c := range commits {
+		if c.PR != nil {
+			entries[i].Number = c.PR.Number
+		}
+		entries[i].Merged = c.State == StateMerged
+	}
+	return entries
 }
 
 // spliceNav merges a rendered nav region into a PR body. If the body already

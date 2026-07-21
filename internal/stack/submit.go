@@ -156,14 +156,9 @@ func planSubmit(st StackStatus, prs []prRecord) (Plan, error) {
 	}
 	rewritten := func(i int) bool { return firstRewrite >= 0 && i >= firstRewrite }
 
-	// Predicted PR numbers, position-indexed, for the nav table (0 = would be
-	// created, rendered "#?").
-	numbers := make([]int, len(st.Commits))
-	for i, c := range st.Commits {
-		if c.PR != nil {
-			numbers[i] = c.PR.Number
-		}
-	}
+	// Predicted nav entries, position-indexed, for the nav table (Number 0 = would
+	// be created, rendered "#?").
+	entries := navEntriesFor(st.Commits)
 
 	var plan Plan
 	for i, c := range st.Commits {
@@ -214,7 +209,7 @@ func planSubmit(st StackStatus, prs []prRecord) (Plan, error) {
 				Position: c.Position, Number: c.PR.Number, OldTitle: old, NewTitle: c.Subject,
 			})
 		}
-		region := renderNavRegion(numbers, i)
+		region := renderNavRegion(entries, i)
 		if cur := bodyByNum[c.PR.Number]; spliceNav(cur, region) != cur {
 			plan.Bodies = append(plan.Bodies, BodyAction{Position: c.Position, Number: c.PR.Number})
 		}
@@ -375,17 +370,12 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 	for _, r := range prs3 {
 		bodyByNum[r.Number] = r.Body
 	}
-	numbers := make([]int, len(st3.Commits))
-	for i, c := range st3.Commits {
-		if c.PR != nil {
-			numbers[i] = c.PR.Number
-		}
-	}
+	entries := navEntriesFor(st3.Commits)
 	for i, c := range st3.Commits {
 		if c.PR == nil {
 			continue
 		}
-		region := renderNavRegion(numbers, i)
+		region := renderNavRegion(entries, i)
 		cur := bodyByNum[c.PR.Number]
 		if want := spliceNav(cur, region); want != cur {
 			if err := ghEditBody(dir, c.PR.Number, want); err != nil {
@@ -459,13 +449,7 @@ func prCreateBody(dir string, st StackStatus, position int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	numbers := make([]int, len(st.Commits))
-	for i, c := range st.Commits {
-		if c.PR != nil {
-			numbers[i] = c.PR.Number
-		}
-	}
-	region := renderNavRegion(numbers, position-1)
+	region := renderNavRegion(navEntriesFor(st.Commits), position-1)
 	return spliceNav(body, region), nil
 }
 
@@ -499,7 +483,7 @@ func ensureCleanTree(dir string) error {
 		if line == "" || strings.HasPrefix(line, "?? ") {
 			continue
 		}
-		return fmt.Errorf("worktree has uncommitted changes; commit or stash them before submitting")
+		return fmt.Errorf("worktree has uncommitted changes; commit or stash them first")
 	}
 	return nil
 }
