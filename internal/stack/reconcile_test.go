@@ -16,13 +16,14 @@ func commit(sha, id, subject string) LocalCommit {
 // left empty because reconcile never inspects them.
 func pr(num int, state, head, base, review, checksSummary string) prRecord {
 	return prRecord{
-		Number: num,
-		URL:    "https://example.test/pr/" + itoa(num),
-		State:  state,
-		Head:   head,
-		Base:   base,
-		Review: review,
-		Checks: Checks{Summary: checksSummary, Failing: []string{}},
+		Number:    num,
+		URL:       "https://example.test/pr/" + itoa(num),
+		State:     state,
+		Head:      head,
+		Base:      base,
+		Review:    review,
+		Mergeable: "MERGEABLE",
+		Checks:    Checks{Summary: checksSummary, Failing: []string{}},
 	}
 }
 
@@ -107,6 +108,24 @@ func TestReconcile(t *testing.T) {
 			wantStates:  []State{StateOpen},
 			wantAction:  "resolve-conflicts",
 			wantChainOK: true,
+		},
+		{
+			name:        "open: unknown mergeability is not mergeable",
+			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
+			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
+			prs:         []prRecord{prm(1, "OPEN", br("aaaaaaaa"), main, "APPROVED", "passing", "UNKNOWN")},
+			wantStates:  []State{StateOpen},
+			wantAction:  "wait",
+			wantChainOK: true,
+		},
+		{
+			name:        "open: non-main base is not mergeable",
+			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
+			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
+			prs:         []prRecord{prm(1, "OPEN", br("aaaaaaaa"), "feature", "APPROVED", "passing", "MERGEABLE")},
+			wantStates:  []State{StateOpen},
+			wantAction:  "submit",
+			wantChainOK: false,
 		},
 		{
 			name:        "merged: PR merged but commit still local -> restack",

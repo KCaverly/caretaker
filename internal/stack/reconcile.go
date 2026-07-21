@@ -306,7 +306,7 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 		case "pending":
 			return "wait"
 		default: // passing or none
-			if bottom.Review == "APPROVED" || bottom.Review == "" {
+			if mergeEligible(bottom, mainBranch) {
 				return "merge"
 			}
 			// Passing CI but review still outstanding (REVIEW_REQUIRED,
@@ -323,7 +323,7 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 }
 
 // mergeEligible reports whether a bottom open PR is independently landable: based
-// on main, not conflicting, checks passing (or none), and either approved or with
+// on main, affirmatively mergeable, checks passing (or none), and either approved or with
 // no review requested. The caller additionally gates on a well-formed base chain.
 func mergeEligible(pr *PR, mainBranch string) bool {
 	if pr == nil {
@@ -332,7 +332,7 @@ func mergeEligible(pr *PR, mainBranch string) bool {
 	if pr.Base != mainBranch {
 		return false
 	}
-	if pr.Mergeable == "CONFLICTING" {
+	if pr.Mergeable != "MERGEABLE" {
 		return false
 	}
 	if pr.Checks.Summary != "passing" && pr.Checks.Summary != "none" {

@@ -333,6 +333,7 @@ type Model struct {
 	stackFetch   func(stack.Params) (stack.StackStatus, error)
 	stackSubmit  func(stack.SubmitOptions) (stack.SubmitResult, error)
 	stackRestack func(stack.RestackOptions) (stack.RestackResult, error)
+	stackMerge   func(stack.MergeOptions) (stack.MergeResult, error)
 	stackOpen    bool
 	stackView    stackView
 
@@ -492,6 +493,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		stackFetch:      stack.Status,
 		stackSubmit:     stack.Submit,
 		stackRestack:    stack.Restack,
+		stackMerge:      stack.Merge,
 	}
 }
 
@@ -1023,6 +1025,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stackRestackMsg:
 		m.applyStackRestack(msg)
+		return m, nil
+
+	case stackMergeMsg:
+		m.applyStackMerge(msg)
 		return m, nil
 
 	case plasmaTickMsg:
@@ -1940,6 +1946,16 @@ func (m Model) paletteCommands() []paletteCmd {
 				run: func(m Model) (tea.Model, tea.Cmd) {
 					m = m.enterStackOverlay(key, repoName, wtName, p)
 					return m, m.restackStackCmd(key, p, true)
+				},
+			})
+		}
+		if stackCanMerge(e.status) {
+			cmds = append(cmds, paletteCmd{
+				title: "merge PR: " + repoName + "/" + wtName,
+				hint:  fmt.Sprintf("#%d", e.status.MergeHint.Number),
+				run: func(m Model) (tea.Model, tea.Cmd) {
+					m = m.enterStackOverlay(key, repoName, wtName, p)
+					return m, m.mergeStackCmd(key, p)
 				},
 			})
 		}

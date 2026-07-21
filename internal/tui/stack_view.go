@@ -77,6 +77,12 @@ type stackRestackMsg struct {
 	err    error
 }
 
+type stackMergeMsg struct {
+	key string
+	res stack.MergeResult
+	err error
+}
+
 // --- params ---
 
 // stackParams builds a stack.Params for a worktree, mirroring the CLI's
@@ -167,6 +173,14 @@ func (m Model) restackStackCmd(key string, p stack.Params, dryRun bool) tea.Cmd 
 	return func() tea.Msg {
 		res, err := restack(stack.RestackOptions{Params: p, DryRun: dryRun})
 		return stackRestackMsg{key: key, res: res, dryRun: dryRun, err: err}
+	}
+}
+
+func (m Model) mergeStackCmd(key string, p stack.Params) tea.Cmd {
+	merge := m.stackMerge
+	return func() tea.Msg {
+		res, err := merge(stack.MergeOptions{Params: p})
+		return stackMergeMsg{key: key, res: res, err: err}
 	}
 }
 
@@ -274,6 +288,26 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 	}
 }
 
+func (m *Model) applyStackMerge(msg stackMergeMsg) {
+	if msg.err == nil {
+		m.stackInfo[msg.key] = stackEntry{status: msg.res.Status, fetchedAt: time.Now()}
+	}
+	if !m.stackOpen || m.stackView.key != msg.key {
+		return
+	}
+	m.stackView.working = false
+	m.stackView.offset = 0
+	if msg.err != nil {
+		m.stackView.status = nil
+		m.stackView.body = stackErrorBody("merge failed: "+msg.err.Error(), msg.res.Executed)
+		return
+	}
+	st := msg.res.Status
+	m.stackView.status = &st
+	m.stackView.body = nil
+	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+}
+
 // clampCursor keeps a commit-row cursor inside a list of n rows, collapsing to 0
 // for an empty list.
 func clampCursor(c, n int) int {
@@ -361,6 +395,14 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
 			return m, m.restackStackCmd(sv.key, sv.params, true)
+		}
+	case "M":
+		if sv.status != nil && !sv.working {
+			if !stackCanMerge(*sv.status) {
+				return m, m.flashCmd("PR is not mergeable into main")
+			}
+			m.stackView.working = true
+			return m, m.mergeStackCmd(sv.key, sv.params)
 		}
 	case "v":
 		// Jump to the deck's read-only diff of everything the branch carries.
@@ -565,6 +607,9 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	}
 	if stackCanRestack(st) {
 		parts = append(parts, keyhint("R", "restack"))
+	}
+	if stackCanMerge(st) {
+		parts = append(parts, keyhint("M", "merge"))
 	}
 	parts = append(parts, keyhint("v", "diff"), keyhint("o", "open PR"),
 		keyhint("esc", "deck"), keyhint("r", "refresh"))
@@ -877,6 +922,19 @@ func stackCanRestack(st stack.StackStatus) bool {
 	}
 	return st.Stack.NextAction == "resolve-conflicts" &&
 		st.Stack.Counts[stack.StateMerged] > 0
+}
+
+func stackCanMerge(st stack.StackStatus) bool {
+	if st.Stack.NextAction != "merge" || st.MergeHint == nil {
+		return false
+	}
+	for _, c := range st.Commits {
+		if c.State == stack.StateOpen && c.PR != nil {
+			return c.PR.Number == st.MergeHint.Number && c.PR.Base == st.MainBranch &&
+				c.PR.Mergeable == "MERGEABLE"
+		}
+	}
+	return false
 }
 
 // stackRestackReason is the palette hint on the "restack" row: how many landed

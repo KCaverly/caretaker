@@ -243,6 +243,10 @@ worktree:
 - `ct stack restack` — repairs a stack after its bottom PRs squash-land: drops the landed commits
   from the local branch, deletes their remote branches, and re-submits the survivors. `--dry-run`
   prints the plan; because it rewrites branches, run the plan first.
+- `ct stack merge` — squash-merges the bottom PR with its original commit message. It leaves branch
+  cleanup to GitHub's repository setting so dependent stacked PRs are retargeted before the merged
+  head branch is deleted. It re-fetches immediately before merging and refuses unless GitHub
+  reports `MERGEABLE` and the PR targets the repository's main branch.
 
 ### Stacked PRs in the TUI
 
@@ -261,6 +265,9 @@ when GitHub is unavailable):
 - **Conflict recovery** — when a PR conflicts after an earlier stack commit lands, the stack screen
   keeps the conflict visible and offers `R` to preview a restack that drops the landed prefix and
   rebases the remaining commits onto current `origin/main`.
+- **Merge action** — a bottom PR that GitHub reports as mergeable and that targets main exposes
+  `M merge` in the stack screen and a matching command-palette action. Non-main, conflicting, and
+  unknown-mergeability PRs never expose the action.
 - **Command palette** — per active worktree: `stack status: <repo>/<wt>` (always), `restack:
   <repo>/<wt>` (only when a restack is needed, hinted with the landed count), and `submit stack:
   <repo>/<wt>` (only with submit-able work).

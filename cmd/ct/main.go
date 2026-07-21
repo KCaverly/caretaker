@@ -34,7 +34,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|merge) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -44,11 +44,51 @@ func runStack(args []string) int {
 		return runStackSubmit(args[1:])
 	case "restack":
 		return runStackRestack(args[1:])
+	case "merge":
+		return runStackMerge(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|merge) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+func runStackMerge(args []string) int {
+	var dir string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack merge: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack merge: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack merge:", err)
+			return 1
+		}
+	}
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack merge:", err)
+		return 1
+	}
+	res, err := stack.Merge(stack.MergeOptions{Params: params})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack merge:", err)
+		return 1
+	}
+	fmt.Print(stack.Render(res.Status))
+	return 0
 }
 
 // runStackRestack resolves the containing worktree, then runs the restack

@@ -196,6 +196,60 @@ func TestConflictingCascadeOffersRestackHotkey(t *testing.T) {
 	}
 }
 
+func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
+	ready := statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "merge",
+			Counts: map[stack.State]int{stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateOpen, Subject: "ready",
+			PR: &stack.PR{Number: 10, Base: "main", Mergeable: "MERGEABLE"}})
+	ready.MergeHint = &stack.MergeHint{Number: 10, Subject: "ready", Body: "body"}
+	if !stackCanMerge(ready) {
+		t.Fatal("mergeable PR targeting main should offer merge")
+	}
+
+	for _, tc := range []struct {
+		name, base, mergeable string
+	}{
+		{"wrong base", "feature", "MERGEABLE"},
+		{"conflicting", "main", "CONFLICTING"},
+		{"unknown", "main", "UNKNOWN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := ready
+			st.Commits = append([]stack.Commit(nil), ready.Commits...)
+			pr := *ready.Commits[0].PR
+			pr.Base, pr.Mergeable = tc.base, tc.mergeable
+			st.Commits[0].PR = &pr
+			if stackCanMerge(st) {
+				t.Fatal("non-main or non-MERGEABLE PR should not offer merge")
+			}
+		})
+	}
+
+	m, key := stackModel()
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{})
+	m.stackView.working = false
+	m.stackView.status = &ready
+	if out := m.renderStack(m.height - barHeight); !strings.Contains(out, "M") || !strings.Contains(out, "merge") {
+		t.Errorf("ready stack should advertise M merge:\n%s", out)
+	}
+	m.stackMerge = func(stack.MergeOptions) (stack.MergeResult, error) { return stack.MergeResult{}, nil }
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: 'M', Text: "M"})
+	if !mm.(Model).stackView.working || cmd == nil {
+		t.Fatal("M should execute the guarded merge command")
+	}
+
+	m, key = stackModel()
+	m.stackInfo[key] = stackEntry{status: ready, fetchedAt: time.Now()}
+	found := false
+	for _, c := range m.paletteCommands() {
+		found = found || strings.HasPrefix(c.title, "merge PR: repo/wt")
+	}
+	if !found {
+		t.Fatal("command palette should offer merge for a mergeable main PR")
+	}
+}
+
 func TestStackDetailSegment(t *testing.T) {
 	// Single-commit stack reads the PR number, state, and a check glyph.
 	single := statusWith(
