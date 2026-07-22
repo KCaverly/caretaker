@@ -282,6 +282,17 @@ func (s *Session) Pid() int {
 	return s.cmd.Process.Pid
 }
 
+// HasForegroundProcess reports whether the terminal's foreground process group
+// differs from the session's initial process group. For an interactive shell,
+// that means a foreground job currently owns the terminal. Platform-specific
+// implementations query the PTY directly; uncertainty is treated as busy.
+func (s *Session) HasForegroundProcess() bool {
+	if s == nil || !s.Alive() || s.cmd == nil || s.cmd.Process == nil || s.pty == nil {
+		return false
+	}
+	return s.hasForegroundProcess()
+}
+
 // dropEnv returns env with any "KEY=..." entries for the given keys removed.
 func dropEnv(env []string, keys ...string) []string {
 	out := env[:0:0]
