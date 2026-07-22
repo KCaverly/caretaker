@@ -1,0 +1,45 @@
+version: 2
+
+project_name: ct
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ct
+    main: ./cmd/ct
+    binary: ct
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version=v{{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - ids: [ct]
+    formats: [tar.gz]
+    name_template: "ct_{{ title .Os }}_{{ if eq .Arch \"amd64\" }}x86_64{{ else }}{{ .Arch }}{{ end }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+
+release:
+  draft: true
+  prerelease: auto
+  name_template: "ct {{ .Tag }}"
