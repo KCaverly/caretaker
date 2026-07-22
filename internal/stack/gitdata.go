@@ -7,7 +7,7 @@ import (
 	"github.com/KCaverly/caretaker/internal/repo"
 )
 
-// LocalCommit is one commit in <main>..HEAD as read from git, before any
+// LocalCommit is one commit in <base>..HEAD as read from git, before any
 // reconciliation against remotes or PRs. StackID is the raw ct-stack-id trailer
 // value: "" when the commit has no such trailer, and possibly malformed (see
 // parseGitLog) when a commit carries more than one.
@@ -22,13 +22,23 @@ type LocalCommit struct {
 // --reverse makes git emit oldest-first, so index 0 is the bottom of the stack,
 // matching the 1-based Position in the JSON output.
 func localCommits(dir, mainBranch string) ([]LocalCommit, error) {
+	base := mainBranch
+	remoteBase := "refs/remotes/origin/" + mainBranch
+	// Worktrees are created from the freshly fetched origin/<main>, while the
+	// primary worktree may legitimately remain behind (for example, when it has
+	// uncommitted work). Use the fetched remote-tracking ref when available so
+	// every stack command uses the same boundary as worktree creation. Repos
+	// without an origin keep the local-only main-branch behavior.
+	if _, err := repo.Git(dir, "rev-parse", "--verify", "--quiet", remoteBase); err == nil {
+		base = remoteBase
+	}
 	// Four NUL-fenced fields per commit: full SHA, short SHA, subject, and the
 	// ct-stack-id trailer value. A NUL beats any other separator because commit
 	// subjects contain spaces (and almost anything else) freely — the same trick
 	// repo.parseBranchTips uses.
 	out, err := repo.Git(dir, "log", "--reverse",
 		"--format=%H%x00%h%x00%s%x00%(trailers:key=ct-stack-id,valueonly,separator=,)",
-		mainBranch+"..HEAD")
+		base+"..HEAD")
 	if err != nil {
 		return nil, err
 	}

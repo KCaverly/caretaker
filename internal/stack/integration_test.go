@@ -110,3 +110,41 @@ func TestLocalGathering(t *testing.T) {
 		t.Errorf("remote_branch = %v, want ct/feat/… prefix", out[0].RemoteBranch)
 	}
 }
+
+// TestLocalCommitsUsesFetchedMain verifies stack discovery stays aligned with
+// worktree creation when the primary worktree's local main is behind its
+// remote-tracking branch. The landed remote-only commit must not be mistaken
+// for the bottom of the stack.
+func TestLocalCommitsUsesFetchedMain(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		if _, err := repo.Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "t@t.t")
+	runGit("config", "user.name", "t")
+	runGit("commit", "--allow-empty", "-m", "local main")
+	runGit("checkout", "-b", "feat")
+	runGit("commit", "--allow-empty", "-m", "landed remotely\n\nct-stack-id: aaaaaaaa")
+	remoteMain, err := repo.Git(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit("update-ref", "refs/remotes/origin/main", strings.TrimSpace(remoteMain))
+	runGit("commit", "--allow-empty", "-m", "actual stack commit\n\nct-stack-id: bbbbbbbb")
+
+	commits, err := localCommits(dir, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 1 || commits[0].Subject != "actual stack commit" {
+		t.Fatalf("localCommits = %+v, want only the commit after origin/main", commits)
+	}
+}
