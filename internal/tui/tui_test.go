@@ -768,6 +768,10 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 
 func mixedProviderModel(defaultProvider agent.Provider) Model {
 	cfg := config.Default()
+	// Keep the fixture independent of developer-machine tools. CI runners do
+	// not necessarily have ct's default editor installed.
+	cfg.Editor = "/usr/bin/true"
+	cfg.Shell = "/bin/sh"
 	cfg.Agents.Enabled = []agent.Provider{agent.Claude, agent.Codex}
 	cfg.Agents.Default = defaultProvider
 	cfg.Agents.Claude.Command = "/usr/bin/true"
