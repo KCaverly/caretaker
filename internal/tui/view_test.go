@@ -353,6 +353,24 @@ func TestBoardRender(t *testing.T) {
 	}
 }
 
+func TestBoardUsesAvailableWidth(t *testing.T) {
+	m := modelWithAgents(2)
+	m.width, m.height = 120, 30
+	mm, _ := m.openBoard()
+	m = mm.(Model)
+
+	out := m.renderBoard(m.height - barHeight)
+	widest := 0
+	for _, line := range strings.Split(out, "\n") {
+		widest = max(widest, lipgloss.Width(line))
+	}
+	// The board frame is width-4 and centerBlock adds the two-cell left
+	// margin. A capped board would be substantially narrower on this terminal.
+	if want := m.width - 2; widest != want {
+		t.Fatalf("rendered board width = %d, want %d", widest, want)
+	}
+}
+
 func TestProviderRowOnlyAppearsForMixedConfig(t *testing.T) {
 	claudeOnly := modelWithAgents(1).openNewAgentForm().(Model)
 	out := claudeOnly.renderBoard(claudeOnly.height - barHeight)

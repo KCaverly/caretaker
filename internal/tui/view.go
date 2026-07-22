@@ -520,10 +520,14 @@ func (m Model) notifZoneAt(x, y int) bool {
 // grouped under worktree header rows, attention sorted to the top, plus the
 // trailing "+ new agent" row. Delegates to renderBoardForm in form state.
 func (m Model) renderBoard(h int) string {
-	innerW := clamp(m.width-8, 32, 64)
 	if m.formOpen {
-		return m.renderBoardForm(h, innerW)
+		return m.renderBoardForm(h, clamp(m.width-8, 32, 64))
 	}
+	// The board is a workspace-wide overview, so let its agent rows use the
+	// full available width instead of constraining them to the compact overlay
+	// width used by forms. The surrounding frame still keeps a two-cell margin
+	// on either side at normal terminal sizes.
+	innerW := max(32, m.width-8)
 
 	rows, nav := m.buildBoard()
 	selRow := -1
