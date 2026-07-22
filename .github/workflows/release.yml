@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag commit is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build draft release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest release archives
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/ct_*.tar.gz"
