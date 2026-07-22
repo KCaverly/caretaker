@@ -111,6 +111,10 @@ func (m Model) View() tea.View {
 		body = m.renderHelp(h - barHeight)
 	case m.paletteOpen:
 		body = m.renderPalette(h - barHeight)
+	case m.confirmActive():
+		// Confirmations can originate from either the deck or the agent board;
+		// render them above their originating surface in both cases.
+		body = m.renderConfirm(h - barHeight)
 	case m.boardOpen:
 		body = m.renderBoard(h - barHeight)
 	case m.usageOpen:
@@ -119,11 +123,6 @@ func (m Model) View() tea.View {
 		body = m.renderDiff(h - barHeight)
 	case m.stackOpen:
 		body = m.renderStack(h - barHeight)
-	case m.screen == screenPicker && m.confirmActive():
-		// A destructive-confirm panel is modal over the deck, layered like the
-		// other overlays (help/board) so its own footer legend shows instead of
-		// the deck's key hints.
-		body = m.renderConfirm(h - barHeight)
 	case m.screen == screenPicker:
 		body = m.renderDeck(h - barHeight)
 	case m.screen == screenTerminal && m.current != nil && m.current.ws != nil:
@@ -579,7 +578,7 @@ func (m Model) renderBoard(h int) string {
 			keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
 		}, separator),
 		"  "+strings.Join([]string{
-			keyhint("n", "new"), keyhint("r", "restart"), keyhint("d", "close"), keyhint("esc", "close"),
+			keyhint("n", "new"), keyhint("r", "restart agent"), keyhint("d", "close agent"), keyhint("esc", "close"),
 		}, separator),
 	)
 

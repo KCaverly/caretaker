@@ -594,6 +594,47 @@ func TestBoardNavigateAndFocus(t *testing.T) {
 	}
 }
 
+func TestBoardCloseRequiresConfirmation(t *testing.T) {
+	m := modelWithAgents(1)
+	m.boardOpen = true
+
+	mm, _ := m.handleBoard(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	m = mm.(Model)
+	if m.mode != modeConfirmAgentClose || m.confirm.agent == nil {
+		t.Fatalf("close should capture its agent in a confirmation: mode=%v target=%v", m.mode, m.confirm.agent)
+	}
+	if m.confirm.title != "CLOSE AGENT" || !confirmHasOption(m.confirm, "d") ||
+		!confirmHasOption(m.confirm, "esc") {
+		t.Fatalf("close confirmation is incomplete: %+v", m.confirm)
+	}
+	if out := m.View().Content; !strings.Contains(out, "CLOSE AGENT") || !strings.Contains(out, "keep agent") {
+		t.Fatalf("close confirmation should render above the board:\n%s", out)
+	}
+
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.mode != modeNormal || !m.boardOpen || len(m.current.ws.Agents) != 1 {
+		t.Fatalf("cancel should return to the unchanged board: mode=%v open=%v agents=%d",
+			m.mode, m.boardOpen, len(m.current.ws.Agents))
+	}
+}
+
+func TestBusyBoardRestartRequiresConfirmation(t *testing.T) {
+	m := modelWithAgents(1)
+	m.boardOpen = true
+	pid := m.current.ws.Agents[0].Pid()
+	m.agentStatus = map[int]AgentStatus{pid: {Status: "busy"}}
+
+	mm, _ := m.handleBoard(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	m = mm.(Model)
+	if m.mode != modeConfirmAgentRestart || m.confirm.agent == nil {
+		t.Fatalf("busy restart should require confirmation: mode=%v target=%v", m.mode, m.confirm.agent)
+	}
+	if !confirmHasContext(m.confirm, "current turn") || !confirmHasOption(m.confirm, "r") {
+		t.Fatalf("restart confirmation should explain interruption and expose restart: %+v", m.confirm)
+	}
+}
+
 func TestBoardDigitJump(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0

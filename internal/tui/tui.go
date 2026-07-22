@@ -91,6 +91,8 @@ const (
 	modeConfirmRemove
 	modeConfirmQuit // guarding ctrl+c while a hosted agent is busy
 	modeConfirmStop // guarding "d" while the target worktree has a busy agent
+	modeConfirmAgentClose
+	modeConfirmAgentRestart
 )
 
 // confirmOption is one selectable row of a destructive-confirm panel: a
@@ -113,13 +115,15 @@ type confirmState struct {
 	context []string        // pre-styled context lines drawn above the options
 	options []confirmOption // vertical, arrow-selectable
 	cursor  int             // index into options; starts on the safe row
+	agent   *boardRow       // captured board target; immune to live status reordering
 }
 
 // confirmActive reports whether one of the three destructive-confirm panels is
 // up, so the view can layer it over the deck and the key router can keep it
 // modal.
 func (m Model) confirmActive() bool {
-	return m.mode == modeConfirmRemove || m.mode == modeConfirmQuit || m.mode == modeConfirmStop
+	return m.mode == modeConfirmRemove || m.mode == modeConfirmQuit || m.mode == modeConfirmStop ||
+		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart
 }
 
 // confirmIsNav reports whether key moves the confirm panel's cursor rather than
@@ -1679,6 +1683,12 @@ func (m Model) openBoard() (tea.Model, tea.Cmd) {
 
 // handleBoard routes key events while the agent board is open.
 func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch m.mode {
+	case modeConfirmAgentClose:
+		return m.handleConfirmAgentKey(msg, false)
+	case modeConfirmAgentRestart:
+		return m.handleConfirmAgentKey(msg, true)
+	}
 	if m.formOpen {
 		return m.handleBoardForm(msg)
 	}
@@ -1712,17 +1722,15 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.openNewAgentForm(), nil
 	case "r":
 		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
+			if m.boardAgentActive(r) {
+				return m.beginAgentRestartConfirm(r), nil
+			}
 			return m.restartBoardAgent(r)
 		}
 		return m, nil
 	case "d":
 		if r, ok := rowAt(m.boardCursor); ok && r.isAgent {
-			m.mgr.CloseAgent(r.key, r.agentIdx)
-			m.clearAgentTracking(r.pid)
-			save := m.saveAgents(r.key)
-			_, nav = m.buildBoard()
-			m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
-			return m, save
+			return m.beginAgentCloseConfirm(r), nil
 		}
 		return m, nil
 	case "enter":
@@ -1744,6 +1752,24 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m Model) boardAgentActive(r boardRow) bool {
+	switch m.agentStatus[r.pid].Status {
+	case "busy", "waiting":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m Model) closeBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
+	m.mgr.CloseAgent(r.key, r.agentIdx)
+	m.clearAgentTracking(r.pid)
+	save := m.saveAgents(r.key)
+	_, nav := m.buildBoard()
+	m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
+	return m, tea.Batch(save, m.flashCmd("closed agent "+r.label))
 }
 
 // restartBoardAgent transactionally replaces the selected process in place.
@@ -2547,7 +2573,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handlePalette(msg)
 	}
 	if msg.String() == m.keys.CommandPalette {
-		if m.screen == screenPicker && m.mode != modeNormal {
+		if m.confirmActive() || (m.screen == screenPicker && m.mode != modeNormal) {
 			return m, nil
 		}
 		return m.openPalette()
@@ -3411,6 +3437,57 @@ func (m Model) beginStopConfirm(name string) Model {
 	return m
 }
 
+func (m Model) beginAgentCloseConfirm(r boardRow) Model {
+	m.mode = modeConfirmAgentClose
+	m.status = ""
+	target := r
+	context := agentConfirmContext(r)
+	if m.boardAgentActive(r) {
+		context = append(context, errStyle.Render("! current work will be interrupted"))
+	}
+	m.confirm = confirmState{
+		title:   "CLOSE AGENT",
+		context: context,
+		options: []confirmOption{
+			{label: "keep agent", key: "esc"},
+			{label: "close agent", key: "d", danger: true},
+		},
+		agent: &target,
+	}
+	return m
+}
+
+func (m Model) beginAgentRestartConfirm(r boardRow) Model {
+	m.mode = modeConfirmAgentRestart
+	m.status = ""
+	target := r
+	context := append(agentConfirmContext(r),
+		errStyle.Render("! restarting will interrupt the current turn"),
+		dimStyle.Render("provider, conversation, and pool position will be preserved"),
+	)
+	m.confirm = confirmState{
+		title:   "RESTART AGENT",
+		context: context,
+		options: []confirmOption{
+			{label: "keep running", key: "esc"},
+			{label: "restart agent", key: "r", danger: true},
+		},
+		agent: &target,
+	}
+	return m
+}
+
+func agentConfirmContext(r boardRow) []string {
+	context := []string{
+		nameStyle.Render(normalizedProvider(r.provider).String() + " · " + r.label),
+		dimStyle.Render(r.repo + " / " + r.worktree),
+	}
+	if r.status != "" {
+		context = append(context, dimStyle.Render(r.status))
+	}
+	return context
+}
+
 // rankedActive returns the active item badged with the given recency rank
 // (1..3), if any.
 func (m Model) rankedActive(rank int) (activeItem, bool) {
@@ -3550,6 +3627,32 @@ func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	m = m.clearConfirm()
 	return m, nil
+}
+
+func (m Model) handleConfirmAgentKey(msg tea.KeyPressMsg, restart bool) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	target := m.confirm.agent
+	actionKey := "d"
+	if restart {
+		actionKey = "r"
+	}
+	if key != actionKey || target == nil {
+		m = m.clearConfirm()
+		return m, nil
+	}
+	r := *target
+	m = m.clearConfirm()
+	if restart {
+		return m.restartBoardAgent(r)
+	}
+	return m.closeBoardAgent(r)
 }
 
 // clearConfirm dismisses whichever confirm panel is up: back to normal mode,
