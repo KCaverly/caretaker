@@ -319,9 +319,31 @@ func (s *Session) Close() {
 			_ = s.cmd.Process.Kill()
 		}
 		_ = s.pty.Close()
-		_ = s.emu.Close()
+		s.stopInputPump()
 		s.closeCompanion()
 	})
+}
+
+// stopInputPump unblocks and terminates the `io.Copy(pty, emu)` input goroutine
+// started in StartSpec. It closes the emulator's input pipe writer directly
+// rather than calling emu.Close(). emu.Close() sets an unsynchronised `closed`
+// bool that the pump's blocked emu.Read() reads the instant it wakes; the two
+// race, and they can't be serialised with a mutex because Read must block
+// without holding one (exactly why vt's SafeEmulator leaves Read lock-free).
+// Closing the input pipe writer instead wakes Read through an ordinary pipe EOF
+// and never touches that field, so the pump drains any buffered input and exits
+// race-free. The emulator holds no other resource that Close would release — it
+// owns no goroutines or file descriptors, only the pipe and GC'd buffers — so
+// closing the pipe is a complete teardown of the input path. The type assertion
+// is a defensive fallback: InputPipe returns an *io.PipeWriter today, but if a
+// future vt stops exposing a closer we degrade to emu.Close() rather than leak
+// the goroutine.
+func (s *Session) stopInputPump() {
+	if c, ok := s.emu.InputPipe().(io.Closer); ok {
+		_ = c.Close()
+		return
+	}
+	_ = s.emu.Close()
 }
 
 func (s *Session) closeCompanion() {
