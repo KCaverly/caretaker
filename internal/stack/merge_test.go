@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,26 @@ func mergeableStatus(base, mergeable string) StackStatus {
 		MainBranch: "main", GitHub: GitHub{Available: true}, Stack: Stack{NextAction: "merge"},
 		Commits:   []Commit{{State: StateOpen, PR: &PR{Number: 10, Base: base, Mergeable: mergeable}}},
 		MergeHint: &MergeHint{Number: 10, Subject: "subject", Body: "body"},
+	}
+}
+
+func TestOpenPRsBasedOn(t *testing.T) {
+	prs := []prRecord{
+		{Number: 1, State: "MERGED", Base: "old"},
+		{Number: 2, State: "OPEN", Base: "other"},
+		{Number: 3, State: "OPEN", Base: "old"},
+		{Number: 4, State: "OPEN", Base: "old"},
+	}
+	got := openPRsBasedOn(prs, "old")
+	var numbers []int
+	for _, p := range got {
+		numbers = append(numbers, p.Number)
+	}
+	if want := []int{3, 4}; !reflect.DeepEqual(numbers, want) {
+		t.Fatalf("open dependents = %v, want %v", numbers, want)
+	}
+	if !prOpenOnBase(prs, 3, "old") || prOpenOnBase(prs, 1, "old") || prOpenOnBase(prs, 3, "other") {
+		t.Fatal("prOpenOnBase did not require matching number, open state, and base")
 	}
 }
 

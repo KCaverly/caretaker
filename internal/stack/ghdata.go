@@ -275,6 +275,31 @@ func ghEditBody(dir string, number int, body string) error {
 	return err
 }
 
+// ensureBranchHasNoOpenDependents is the final guard before deleting a remote
+// stack branch. The check is intentionally fresh rather than derived from an
+// earlier StackStatus: another actor may have retargeted or opened a PR while a
+// multi-step submit/restack operation was running.
+func ensureBranchHasNoOpenDependents(dir, worktree, branch string) error {
+	prs, gh := gatherGitHub(dir, worktree)
+	if !gh.Available {
+		return fmt.Errorf("refusing to delete %s while GitHub state is unavailable: %s", branch, strings.Join(gh.Warnings, "; "))
+	}
+	if dependents := openPRsBasedOn(prs, branch); len(dependents) > 0 {
+		return fmt.Errorf("refusing to delete %s: open PR #%d still targets it", branch, dependents[0].Number)
+	}
+	return nil
+}
+
+func openPRsBasedOn(prs []prRecord, branch string) []prRecord {
+	var out []prRecord
+	for _, p := range prs {
+		if p.State == "OPEN" && p.Base == branch {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // runGH runs a gh command in dir with the same 30s-timeout, stderr-wrapping
 // contract as repo.Git. It is a local twin rather than a reuse of repo.Git
 // because that runner is hard-wired to the git binary.

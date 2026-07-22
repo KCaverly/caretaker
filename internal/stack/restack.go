@@ -369,21 +369,32 @@ func Restack(o RestackOptions) (RestackResult, error) {
 	}
 	res.Executed = append(res.Executed, fmt.Sprintf("fast-forwarded %s to origin/%s", st.MainBranch, st.MainBranch))
 
-	// 6. Delete the landed remote branches (tolerating GitHub's auto-delete).
-	for _, b := range res.BranchDeletes {
-		if err := deleteRemoteBranch(dir, b); err != nil {
-			return res, fmt.Errorf("deleting landed remote branch %s: %w", b, err)
-		}
-		res.Executed = append(res.Executed, "deleted landed remote branch "+b)
-	}
-
-	// 7. Re-converge the survivors via the existing submit pipeline: force-with-
+	// 6. Re-converge the survivors before deleting any landed base branch. An
+	// open PR may still target the top landed branch; deleting that branch first
+	// can cause GitHub to close the dependent PR before submit gets a chance to
+	// retarget it. Submit is idempotent, so a failure here leaves every base
+	// branch intact and a rerun can safely resume.
+	//
+	// Re-convergence uses the existing submit pipeline: force-with-
 	// lease pushes of the rebased branches, retarget of the new bottom PR to main,
 	// title updates, and nav-table re-splice.
 	sub, err := Submit(SubmitOptions{Params: o.Params, DryRun: false})
 	res.Executed = append(res.Executed, sub.Executed...)
 	if err != nil {
 		return res, fmt.Errorf("re-converging after rebase: %w", err)
+	}
+
+	// 7. Only after convergence has been observed may landed branches disappear.
+	// Re-read GitHub before each deletion so a concurrent PR cannot acquire the
+	// branch as its base between submit and cleanup.
+	for _, b := range res.BranchDeletes {
+		if err := ensureBranchHasNoOpenDependents(dir, st.Worktree, b); err != nil {
+			return res, err
+		}
+		if err := deleteRemoteBranch(dir, b); err != nil {
+			return res, fmt.Errorf("deleting landed remote branch %s: %w", b, err)
+		}
+		res.Executed = append(res.Executed, "deleted landed remote branch "+b)
 	}
 
 	// 8. Report the converged status.
