@@ -619,16 +619,24 @@ func (m Model) renderBoardForm(h, innerW int) string {
 		}
 		return st.Render(padLine(name, 8))
 	}
+	selectedToggle := lipgloss.NewStyle().Bold(true).Foreground(cInk).Background(cAccent)
 	toggle := func(options [2]string, sel int) string {
 		var parts [2]string
 		for i, o := range options {
 			if i == sel {
-				parts[i] = lipgloss.NewStyle().Bold(true).Foreground(cFg).Render("[" + o + "]")
+				parts[i] = selectedToggle.Render(" " + o + " ")
 			} else {
 				parts[i] = dimStyle.Render(" " + o + " ")
 			}
 		}
-		return parts[0] + " " + parts[1]
+		return parts[0] + helpStyle.Render(" ") + parts[1]
+	}
+	toggleRow := func(field int, label string, options [2]string, sel int) string {
+		line := "  " + fieldName(field, label) + " " + toggle(options, sel)
+		if m.formFocus == field {
+			line += helpStyle.Render("   ← → change")
+		}
+		return line
 	}
 	bgIdx := 0
 	if m.formBackground {
@@ -650,16 +658,20 @@ func (m Model) renderBoardForm(h, innerW int) string {
 				providerIdx = i
 			}
 		}
-		rows = append(rows, "  "+fieldName(formFieldProvider, "provider")+
-			toggle([2]string{m.agentProviders[0].String(), m.agentProviders[1].String()}, providerIdx))
+		rows = append(rows, toggleRow(formFieldProvider, "provider",
+			[2]string{m.agentProviders[0].String(), m.agentProviders[1].String()}, providerIdx))
+	}
+	currentLocation := "current worktree"
+	if m.current != nil && m.current.worktree != "" {
+		currentLocation = "current: " + truncateTo(m.current.worktree, 24)
 	}
 	rows = append(rows,
-		"  "+fieldName(formFieldWhere, "where")+toggle([2]string{"active worktree", "home worktree"}, m.formLocation),
-		"  "+fieldName(formFieldMode, "mode")+toggle([2]string{"foreground", "background"}, bgIdx),
+		toggleRow(formFieldWhere, "where", [2]string{currentLocation, "home"}, m.formLocation),
+		toggleRow(formFieldMode, "mode", [2]string{"interactive", "background"}, bgIdx),
 		"",
 		"  "+strings.Join([]string{
 			keyhint("ctrl+enter", "launch"), keyhint("tab", "field"),
-			keyhint("space", "toggle"), keyhint("esc", "back"),
+			keyhint("←→", "change"), keyhint("esc", "back"),
 		}, helpStyle.Render("  ·  ")),
 	)
 	boxStr := box(rows, innerW, len(rows), true)

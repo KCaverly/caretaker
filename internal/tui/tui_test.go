@@ -704,6 +704,11 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	if m.formLocation != 1 {
 		t.Fatalf("space should flip location, got %d", m.formLocation)
 	}
+	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyLeft})
+	m = mm.(Model)
+	if m.formLocation != 0 {
+		t.Fatalf("left should change location, got %d", m.formLocation)
+	}
 	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // → mode
 	m = mm.(Model)
 	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
