@@ -2,10 +2,6 @@ version: 2
 
 project_name: ct
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - id: ct
     main: ./cmd/ct
@@ -24,7 +20,8 @@ builds:
       - -X main.date={{ .Date }}
 
 archives:
-  - ids: [ct]
+  - id: ct
+    ids: [ct]
     formats: [tar.gz]
     name_template: "ct_{{ title .Os }}_{{ if eq .Arch \"amd64\" }}x86_64{{ else }}{{ .Arch }}{{ end }}"
     files:
