@@ -209,7 +209,6 @@ const (
 	formFieldPrompt = iota
 	formFieldProvider
 	formFieldWhere
-	formFieldMode
 	formFieldCount
 )
 
@@ -389,11 +388,10 @@ type Model struct {
 	homeWSKey  string
 
 	// new-agent form (sub-state of the agent board)
-	formOpen       bool
-	formFocus      int // formFieldPrompt..formFieldMode
-	formProvider   agent.Provider
-	formLocation   int  // 0 = active worktree, 1 = home worktree
-	formBackground bool // false = foreground (default), true = background
+	formOpen     bool
+	formFocus    int // formFieldPrompt..formFieldWhere
+	formProvider agent.Provider
+	formLocation int // 0 = active worktree, 1 = home worktree
 
 	status        string
 	statusLevel   statusLevel // errors stick; info auto-expires
@@ -895,7 +893,7 @@ func (m Model) activeSession() *session.Session {
 
 // Update implements tea.Model. After every message it re-declares which
 // sessions are on screen so the manager can drop repaint wakeups from
-// invisible ones (background agents streaming output would otherwise trigger
+// invisible ones (off-screen agents streaming output would otherwise trigger
 // a full re-render each pty read).
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	mm, cmd := m.update(msg)
@@ -1703,8 +1701,6 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q", m.keys.Palette:
 		m.boardOpen = false
 		return m, nil
-	case m.keys.Prompt:
-		return m.openQuickPrompt()
 	case m.keys.Attention:
 		// The jump works from within the board too: focusBoardAgent closes it.
 		return m.jumpAttention()
@@ -1793,9 +1789,9 @@ func (m Model) restartBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 		err  error
 	)
 	if old.SessionID == "" {
-		spec, err = m.ctrl.NewProviderAgentSpec(provider, old.Title, "", AgentForeground)
+		spec, err = m.ctrl.NewProviderAgentSpec(provider, old.Title, "")
 	} else {
-		spec, err = m.ctrl.RestoreProviderAgentSpec(provider, old.SessionID, old.Title, "", AgentForeground)
+		spec, err = m.ctrl.RestoreProviderAgentSpec(provider, old.SessionID, old.Title, "")
 	}
 	if err != nil {
 		m.setError("restart error: " + err.Error())
@@ -2046,7 +2042,6 @@ func (m Model) paletteCommands() []paletteCmd {
 	cmds = append(cmds,
 		paletteCmd{title: "open agent board", hint: m.keys.Palette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
 		paletteCmd{title: "new agent…", run: func(m Model) (tea.Model, tea.Cmd) { return m.openNewAgentForm(), nil }},
-		paletteCmd{title: "new background agent (quick prompt)…", hint: m.keys.Prompt, run: func(m Model) (tea.Model, tea.Cmd) { return m.openQuickPrompt() }},
 	)
 	if m.current != nil && m.current.ws != nil && len(m.current.ws.Agents) >= 2 {
 		cmds = append(cmds,
@@ -2204,8 +2199,8 @@ func (m Model) activateGlobalConfig() (tea.Model, tea.Cmd) {
 }
 
 // openNewAgentForm switches the board into the new-agent form with defaults:
-// active worktree (home when no workspace is active), foreground, focus on the
-// prompt field. Agents are no longer manually named — claude names the session
+// active worktree (home when no workspace is active), focus on the prompt
+// field. Agents are no longer manually named — claude names the session
 // after its topic — so the form opens straight on the prompt.
 func (m Model) openNewAgentForm() tea.Model {
 	m.boardOpen = true
@@ -2219,30 +2214,20 @@ func (m Model) openNewAgentForm() tea.Model {
 	if m.current == nil {
 		m.formLocation = 1
 	}
-	m.formBackground = false
 	m.promptInput.SetValue("")
 	m.promptInput.Focus()
 	return m
 }
 
-// openQuickPrompt opens the new-agent form pre-set for a background home
-// worktree agent with the prompt field focused (the ctrl+y shortcut).
-func (m Model) openQuickPrompt() (tea.Model, tea.Cmd) {
-	mm := m.openNewAgentForm().(Model)
-	mm.formLocation = 1
-	mm.formBackground = true
-	return mm, mm.promptInput.Focus()
-}
-
 // formFields returns the fields in navigation order. The provider row is
 // omitted entirely when there is no choice to make, preserving the legacy
-// prompt → where → mode traversal.
+// prompt → where traversal.
 func (m Model) formFields() []int {
 	fields := []int{formFieldPrompt}
 	if len(m.agentProviders) > 1 {
 		fields = append(fields, formFieldProvider)
 	}
-	return append(fields, formFieldWhere, formFieldMode)
+	return append(fields, formFieldWhere)
 }
 
 // moveFormFocus moves by delta through the visible fields, wrapping, and keeps
@@ -2319,8 +2304,6 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.cycleFormProvider(delta)
 		} else if m.formFocus == formFieldWhere {
 			m.formLocation = 1 - m.formLocation
-		} else {
-			m.formBackground = !m.formBackground
 		}
 	}
 	return m, nil
@@ -2418,7 +2401,7 @@ func (m Model) workspaceSpecs(key string, addDefault bool) ([]session.Spec, erro
 		saved, _ = m.state.Agents(key)
 	}
 	if len(saved) == 0 && addDefault {
-		spec, err := m.ctrl.NewProviderAgentSpec(m.defaultAgentProvider, "", "", AgentForeground)
+		spec, err := m.ctrl.NewProviderAgentSpec(m.defaultAgentProvider, "", "")
 		if err != nil {
 			return nil, err
 		}
@@ -2426,7 +2409,7 @@ func (m Model) workspaceSpecs(key string, addDefault bool) ([]session.Spec, erro
 	} else {
 		for _, a := range saved {
 			provider := normalizedProvider(a.Provider)
-			spec, err := m.ctrl.RestoreProviderAgentSpec(provider, a.SessionID, a.Label, "", AgentForeground)
+			spec, err := m.ctrl.RestoreProviderAgentSpec(provider, a.SessionID, a.Label, "")
 			if err != nil {
 				return nil, err
 			}
@@ -2605,13 +2588,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == m.keys.Palette {
 		return m.openBoard()
 	}
-	if msg.String() == m.keys.Prompt {
-		return m.openQuickPrompt()
-	}
 	// The attention-jump chord fires from session screens and from the picker.
 	// It sits below the modal overlays handled above (palette/diff/usage/board),
-	// so those keep their precedence, and mirrors keys.Prompt's placement in the
-	// global chain. jumpAttention is a no-op when nothing is pending.
+	// so those keep their precedence. jumpAttention is a no-op when nothing is
+	// pending.
 	if msg.String() == m.keys.Attention {
 		return m.jumpAttention()
 	}
@@ -2658,7 +2638,7 @@ func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
 // into the session beneath, exactly the leak the help swallow prevents.
 func (m Model) isReservedActionKey(s string) bool {
 	switch s {
-	case m.keys.Cycle, m.keys.CycleBack, m.keys.Picker, m.keys.Palette, m.keys.Prompt,
+	case m.keys.Cycle, m.keys.CycleBack, m.keys.Picker, m.keys.Palette,
 		m.keys.Attention, m.keys.GlobalConfig, m.keys.NextAgent, m.keys.PrevAgent,
 		m.keys.CommandPalette, m.keys.GotoEditor, m.keys.GotoAgent, m.keys.GotoTerm:
 		return true
@@ -2844,7 +2824,7 @@ func (m Model) rotateAgent(delta int) (tea.Model, tea.Cmd) {
 }
 
 // launchAgent spawns a new agent from the board's new-agent form, honouring the
-// selected location (active/home worktree) and mode (foreground/background).
+// selected location (active/home worktree).
 func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	prompt := strings.TrimSpace(m.promptInput.Value())
 	// The form no longer takes a label; every agent gets an auto-generated
@@ -2859,11 +2839,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 	const homeKey = "~/config"
 	isHome := m.formLocation == 1
 	provider := normalizedProvider(m.formProvider)
-	agentMode := AgentForeground
-	if m.formBackground {
-		agentMode = AgentBackground
-	}
-	spec, err := m.ctrl.NewProviderAgentSpec(provider, label, prompt, agentMode)
+	spec, err := m.ctrl.NewProviderAgentSpec(provider, label, prompt)
 	if err != nil {
 		m.setError("spawn error: " + err.Error())
 		return m, nil
@@ -2930,9 +2906,9 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Home + foreground navigates through activate(), which rebuilds the pane
-	// pool from persisted state — so persist the new agent first, then hand off.
-	if isHome && !m.formBackground {
+	// Home navigates through activate(), which rebuilds the pane pool from
+	// persisted state — so persist the new agent first, then hand off.
+	if isHome {
 		m.persistAgents(homeKey)
 		mm, cmd := m.activate("~", "config", path)
 		model := mm.(Model)
@@ -2940,19 +2916,7 @@ func (m Model) launchAgent() (tea.Model, tea.Cmd) {
 		return model, tea.Batch(cmd, restoredWatches, model.watchAgentEvents(spawned), model.flashCmd("agent launched"))
 	}
 
-	// Home background records the open so the board can order it; both background
-	// paths and the active-foreground path save the workspace's agent pool.
-	if isHome && m.state != nil {
-		m.state.Touch(homeKey)
-	}
 	save := m.saveAgents(key)
-	if m.formBackground {
-		flash := "agent launched in background"
-		if isHome {
-			flash = "background agent launched"
-		}
-		return m, tea.Batch(save, m.flashCmd(flash))
-	}
 	m.screen = screenAgent
 	m.clearWorkspaceAttention()
 	return m, tea.Batch(save, restoredWatches, m.watchAgentEvents(spawned), m.flashCmd("agent launched"))

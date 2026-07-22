@@ -647,10 +647,6 @@ func (m Model) renderBoardForm(h, innerW int) string {
 		}
 		return line
 	}
-	bgIdx := 0
-	if m.formBackground {
-		bgIdx = 1
-	}
 	rows := []string{
 		header("new agent", -1),
 		"",
@@ -676,7 +672,6 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	}
 	rows = append(rows,
 		toggleRow(formFieldWhere, "where", [2]string{currentLocation, "home"}, m.formLocation),
-		toggleRow(formFieldMode, "mode", [2]string{"interactive", "background"}, bgIdx),
 		"",
 		"  "+strings.Join([]string{
 			keyhint("ctrl+enter", "launch"), keyhint("tab", "field"),
@@ -1562,7 +1557,6 @@ func (m Model) renderHelp(h int) string {
 		row(m.keys.GotoEditor+" "+m.keys.GotoAgent+" "+m.keys.GotoTerm, "go to editor / agent / term"),
 		row(m.keys.Picker, "back to the deck"),
 		row(m.keys.GlobalConfig, "open home workspace (~)"),
-		row(m.keys.Prompt, "quick background agent (home)"),
 		row(m.keys.Palette, "agent board"),
 		row(m.keys.CommandPalette, "command palette (every action)"),
 	)

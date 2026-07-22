@@ -93,7 +93,6 @@ palette     = "alt+a"  # agent board: focus, create, restart, or close agents
 next_agent  = "f4"     # next agent in the active worktree
 prev_agent  = "f3"     # previous agent in the active worktree
 global_config = "alt+g" # open the home-directory workspace
-prompt      = "alt+y"  # new-agent form, pre-set to background + home
 attention   = "alt+n"  # jump to the agent needing attention (cycles on repeat)
 usage       = "alt+u"  # plan usage for enabled agent providers
 help        = "f1"     # toggle the key/legend overlay (also "?" in the deck)
@@ -188,13 +187,10 @@ is enabled, the new-agent form adds a Claude/Codex selector; when only one is en
 hidden. Each time the form opens it starts on `agents.default`. Board and status-bar labels include
 the provider so mixed pools remain easy to distinguish.
 
-Caretaker passes the form prompt as the CLI's initial prompt. Foreground agents are interactive.
+Caretaker passes the form prompt as the CLI's initial prompt; agents launch interactively.
 The prompt editor supports multiple lines; press `ctrl+enter` to launch the agent (plain `enter`
-adds a new line).
-Background Claude agents use Claude Code's permission-skipping mode; background Codex agents use
-the `workspace-write` sandbox with approvals disabled, so writes outside the workspace still fail
-closed. Codex starts a fresh conversation normally and uses `codex resume <thread-id>` when a known
-thread ID is restored.
+adds a new line). Codex starts a fresh conversation normally and uses `codex resume <thread-id>`
+when a known thread ID is restored.
 
 Each Codex pane also owns a private companion `codex app-server` on a local Unix socket. The stock
 Codex TUI connects to it with `--remote` and remains responsible for approvals and user input;

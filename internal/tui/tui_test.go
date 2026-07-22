@@ -685,20 +685,6 @@ func TestBoardOpensFromPicker(t *testing.T) {
 	}
 }
 
-func TestQuickPromptOpensForm(t *testing.T) {
-	m := sampleModel()
-
-	mm, _ := m.handleKey(altKey('y'))
-	m = mm.(Model)
-	if !m.boardOpen || !m.formOpen {
-		t.Fatalf("alt+y should open the new-agent form: board=%v form=%v", m.boardOpen, m.formOpen)
-	}
-	if m.formLocation != 1 || !m.formBackground || m.formFocus != formFieldPrompt {
-		t.Fatalf("quick prompt should preselect home+background with prompt focused: loc=%d bg=%v focus=%d",
-			m.formLocation, m.formBackground, m.formFocus)
-	}
-}
-
 func TestBoardFormPromptSupportsMultipleLines(t *testing.T) {
 	m := modelWithAgents(1).openNewAgentForm().(Model)
 
@@ -724,12 +710,12 @@ func TestBoardFormPromptSupportsMultipleLines(t *testing.T) {
 func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m := modelWithAgents(1)
 	m = m.openNewAgentForm().(Model)
-	if m.formFocus != formFieldPrompt || m.formLocation != 0 || m.formBackground {
-		t.Fatalf("form defaults: focus=%d loc=%d bg=%v", m.formFocus, m.formLocation, m.formBackground)
+	if m.formFocus != formFieldPrompt || m.formLocation != 0 {
+		t.Fatalf("form defaults: focus=%d loc=%d", m.formFocus, m.formLocation)
 	}
 
-	// Tab cycles prompt → where → mode → prompt.
-	for _, want := range []int{formFieldWhere, formFieldMode, formFieldPrompt} {
+	// Tab cycles prompt → where → prompt.
+	for _, want := range []int{formFieldWhere, formFieldPrompt} {
 		mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab})
 		m = mm.(Model)
 		if m.formFocus != want {
@@ -737,7 +723,7 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 		}
 	}
 
-	// Space on the where/mode rows flips the toggles.
+	// Space on the where row flips the toggle.
 	mm, _ := m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // prompt → where
 	m = mm.(Model)
 	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
@@ -749,13 +735,6 @@ func TestBoardFormFieldCycleAndToggles(t *testing.T) {
 	m = mm.(Model)
 	if m.formLocation != 0 {
 		t.Fatalf("left should change location, got %d", m.formLocation)
-	}
-	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeyTab}) // → mode
-	m = mm.(Model)
-	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
-	m = mm.(Model)
-	if !m.formBackground {
-		t.Fatal("space should flip mode to background")
 	}
 
 	// Esc returns to the board list without closing the overlay.
@@ -815,7 +794,7 @@ func TestPrepareAgentSpecPlacesRemoteAfterBaseArgs(t *testing.T) {
 		return runtime, nil
 	}
 
-	spec, err := ctrl.NewProviderAgentSpec(agent.Codex, "jade-otter", "inspect", AgentBackground)
+	spec, err := ctrl.NewProviderAgentSpec(agent.Codex, "jade-otter", "inspect")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +804,7 @@ func TestPrepareAgentSpecPlacesRemoteAfterBaseArgs(t *testing.T) {
 	}
 	want := []string{
 		"codex-test", "--base", "value", "--remote", "unix:///tmp/fake-runtime.sock",
-		"--sandbox", "workspace-write", "--ask-for-approval", "never", "inspect",
+		"inspect",
 	}
 	if !equalStrings(prepared.Argv, want) {
 		t.Fatalf("prepared argv = %v, want %v", prepared.Argv, want)
@@ -848,7 +827,7 @@ func TestPrepareWorkspaceSpecsCleansEarlierCompanionOnFailure(t *testing.T) {
 		runtimes = append(runtimes, runtime)
 		return runtime, nil
 	}
-	valid, err := m.ctrl.NewProviderAgentSpec(agent.Codex, "one", "", AgentForeground)
+	valid, err := m.ctrl.NewProviderAgentSpec(agent.Codex, "one", "")
 	if err != nil {
 		t.Fatal(err)
 	}

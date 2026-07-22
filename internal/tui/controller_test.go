@@ -129,8 +129,8 @@ func TestProviderAgentSpecs(t *testing.T) {
 		t.Fatalf("enabled providers = %v", got)
 	}
 
-	t.Run("claude foreground", func(t *testing.T) {
-		spec, err := c.NewProviderAgentSpec(agent.Claude, "amber-fox", "fix the tests", AgentForeground)
+	t.Run("claude", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Claude, "amber-fox", "fix the tests")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -146,19 +146,8 @@ func TestProviderAgentSpecs(t *testing.T) {
 		}
 	})
 
-	t.Run("claude background", func(t *testing.T) {
-		spec, err := c.NewProviderAgentSpec(agent.Claude, "amber-fox", "fix the tests", AgentBackground)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := []string{"configured-claude", "--claude-base", "--session-id", spec.SessionID, "--teammate-mode", "in-process", "--dangerously-skip-permissions", "-n", "amber-fox", "fix the tests"}
-		if !equalStrings(spec.Argv, want) {
-			t.Errorf("argv = %v, want %v", spec.Argv, want)
-		}
-	})
-
-	t.Run("codex foreground", func(t *testing.T) {
-		spec, err := c.NewProviderAgentSpec(agent.Codex, "amber-fox", "fix the tests", AgentForeground)
+	t.Run("codex", func(t *testing.T) {
+		spec, err := c.NewProviderAgentSpec(agent.Codex, "amber-fox", "fix the tests")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -176,20 +165,6 @@ func TestProviderAgentSpecs(t *testing.T) {
 			t.Errorf("title = %q", spec.Title)
 		}
 	})
-
-	t.Run("codex background", func(t *testing.T) {
-		spec, err := c.NewProviderAgentSpec(agent.Codex, "", "fix the tests", AgentBackground)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := []string{"configured-codex", "--codex-base", "--sandbox", "workspace-write", "--ask-for-approval", "never", "fix the tests"}
-		if !equalStrings(spec.Argv, want) {
-			t.Errorf("argv = %v, want %v", spec.Argv, want)
-		}
-		if spec.Title != "codex" {
-			t.Errorf("title = %q, want codex", spec.Title)
-		}
-	})
 }
 
 func TestRestoreProviderAgentSpecs(t *testing.T) {
@@ -203,12 +178,12 @@ func TestRestoreProviderAgentSpecs(t *testing.T) {
 	c.projectsDir = projects
 	id := "11111111-2222-4333-8444-555555555555"
 
-	// Codex global background flags must precede the resume subcommand.
-	codexSpec, err := c.RestoreProviderAgentSpec(agent.Codex, id, "amber-fox", "continue", AgentBackground)
+	// Codex resumes through its resume subcommand.
+	codexSpec, err := c.RestoreProviderAgentSpec(agent.Codex, id, "amber-fox", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCodex := []string{"codex", "--codex-base", "--sandbox", "workspace-write", "--ask-for-approval", "never", "resume", id, "continue"}
+	wantCodex := []string{"codex", "--codex-base", "resume", id, "continue"}
 	if !equalStrings(codexSpec.Argv, wantCodex) {
 		t.Errorf("Codex resume argv = %v, want %v", codexSpec.Argv, wantCodex)
 	}
@@ -218,7 +193,7 @@ func TestRestoreProviderAgentSpecs(t *testing.T) {
 
 	// If caretaker stopped before the provider supplied an ID, restoration is a
 	// fresh launch rather than a malformed resume with an empty argument.
-	emptyCodex, err := c.RestoreProviderAgentSpec(agent.Codex, "", "amber-fox", "continue", AgentForeground)
+	emptyCodex, err := c.RestoreProviderAgentSpec(agent.Codex, "", "amber-fox", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +203,7 @@ func TestRestoreProviderAgentSpecs(t *testing.T) {
 	if emptyCodex.SessionID != "" {
 		t.Errorf("fresh Codex ID = %q, want provider-assigned empty ID", emptyCodex.SessionID)
 	}
-	emptyClaude, err := c.RestoreProviderAgentSpec(agent.Claude, "", "amber-fox", "continue", AgentForeground)
+	emptyClaude, err := c.RestoreProviderAgentSpec(agent.Claude, "", "amber-fox", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,13 +215,13 @@ func TestRestoreProviderAgentSpecs(t *testing.T) {
 		t.Errorf("empty-ID Claude argv = %v, want %v", emptyClaude.Argv, wantEmptyClaude)
 	}
 
-	// Claude keeps the missing-transcript fresh fallback, including background
-	// mode and the initial prompt.
-	claudeFresh, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue", AgentBackground)
+	// Claude keeps the missing-transcript fresh fallback, including the initial
+	// prompt.
+	claudeFresh, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantFresh := []string{"claude", "--claude-base", "--session-id", id, "--teammate-mode", "in-process", "--dangerously-skip-permissions", "-n", "amber-fox", "continue"}
+	wantFresh := []string{"claude", "--claude-base", "--session-id", id, "--teammate-mode", "in-process", "-n", "amber-fox", "continue"}
 	if !equalStrings(claudeFresh.Argv, wantFresh) {
 		t.Errorf("Claude fresh argv = %v, want %v", claudeFresh.Argv, wantFresh)
 	}
@@ -258,7 +233,7 @@ func TestRestoreProviderAgentSpecs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte("{}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	claudeResume, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue", AgentForeground)
+	claudeResume, err := c.RestoreProviderAgentSpec(agent.Claude, id, "amber-fox", "continue")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,16 +249,13 @@ func TestProviderAgentSpecErrors(t *testing.T) {
 		Enabled: []agent.Provider{agent.Claude},
 		Claude:  config.AgentProvider{Command: "claude"},
 	}})
-	if _, err := c.NewProviderAgentSpec(agent.Provider("other"), "", "", AgentForeground); err == nil {
+	if _, err := c.NewProviderAgentSpec(agent.Provider("other"), "", ""); err == nil {
 		t.Error("expected unknown-provider error")
 	}
-	if _, err := c.RestoreProviderAgentSpec("", "id", "", "", AgentForeground); err == nil {
+	if _, err := c.RestoreProviderAgentSpec("", "id", "", ""); err == nil {
 		t.Error("expected empty-provider error")
 	}
-	if _, err := c.NewProviderAgentSpec(agent.Claude, "", "", AgentMode(99)); err == nil {
-		t.Error("expected invalid-mode error")
-	}
-	if _, err := c.NewProviderAgentSpec(agent.Codex, "", "", AgentForeground); err == nil {
+	if _, err := c.NewProviderAgentSpec(agent.Codex, "", ""); err == nil {
 		t.Error("expected missing-command error")
 	}
 }
