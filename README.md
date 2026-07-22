@@ -39,6 +39,15 @@ Search every action and see its current configurable shortcut without leaving th
 - Codex integration uses the experimental remote/App Server interface and is tested with
   `codex-cli 0.144.4`; use that version or newer
 
+## Credentials and privacy
+
+`ct` does not implement its own agent login or store copies of provider credentials. To display
+Claude usage limits, it reads Claude Code's existing OAuth credential from the macOS Keychain (or
+`~/.claude/.credentials.json` as a fallback) and sends it only to Anthropic's
+`https://api.anthropic.com/api/oauth/usage` endpoint. Codex usage and lifecycle information comes
+from a local `codex app-server` process started from your configured Codex command. `ct` has no
+telemetry and does not send repository contents, prompts, or session output to a caretaker service.
+
 ## Configuration
 
 `ct` reads `~/.caretaker/config.toml`, or the path in `CT_CONFIG`. Only `root` is required:
