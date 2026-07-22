@@ -168,7 +168,7 @@ type attnLevel int
 
 const (
 	attnNone    attnLevel = iota // nothing pending
-	attnDone                     // busy → idle while unviewed (*)
+	attnDone                     // busy → idle while unviewed (✓)
 	attnWaiting                  // live status "waiting" — needs input/permission (!)
 )
 
@@ -1635,12 +1635,12 @@ func (m Model) boardStatus(pid int, attn attnLevel) string {
 		return "working"
 	case "waiting":
 		if st.WaitingFor != "" {
-			return "waiting: " + st.WaitingFor
+			return "waiting · " + st.WaitingFor
 		}
 		return "waiting"
 	case "idle":
 		if attn == attnDone {
-			return "done"
+			return "ready · new output"
 		}
 		return "idle"
 	default:

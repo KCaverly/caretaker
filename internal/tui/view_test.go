@@ -305,11 +305,11 @@ func TestBarNotifZone(t *testing.T) {
 	if !strings.Contains(bar, "r / w") {
 		t.Errorf("bar should show worktree label:\n%s", bar)
 	}
-	if strings.Contains(bar, "!") || strings.Contains(bar, "*") {
+	if strings.Contains(bar, "!") || strings.Contains(bar, "✓") {
 		t.Errorf("bar should not show notif glyphs when nothing is unread:\n%s", bar)
 	}
 
-	// A live-waiting agent elsewhere shows "!", a stored unread marker shows "*".
+	// A live-waiting agent elsewhere shows "!", a stored unread marker shows "✓".
 	// (The waiting agent is in another worktree so it maps via m.active.)
 	m.active = []activeItem{
 		{repo: repo.Repo{Name: "other"}, view: WorktreeView{WT: repo.Worktree{Name: "wt", Path: "/other/wt"}}},
@@ -320,8 +320,8 @@ func TestBarNotifZone(t *testing.T) {
 	if !strings.Contains(bar, "!") {
 		t.Errorf("bar should show ! for a live-waiting agent:\n%s", bar)
 	}
-	if !strings.Contains(bar, "*") {
-		t.Errorf("bar should show * for an unread completion:\n%s", bar)
+	if !strings.Contains(bar, "✓") {
+		t.Errorf("bar should show ✓ for unread output:\n%s", bar)
 	}
 
 	// Board header should show the agent count when open.

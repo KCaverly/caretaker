@@ -177,7 +177,7 @@ func (m Model) renderBar() string {
 		left += z.glyph
 	}
 
-	// Right side: notification zone (! N  * N) then the workspace context. Its
+	// Right side: notification zone (! N  ✓ N) then the workspace context. Its
 	// layout (and the click targets within it) is derived once by barRightZones.
 	right := m.barRightZones().text
 
@@ -188,7 +188,7 @@ func (m Model) renderBar() string {
 }
 
 // renderNotifZone builds the right-side attention summary: "! N" (red) for
-// worktrees where an agent is waiting on input and "* N" (green) for worktrees
+// worktrees where an agent is waiting on input and "✓ N" (green) for worktrees
 // with unread completions. Returns "" when nothing is pending. Clicking it
 // jumps straight to the agent needing attention (the attention-jump chord's
 // destination), cycling to the next on each click.
@@ -200,7 +200,7 @@ func (m Model) renderNotifZone() string {
 			" "+countStyle.Render(strconv.Itoa(waiting)))
 	}
 	if done > 0 {
-		parts = append(parts, boldGreen.Render("*")+
+		parts = append(parts, boldGreen.Render("✓")+
 			" "+countStyle.Render(strconv.Itoa(done)))
 	}
 	return strings.Join(parts, "  ")
@@ -464,7 +464,7 @@ func (m Model) tabAt(x, y int) (screen, bool) {
 // zone isn't shown; their start columns are only meaningful when non-empty.
 type barRight struct {
 	text       string // the right side exactly as drawn
-	notif      string // notification zone ("! N  * N")
+	notif      string // notification zone ("! N  ✓ N")
 	notifStart int
 	usage      string // plan-usage segment (unstyled)
 	usageStart int
@@ -598,13 +598,22 @@ func (m Model) boardAgentLine(r boardRow, innerW int) string {
 	case attnWaiting:
 		glyph, glyphSt = "!", boldRed
 	case attnDone:
-		glyph, glyphSt = "*", boldGreen
+		glyph, glyphSt = "✓", boldGreen
 	}
 	chip := helpKeyStyle.Render(normalizedProvider(r.provider).String())
 	left := "   " + dimStyle.Render(numCol) + " " + glyphSt.Render(glyph) + " " + chip +
 		dimStyle.Render(" · ") + nameStyle.Render(r.label)
 	status := truncateTo(r.status, max(0, innerW-lipgloss.Width(left)-2))
-	right := dimStyle.Render(status)
+	statusSt := dimStyle
+	switch {
+	case r.attn == attnWaiting:
+		statusSt = boldRed
+	case r.attn == attnDone:
+		statusSt = boldGreen
+	case strings.HasPrefix(status, "working"):
+		statusSt = accentStyle
+	}
+	right := statusSt.Render(status)
 	gap := max(2, innerW-lipgloss.Width(left)-lipgloss.Width(right))
 	return left + strings.Repeat(" ", gap) + right
 }
@@ -1291,7 +1300,7 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 		notifChar = "!"
 		notifSt = boldRed
 	case attnDone:
-		notifChar = "*"
+		notifChar = "✓"
 		notifSt = boldGreen
 	}
 
@@ -1596,7 +1605,7 @@ func statusLegend() string {
 		liveStyle.Render("●") + helpStyle.Render(" live"),
 		dimStyle.Render("○") + helpStyle.Render(" stopped"),
 		lipgloss.NewStyle().Foreground(cRed).Render("!") + helpStyle.Render(" waiting"),
-		lipgloss.NewStyle().Foreground(cGreen).Render("*") + helpStyle.Render(" done"),
+		lipgloss.NewStyle().Foreground(cGreen).Render("✓") + helpStyle.Render(" new output"),
 	}, helpStyle.Render("   "))
 }
 

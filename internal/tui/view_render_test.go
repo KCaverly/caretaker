@@ -244,6 +244,24 @@ func TestBoardShowsElapsedBusyTime(t *testing.T) {
 	}
 }
 
+func TestBoardAttentionStatusVocabulary(t *testing.T) {
+	m := modelWithAgents(1)
+	pid := m.current.ws.Agents[0].Pid()
+	m.agentStatus = map[int]AgentStatus{}
+
+	m.agentStatus[pid] = AgentStatus{Status: "waiting", WaitingFor: "permission"}
+	if got, want := m.boardStatus(pid, attnWaiting), "waiting · permission"; got != want {
+		t.Fatalf("waiting status = %q, want %q", got, want)
+	}
+	m.agentStatus[pid] = AgentStatus{Status: "idle"}
+	if got, want := m.boardStatus(pid, attnDone), "ready · new output"; got != want {
+		t.Fatalf("unread status = %q, want %q", got, want)
+	}
+	if got, want := m.boardStatus(pid, attnNone), "idle"; got != want {
+		t.Fatalf("acknowledged status = %q, want %q", got, want)
+	}
+}
+
 func TestDeckLoadingState(t *testing.T) {
 	// A fresh model has issued its first scan but received nothing yet: the
 	// deck must say it's scanning, not claim the root is empty.
