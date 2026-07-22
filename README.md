@@ -142,6 +142,50 @@ go run ./cmd/ct
 go build -o ct ./cmd/ct && ./ct
 ```
 
+## Install and update
+
+Release binaries currently support Apple Silicon and Intel Macs. They do not
+require Go or a caretaker source checkout.
+
+With Homebrew:
+
+```sh
+brew install kcaverly/tap/ct
+brew upgrade ct
+```
+
+Without Homebrew, use the checksum-verifying installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/KCaverly/caretaker/main/scripts/install.sh | sh
+```
+
+The installer writes to `~/.local/bin` by default. Set `CT_INSTALL_DIR` to use a
+different directory, or download it first if your environment does not permit
+piping scripts into a shell. A specific release can be installed with
+`--version v0.1.0`. Confirm the installed build with `ct version`.
+
+### Maintainer release process
+
+Releases are built by GitHub Actions from semantic version tags and begin as
+drafts so their archives and attestations can be reviewed before publication.
+
+1. Create the public `KCaverly/homebrew-tap` repository.
+2. Add a fine-grained `HOMEBREW_TAP_TOKEN` repository secret with Contents
+   read/write access to that tap. Until then, releases still work but tap
+   publication is skipped.
+3. Ensure the release commit is on `main`, then push a tag such as `v0.1.0`.
+4. Review the draft release, its two macOS archives, checksums, generated notes,
+   and attestations, then publish it.
+5. Enable immutable releases in repository settings after the first successful
+   end-to-end release.
+
+Release assets can be verified with GitHub CLI:
+
+```sh
+gh attestation verify ct_Darwin_arm64.tar.gz --repo KCaverly/caretaker
+```
+
 ## How it works
 
 A pinned status bar sits at the top at all times:
