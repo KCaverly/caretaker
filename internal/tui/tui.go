@@ -1975,8 +1975,12 @@ func (m Model) paletteCommands() []paletteCmd {
 			continue
 		}
 		if stackCanRestack(e.status) {
+			title := "restack: " + repoName + "/" + wtName
+			if e.status.Stack.NextAction == "finish" {
+				title = "finish stack: " + repoName + "/" + wtName
+			}
 			cmds = append(cmds, paletteCmd{
-				title: "restack: " + repoName + "/" + wtName,
+				title: title,
 				hint:  stackRestackReason(e.status),
 				run: func(m Model) (tea.Model, tea.Cmd) {
 					m = m.enterStackOverlay(key, repoName, wtName, p)

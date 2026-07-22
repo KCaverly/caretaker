@@ -800,7 +800,7 @@ func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 		stk.NextAction == "resolve-conflicts" {
 		return "!", errStyle, true
 	}
-	if stk.NextAction == "restack" {
+	if stk.NextAction == "restack" || stk.NextAction == "finish" {
 		return "⟳", errStyle, true
 	}
 
@@ -876,6 +876,8 @@ func stackActionLabel(action string) string {
 		return "waiting on checks"
 	case "restack":
 		return "restack needed"
+	case "finish":
+		return "ready to finish"
 	case "resolve-conflicts":
 		return "resolve conflicts"
 	case "submit":
@@ -917,7 +919,7 @@ func stackHasSubmitWork(st stack.StackStatus) bool {
 // and rebase away. A conflict is restackable only in that cascade shape; an
 // ordinary conflicting PR has no landed prefix, so restack would be a no-op.
 func stackCanRestack(st stack.StackStatus) bool {
-	if st.Stack.NextAction == "restack" {
+	if st.Stack.NextAction == "restack" || st.Stack.NextAction == "finish" {
 		return true
 	}
 	return st.Stack.NextAction == "resolve-conflicts" &&
@@ -940,6 +942,9 @@ func stackCanMerge(st stack.StackStatus) bool {
 // stackRestackReason is the palette hint on the "restack" row: how many landed
 // commits sit below the survivors.
 func stackRestackReason(st stack.StackStatus) string {
+	if st.Stack.NextAction == "finish" {
+		return "all PRs landed"
+	}
 	if n := st.Stack.Counts[stack.StateMerged]; n > 0 {
 		return fmt.Sprintf("%d landed below", n)
 	}

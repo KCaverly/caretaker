@@ -69,6 +69,14 @@ func TestDeckStackGlyph(t *testing.T) {
 			glyph: "⟳",
 		},
 		{
+			name: "fully landed needs finish",
+			st: statusWith(
+				stack.Stack{Size: 1, BaseChainOK: true, NextAction: "finish",
+					Counts: map[stack.State]int{stack.StateMerged: 1}},
+				stack.Commit{State: stack.StateMerged}),
+			glyph: "⟳",
+		},
+		{
 			name: "all open passing",
 			st: statusWith(
 				stack.Stack{Size: 2, BaseChainOK: true, NextAction: "merge",
@@ -403,6 +411,15 @@ func TestStackPaletteRows(t *testing.T) {
 	}
 	if has(m, "submit stack: repo/wt") {
 		t.Error("submit row should be absent with no submit-able work")
+	}
+
+	// Fully landed stacks use the same cleanup pipeline under a clearer verb.
+	m.stackInfo[key] = stackEntry{status: statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "finish",
+			Counts: map[stack.State]int{stack.StateMerged: 1}},
+		stack.Commit{State: stack.StateMerged}), fetchedAt: time.Now()}
+	if !has(m, "finish stack: repo/wt") || has(m, "restack: repo/wt") {
+		t.Error("fully landed stack should offer finish rather than restack")
 	}
 
 	// A conflicting cascade can use the same restack pipeline: drop the landed

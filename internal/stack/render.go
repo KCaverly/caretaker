@@ -131,6 +131,12 @@ func RenderRestackPlan(res RestackResult) string {
 	return b.String()
 }
 
+// RenderFinishPlan uses the restack plan's details but names the user-facing
+// operation accurately for a stack with no surviving commits.
+func RenderFinishPlan(res FinishResult) string {
+	return strings.Replace(RenderRestackPlan(res), "restack plan (dry-run)", "finish plan (dry-run)", 1)
+}
+
 // glyph is the single-character status mark for a commit state: a check for
 // good/landed, a cross for problems, a dotted circle for in-flight/todo, an
 // ellipsis for "moved, needs a push".

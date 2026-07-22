@@ -50,7 +50,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|merge) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -60,13 +60,71 @@ func runStack(args []string) int {
 		return runStackSubmit(args[1:])
 	case "restack":
 		return runStackRestack(args[1:])
+	case "finish":
+		return runStackFinish(args[1:])
 	case "merge":
 		return runStackMerge(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|merge) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+func runStackFinish(args []string) int {
+	var asJSON, dryRun bool
+	var dir string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--dry-run":
+			dryRun = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack finish: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack finish: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack finish:", err)
+			return 1
+		}
+	}
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack finish:", err)
+		return 1
+	}
+	res, err := stack.Finish(stack.FinishOptions{Params: params, DryRun: dryRun})
+	if err != nil {
+		for _, done := range res.Executed {
+			fmt.Fprintln(os.Stderr, "  did:", done)
+		}
+		fmt.Fprintln(os.Stderr, "ct stack finish:", err)
+		return 1
+	}
+	if dryRun {
+		if asJSON {
+			return encodeStackJSON(res.Status, &res.Plan)
+		}
+		fmt.Print(stack.RenderFinishPlan(res))
+		return 0
+	}
+	if asJSON {
+		return encodeStackJSON(res.Status, nil)
+	}
+	fmt.Print(stack.Render(res.Status))
+	return 0
 }
 
 func runStackMerge(args []string) int {

@@ -172,6 +172,18 @@ func TestRenderRestackPlan(t *testing.T) {
 	}
 }
 
+func TestRenderFinishPlan(t *testing.T) {
+	res := FinishResult{
+		Status:    StackStatus{Repo: "demo", Worktree: "feat", MainBranch: "main"},
+		Drops:     []DropAction{{Position: 1, ShortSHA: "aaaaaaa", Subject: "one", Number: 41}},
+		RebaseCmd: []string{"git", "rebase", "--onto", "origin/main", "aaaaaaa", "feat"},
+	}
+	out := RenderFinishPlan(res)
+	if !strings.Contains(out, "finish plan (dry-run)") || strings.Contains(out, "restack plan (dry-run)") {
+		t.Fatalf("finish renderer did not rename the cleanup operation:\n%s", out)
+	}
+}
+
 // TestPredictRestackSubmit checks the dry-run prediction: survivors are pushed
 // (rebased), the new bottom is retargeted to main if GitHub has not, and every
 // surviving PR's nav table is re-spliced. The landed commit is excluded.
