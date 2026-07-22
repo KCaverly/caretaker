@@ -1631,6 +1631,7 @@ func (m Model) buildBoard() (rows []boardRow, nav []int) {
 	for _, it := range m.active {
 		addGroup(wsKey(it.repo.Name, it.view.WT.Name), it.repo.Name, it.view.WT.Name, it.view.WT.Path)
 	}
+
 	// The home workspace isn't a git worktree, so it never appears in m.active.
 	if m.homeWSKey != "" {
 		addGroup(m.homeWSKey, "~", "config", m.homeWSPath)
@@ -2017,8 +2018,18 @@ func (m Model) paletteCommands() []paletteCmd {
 			},
 		})
 		e, cached := m.stackInfo[key]
-		if !cached || e.loading || e.err != nil {
+		if !cached || e.loading || e.err != nil || time.Since(e.fetchedAt) >= stackFreshFor {
 			continue
+		}
+		for _, commit := range e.status.Commits {
+			if commit.State != stack.StateOpen || commit.PR == nil || commit.PR.URL == "" {
+				continue
+			}
+			url := commit.PR.URL
+			title := fmt.Sprintf("open PR #%d: %s/%s — %s", commit.PR.Number, repoName, wtName, commit.Subject)
+			cmds = append(cmds, paletteCmd{title: title, run: func(m Model) (tea.Model, tea.Cmd) {
+				return m, openURLCmd(url)
+			}})
 		}
 		if e.status.Stack.NextAction == "complete" {
 			cmds = append(cmds, paletteCmd{
@@ -2106,6 +2117,27 @@ func (m Model) paletteCommands() []paletteCmd {
 		paletteCmd{title: "open agent board", hint: m.keys.Palette, run: func(m Model) (tea.Model, tea.Cmd) { return m.openBoard() }},
 		paletteCmd{title: "new agent…", run: func(m Model) (tea.Model, tea.Cmd) { return m.openNewAgentForm(), nil }},
 	)
+	rows, _ := m.buildBoard()
+	for _, r := range rows {
+		if !r.isAgent {
+			continue
+		}
+		identity := r.repo + "/" + r.worktree + " — " + r.label
+		target := r
+		cmds = append(cmds,
+			paletteCmd{title: "restart agent: " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.boardOpen = true
+				if m.boardAgentActive(target) {
+					return m.beginAgentRestartConfirm(target), nil
+				}
+				return m.restartBoardAgent(target)
+			}},
+			paletteCmd{title: "close agent: " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.boardOpen = true
+				return m.beginAgentCloseConfirm(target), nil
+			}},
+		)
+	}
 	if m.current != nil && m.current.ws != nil && len(m.current.ws.Agents) >= 2 {
 		cmds = append(cmds,
 			paletteCmd{title: "next agent", hint: m.keys.NextAgent, run: func(m Model) (tea.Model, tea.Cmd) { return m.rotateAgent(+1) }},
@@ -2136,6 +2168,82 @@ func (m Model) paletteCommands() []paletteCmd {
 				return m.closeTermPane()
 			}},
 		)
+		ws := m.current.ws
+		if ws != nil && len(ws.Terms) > 1 && !ws.TermZoomed {
+			w, h := m.sessionSize()
+			bounds := session.ComputePaneBounds(ws.TermLayout, 0, 0, w, h)
+			for _, item := range []struct {
+				name string
+				hint string
+				dir  session.FocusDir
+			}{
+				{"left", m.keys.TermFocusLeft, session.FocusLeft},
+				{"down", m.keys.TermFocusDown, session.FocusDown},
+				{"up", m.keys.TermFocusUp, session.FocusUp},
+				{"right", m.keys.TermFocusRight, session.FocusRight},
+			} {
+				if session.FocusPaneDir(bounds, ws.ActiveTerm, item.dir) < 0 {
+					continue
+				}
+				dir := item.dir
+				cmds = append(cmds, paletteCmd{
+					title: "focus terminal pane " + item.name, hint: item.hint,
+					run: func(m Model) (tea.Model, tea.Cmd) {
+						m.screen = screenTerminal
+						w, h := m.sessionSize()
+						m.mgr.FocusTermPaneDir(m.current.key, dir, w, h)
+						return m, nil
+					},
+				})
+			}
+		}
+	}
+
+	// Lower-frequency expert actions remain searchable without displacing the
+	// palette's common open/create/navigation rows from its initial viewport.
+	if m.current != nil {
+		cmds = append(cmds,
+			paletteCmd{title: "cycle view next", hint: m.keys.Cycle, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = m.screen.next()
+				if m.screen == screenAgent {
+					m.clearWorkspaceAttention()
+				}
+				return m, nil
+			}},
+			paletteCmd{title: "cycle view previous", hint: m.keys.CycleBack, run: func(m Model) (tea.Model, tea.Cmd) {
+				m.screen = m.screen.prev()
+				if m.screen == screenAgent {
+					m.clearWorkspaceAttention()
+				}
+				return m, nil
+			}},
+		)
+	}
+	for _, it := range m.active {
+		key := wsKey(it.repo.Name, it.view.WT.Name)
+		identity := it.repo.Name + "/" + it.view.WT.Name
+		if it.view.Live {
+			cmds = append(cmds, paletteCmd{title: "stop " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
+				if !m.selectActiveByKey(key) {
+					return m, nil
+				}
+				selected, _ := m.selectedActive()
+				if m.busyHostedAgents(key) > 0 {
+					return m.beginStopConfirm(selected.view.WT.Name), nil
+				}
+				m.stopWorkspace(key)
+				return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+selected.view.WT.Name))
+			}})
+		}
+		if !it.view.WT.IsMain {
+			cmds = append(cmds, paletteCmd{title: "remove " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
+				if !m.selectActiveByKey(key) {
+					return m, nil
+				}
+				selected, _ := m.selectedActive()
+				return m.beginRemove(selected), nil
+			}})
+		}
 	}
 
 	// 6. Misc / global — always available. Quit sits last and reuses the picker's
@@ -4401,6 +4509,18 @@ func (m Model) selectedActive() (activeItem, bool) {
 		return activeItem{}, false
 	}
 	return m.active[m.activeCursor], true
+}
+
+func (m *Model) selectActiveByKey(key string) bool {
+	for i, it := range m.active {
+		if wsKey(it.repo.Name, it.view.WT.Name) == key {
+			m.screen = screenPicker
+			m.focus = focusActive
+			m.activeCursor = i
+			return true
+		}
+	}
+	return false
 }
 
 func clamp(v, lo, hi int) int {
