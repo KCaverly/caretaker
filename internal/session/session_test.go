@@ -273,11 +273,18 @@ func TestRenderCacheMatchesEmulator(t *testing.T) {
 // TestRenderCacheInvalidatesOnWrite proves new pty output is reflected on the
 // next Render() rather than being masked by a stale cache.
 func TestRenderCacheInvalidatesOnWrite(t *testing.T) {
-	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	// Disable the PTY's own echo before starting cat. With both terminal echo
+	// and cat active, the two copies can arrive in separate reads; a test render
+	// between them observes a legitimately changing emulator and becomes timing
+	// dependent on slower CI runners.
+	s, err := Start(Terminal, "term", t.TempDir(),
+		[]string{"sh", "-c", "stty -echo; printf 'READY\\n'; exec cat"},
+		80, 24, func(*Session) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	waitFor(t, s, "READY")
 
 	_, _ = s.WriteInput([]byte("first-line\n"))
 	waitFor(t, s, "first-line")
