@@ -17,6 +17,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "--version") {
+		fmt.Println(versionString())
+		return
+	}
 	// The `stack` command group runs headless, before any TUI setup: it prints to
 	// stdout and exits, so it must not touch the Bubble Tea program or config.
 	if len(os.Args) > 1 && os.Args[1] == "stack" {
