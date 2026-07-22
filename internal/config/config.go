@@ -37,6 +37,15 @@ type Config struct {
 	Usage Usage `toml:"usage"`
 	// Plasma configures the deck's ambient plasma panel.
 	Plasma Plasma `toml:"plasma"`
+	// Stack configures stacked-PR workflow behavior.
+	Stack Stack `toml:"stack"`
+}
+
+// Stack configures stacked-PR workflow behavior.
+type Stack struct {
+	// AutoMerge bypasses ct's merge confirmation panel. This is distinct from
+	// GitHub auto-merge: an eligible merge runs immediately when requested.
+	AutoMerge bool `toml:"auto_merge"`
 }
 
 // Agents configures which agent providers can be launched.

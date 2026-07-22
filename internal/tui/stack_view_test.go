@@ -243,8 +243,25 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 	}
 	m.stackMerge = func(stack.MergeOptions) (stack.MergeResult, error) { return stack.MergeResult{}, nil }
 	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: 'M', Text: "M"})
-	if !mm.(Model).stackView.working || cmd == nil {
-		t.Fatal("M should execute the guarded merge command")
+	m = mm.(Model)
+	if m.mode != modeConfirmMerge || cmd != nil || m.confirm.cursor != 0 {
+		t.Fatal("M should open the merge confirmation on its safe option")
+	}
+	if out := m.renderConfirm(m.height - barHeight); !strings.Contains(out, "PR #10") ||
+		!strings.Contains(out, "merge PR #10 into main") || !strings.Contains(out, "checks: unknown") {
+		t.Errorf("merge confirmation should identify the target and evidence:\n%s", out)
+	}
+	mm, cmd = m.handleConfirmMergeKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	m = mm.(Model)
+	if m.mode != modeConfirmMerge || cmd != nil {
+		t.Fatal("unrelated input should be swallowed by the merge confirmation")
+	}
+	mm, _ = m.handleConfirmMergeKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	mm, cmd = m.handleConfirmMergeKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.mode != modeNormal || !m.stackView.working || cmd == nil {
+		t.Fatal("confirming should restore the stack overlay and start the merge")
 	}
 
 	m, key = stackModel()
@@ -255,6 +272,22 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("command palette should offer merge for a mergeable main PR")
+	}
+
+	cmd = runPaletteRow(t, &m, "merge PR: repo/wt")
+	if m.mode != modeConfirmMerge || cmd != nil || !m.stackOpen {
+		t.Fatal("palette merge should open the shared confirmation")
+	}
+	mm, _ = m.handleConfirmMergeKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.mode != modeNormal || !m.stackOpen || m.stackView.status == nil {
+		t.Fatal("cancel should return to the same loaded stack context")
+	}
+
+	m.stackAutoMerge = true
+	cmd = runPaletteRow(t, &m, "merge PR: repo/wt")
+	if m.mode != modeNormal || !m.stackView.working || cmd == nil {
+		t.Fatal("auto_merge should execute immediately from the palette")
 	}
 }
 

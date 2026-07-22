@@ -117,6 +117,11 @@ palette = "aurora"  # aurora (blue/purple) | ember (yellow/red) | mono (grayscal
 charset = "dots"    # dots (braille) | shade | blocks
 speed   = 0.3       # animation rate; 0 freezes the pattern
 width   = 40        # percent of the terminal width; 0 disables the panel
+
+# Stack merges require a confirmation by default. This setting bypasses ct's
+# confirmation; it is not GitHub's "auto-merge when checks pass" feature.
+[stack]
+auto_merge = false
 ```
 
 The old top-level `agent = "claude"` setting is still accepted as a Claude command override.
