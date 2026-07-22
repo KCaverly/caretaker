@@ -27,7 +27,7 @@ var (
 	cFg     = lipgloss.Color("#EBDBB2") // fg1
 	cDim    = lipgloss.Color("#928374") // gray
 	cFaint  = lipgloss.Color("#665C54") // bg3
-	cSelBg  = lipgloss.Color("#504945") // bg2 (selection)
+	cSelBg  = lipgloss.Color("#665C54") // bg3 (strong selection)
 	cInk    = lipgloss.Color("#1D2021") // bg0_h (hard)
 )
 
@@ -49,6 +49,7 @@ var (
 	aheadStyle   = lipgloss.NewStyle().Foreground(cGreen)
 	behindStyle  = lipgloss.NewStyle().Foreground(cYellow)
 	selStyle     = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cSelBg)
+	selANSI      = ansi.NewStyle().Bold().ForegroundColor(cFg).BackgroundColor(cSelBg).String()
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent)
 	helpStyle    = lipgloss.NewStyle().Foreground(cDim)
 	errStyle     = lipgloss.NewStyle().Foreground(cRed)
@@ -1954,10 +1955,13 @@ func keyhint(key, desc string) string {
 	return helpKeyStyle.Render(key) + helpStyle.Render(" "+desc)
 }
 
-// selBar renders text as a solid full-width selection bar by padding the plain
-// string to innerW before styling, so the background spans the whole row.
+// selBar renders text as a solid full-width selection bar. Nested styles in a
+// row (provider, label, status) emit full ANSI resets, so reapply the selection
+// style after each one; otherwise the background stops at the first styled
+// segment instead of continuing through the title and status columns.
 func selBar(text string, innerW int) string {
-	return selStyle.Render(padLine(text, innerW))
+	text = strings.ReplaceAll(padLine(text, innerW), ansi.ResetStyle, ansi.ResetStyle+selANSI)
+	return selStyle.Render(text)
 }
 
 // box draws content inside a rounded, padded frame of a fixed inner size. Lines

@@ -76,6 +76,31 @@ func TestSelectionBarFillsWidth(t *testing.T) {
 	}
 }
 
+func TestSelectionBarPreservesSemanticColors(t *testing.T) {
+	for name, semantic := range map[string]string{
+		"waiting": boldRed.Render("waiting · permission"),
+		"ready":   boldGreen.Render("ready · new output"),
+		"working": accentStyle.Render("working · 41s"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			selected := selBar("agent  "+semantic, 48)
+			if !strings.Contains(ansi.Strip(selected), ansi.Strip(semantic)) {
+				t.Fatalf("selection bar replaced %s semantic text:\n%s", name, selected)
+			}
+			// Every nested reset must immediately restore the selection style;
+			// only selBar's final outer reset is allowed to leave it off.
+			resets := strings.Count(selected, ansi.ResetStyle)
+			restored := strings.Count(selected, ansi.ResetStyle+selANSI)
+			if restored != resets-1 {
+				t.Fatalf("selection background restored after %d/%d nested resets", restored, resets-1)
+			}
+			if w := lipgloss.Width(selected); w != 48 {
+				t.Fatalf("selected row width = %d, want 48", w)
+			}
+		})
+	}
+}
+
 // TestActiveRowStateCluster checks the right-aligned work-state cluster: ↑N
 // when ahead, ↓M when behind, both when diverged, and a dim — when there is no
 // base to compare against or the branch is level with it. Selected and
