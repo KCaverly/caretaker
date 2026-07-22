@@ -523,11 +523,9 @@ func (m Model) renderBoard(h int) string {
 	if m.formOpen {
 		return m.renderBoardForm(h, clamp(m.width-8, 32, 64))
 	}
-	// The board is a workspace-wide overview, so let its agent rows use the
-	// full available width instead of constraining them to the compact overlay
-	// width used by forms. The surrounding frame still keeps a two-cell margin
-	// on either side at normal terminal sizes.
-	innerW := max(32, m.width-8)
+	// Match the help overlay's readable maximum while allowing every agent row
+	// and its selection bar to use the full width inside the panel.
+	innerW := clamp(m.width-8, 32, 72)
 
 	rows, nav := m.buildBoard()
 	selRow := -1
@@ -574,10 +572,15 @@ func (m Model) renderBoard(h int) string {
 		}
 	}
 
-	lines = append(lines, "", "  "+strings.Join([]string{
-		keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
-		keyhint("n", "new"), keyhint("r", "restart"), keyhint("d", "close"), keyhint("esc", "close"),
-	}, helpStyle.Render("  ·  ")))
+	separator := helpStyle.Render("  ·  ")
+	lines = append(lines, "",
+		"  "+strings.Join([]string{
+			keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
+		}, separator),
+		"  "+strings.Join([]string{
+			keyhint("n", "new"), keyhint("r", "restart"), keyhint("d", "close"), keyhint("esc", "close"),
+		}, separator),
+	)
 
 	boxStr := box(lines, innerW, len(lines), true)
 	return centerBlock(boxStr, m.width, h)

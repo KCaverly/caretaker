@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/config"
@@ -353,21 +354,30 @@ func TestBoardRender(t *testing.T) {
 	}
 }
 
-func TestBoardUsesAvailableWidth(t *testing.T) {
+func TestBoardUsesFullPanelWidth(t *testing.T) {
 	m := modelWithAgents(2)
 	m.width, m.height = 120, 30
 	mm, _ := m.openBoard()
 	m = mm.(Model)
 
 	out := m.renderBoard(m.height - barHeight)
-	widest := 0
-	for _, line := range strings.Split(out, "\n") {
-		widest = max(widest, lipgloss.Width(line))
+	lines := strings.Split(out, "\n")
+	frameWidth := 0
+	for _, line := range lines {
+		frameWidth = max(frameWidth, lipgloss.Width(strings.TrimLeft(ansi.Strip(line), " ")))
 	}
-	// The board frame is width-4 and centerBlock adds the two-cell left
-	// margin. A capped board would be substantially narrower on this terminal.
-	if want := m.width - 2; widest != want {
-		t.Fatalf("rendered board width = %d, want %d", widest, want)
+	// 72 content cells plus two horizontal padding cells and two borders,
+	// matching the help overlay's maximum width.
+	if want := 76; frameWidth != want {
+		t.Fatalf("rendered board frame width = %d, want %d", frameWidth, want)
+	}
+
+	rows, nav := m.buildBoard()
+	if len(nav) == 0 || !rows[nav[0]].isAgent {
+		t.Fatal("test board has no selectable agent row")
+	}
+	if got, want := lipgloss.Width(m.boardAgentLine(rows[nav[0]], 72)), 72; got != want {
+		t.Fatalf("agent row width = %d, want full panel width %d", got, want)
 	}
 }
 
