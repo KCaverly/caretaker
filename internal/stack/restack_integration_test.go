@@ -301,9 +301,14 @@ func buildRestackStack(t *testing.T, bConflicts bool) restackHarness {
 	run(dir, "commit", "-m", "C\n\nct-stack-id: cccccccc")
 
 	bare := filepath.Join(root, "origin.git")
-	run(dir, "init", "--bare", bare)
+	// The clone used by squashLand follows the bare remote's HEAD. Make it
+	// deterministic instead of inheriting the runner's init.defaultBranch.
+	run(dir, "init", "--bare", "-b", "main", bare)
 	run(dir, "remote", "add", "origin", bare)
-	run(dir, "push", "origin", "main")
+	// Resolve main from the primary worktree. Newer Git versions do not always
+	// expose a branch checked out by another worktree as an unqualified push
+	// source when the command runs from a linked worktree.
+	run(repoDir, "push", "origin", "main")
 
 	commits, err := localCommits(dir, "main")
 	if err != nil {
