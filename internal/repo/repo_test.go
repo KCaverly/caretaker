@@ -107,7 +107,7 @@ func TestParseBranchTips(t *testing.T) {
 	out := "main\x001700000000\x00Initial commit\n" +
 		"feat-login\x001700000500\x00Add the login form · wip\n" +
 		"broken\x00notanumber\x00nope\n"
-	tips := parseBranchTips(out)
+	tips := parseBranchTips(out, false)
 	if len(tips) != 2 {
 		t.Fatalf("expected 2 parsed tips (broken one skipped), got %d: %v", len(tips), tips)
 	}
@@ -122,6 +122,32 @@ func TestParseBranchTips(t *testing.T) {
 	}
 	if _, ok := tips["broken"]; ok {
 		t.Errorf("line with unparseable time should have been skipped")
+	}
+}
+
+func TestParseBranchTipsAheadBehind(t *testing.T) {
+	// Four NUL-fenced fields per line; the fourth is the ahead-behind atom's
+	// "<ahead> <behind>" pair. The main branch compared to itself is 0/0; feat
+	// is 2 ahead / 1 behind; the empty pair (a ref git couldn't compare) keeps
+	// its tip but reports no base.
+	out := "main\x001700000000\x00Initial commit\x000 0\n" +
+		"feat\x001700000500\x00Add feature\x002 1\n" +
+		"orphan\x001700000900\x00Unrelated\x00\n"
+	tips := parseBranchTips(out, true)
+	if len(tips) != 3 {
+		t.Fatalf("expected 3 tips, got %d: %v", len(tips), tips)
+	}
+	if tip := tips["feat"]; !tip.HasBase || tip.Ahead != 2 || tip.Behind != 1 {
+		t.Errorf("feat = {ahead=%d behind=%d hasBase=%v}, want 2/1/true", tip.Ahead, tip.Behind, tip.HasBase)
+	}
+	if tip := tips["main"]; !tip.HasBase || tip.Ahead != 0 || tip.Behind != 0 {
+		t.Errorf("main = {ahead=%d behind=%d hasBase=%v}, want 0/0/true", tip.Ahead, tip.Behind, tip.HasBase)
+	}
+	if tip := tips["orphan"]; tip.HasBase {
+		t.Errorf("orphan with empty ahead-behind should report HasBase=false, got %+v", tip)
+	}
+	if tips["orphan"].Subject != "Unrelated" {
+		t.Errorf("orphan tip should still load its subject, got %q", tips["orphan"].Subject)
 	}
 }
 

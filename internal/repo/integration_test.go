@@ -118,7 +118,7 @@ func TestWorktreeLifecycle(t *testing.T) {
 	}
 
 	// Branch tips: one call covers every branch's time and subject.
-	tips, err := BranchTips(r)
+	tips, _, err := BranchTips(r, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +209,17 @@ func TestAheadBehindAndDiffstat(t *testing.T) {
 		t.Fatalf("diverged feat: got ahead=%d behind=%d ok=%v, want 2/1/true", a, b, ok)
 	}
 
+	// BranchTips folds the same ahead/behind into its single for-each-ref pass
+	// (the fast path the deck load uses). On git 2.41+ it must agree with the
+	// per-worktree AheadBehind above.
+	if tips, ab, err := BranchTips(r, "main"); err != nil {
+		t.Fatalf("BranchTips: %v", err)
+	} else if ab {
+		if tip := tips["feat"]; !tip.HasBase || tip.Ahead != 2 || tip.Behind != 1 {
+			t.Fatalf("BranchTips feat = {ahead=%d behind=%d hasBase=%v}, want 2/1/true", tip.Ahead, tip.Behind, tip.HasBase)
+		}
+	}
+
 	// Clean tree: no uncommitted diffstat. Then modify a tracked file.
 	if add, del, err := UncommittedDiffstat(wt); err != nil || add != 0 || del != 0 {
 		t.Fatalf("clean feat: got add=%d del=%d err=%v, want 0/0/nil", add, del, err)
@@ -263,7 +274,7 @@ func TestRemoveWorktreeKeepsBranch(t *testing.T) {
 		t.Fatalf("expected only main worktree after remove, got %+v", wts)
 	}
 	// The branch tip must survive.
-	tips, err := BranchTips(r)
+	tips, _, err := BranchTips(r, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
