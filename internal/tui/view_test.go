@@ -347,10 +347,13 @@ func TestBoardRender(t *testing.T) {
 	// The form renders the prompt input and both toggles.
 	m = m.openNewAgentForm().(Model)
 	out = m.renderBoard(m.height - barHeight)
-	for _, want := range []string{"NEW AGENT", "prompt", "active worktree", "background", "launch"} {
+	for _, want := range []string{"NEW AGENT", "What should Claude do?", "active worktree", "background", "launch"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("form missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "prompt") {
+		t.Errorf("form should not render a redundant prompt label or placeholder:\n%s", out)
 	}
 }
 

@@ -445,7 +445,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	rootInput.Prompt = "› "
 
 	promptInput := textarea.New()
-	promptInput.Placeholder = "What should Claude do?"
+	promptInput.Placeholder = ""
 	promptInput.Prompt = ""
 	promptInput.ShowLineNumbers = false
 	promptInput.DynamicHeight = true
@@ -2195,7 +2195,6 @@ func (m Model) openNewAgentForm() tea.Model {
 	}
 	m.formBackground = false
 	m.promptInput.SetValue("")
-	m.updatePromptPlaceholder()
 	m.promptInput.Focus()
 	return m
 }
@@ -2240,10 +2239,6 @@ func (m Model) moveFormFocus(delta int) (Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) updatePromptPlaceholder() {
-	m.promptInput.Placeholder = "What should " + providerName(m.formProvider) + " do?"
-}
-
 func (m *Model) cycleFormProvider(delta int) {
 	if len(m.agentProviders) < 2 {
 		return
@@ -2257,7 +2252,6 @@ func (m *Model) cycleFormProvider(delta int) {
 	}
 	idx = ((idx+delta)%len(m.agentProviders) + len(m.agentProviders)) % len(m.agentProviders)
 	m.formProvider = m.agentProviders[idx]
-	m.updatePromptPlaceholder()
 }
 
 // handleBoardForm drives the new-agent form. The prompt accepts ordinary

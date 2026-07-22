@@ -821,7 +821,8 @@ func TestBoardFormProviderChoiceAndDefaultReset(t *testing.T) {
 	m := mixedProviderModel(agent.Codex)
 	m.current = &workspaceRef{key: "r/w", path: t.TempDir(), ws: &session.Workspace{}}
 	m = m.openNewAgentForm().(Model)
-	if m.formProvider != agent.Codex || m.promptInput.Placeholder != "What should Codex do?" {
+	if m.formProvider != agent.Codex || m.promptInput.Placeholder != "" ||
+		!strings.Contains(m.renderBoard(m.height-barHeight), "What should Codex do?") {
 		t.Fatalf("default provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
 	}
 
@@ -833,7 +834,8 @@ func TestBoardFormProviderChoiceAndDefaultReset(t *testing.T) {
 	}
 	mm, _ = m.handleBoardForm(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
 	m = mm.(Model)
-	if m.formProvider != agent.Claude || m.promptInput.Placeholder != "What should Claude do?" {
+	if m.formProvider != agent.Claude || m.promptInput.Placeholder != "" ||
+		!strings.Contains(m.renderBoard(m.height-barHeight), "What should Claude do?") {
 		t.Fatalf("toggled provider form state = %q / %q", m.formProvider, m.promptInput.Placeholder)
 	}
 

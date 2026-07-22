@@ -637,7 +637,7 @@ func (m Model) renderBoardForm(h, innerW int) string {
 	rows := []string{
 		header("new agent", -1),
 		"",
-		"  " + fieldName(formFieldPrompt, "prompt"),
+		"  " + fieldName(formFieldPrompt, "What should "+providerName(m.formProvider)+" do?"),
 	}
 	for _, line := range strings.Split(m.promptInput.View(), "\n") {
 		rows = append(rows, "  "+line)
