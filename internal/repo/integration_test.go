@@ -4,8 +4,59 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestCreateWorktreeFetchesOrigin verifies that the default creation path does
+// not branch from a stale local main when origin/main has advanced.
+func TestCreateWorktreeFetchesOrigin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	local := filepath.Join(root, "local")
+	for _, dir := range []string{remote, seed} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(dir string, args ...string) {
+		t.Helper()
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	run(remote, "init", "--bare")
+	run(seed, "init", "-b", "main")
+	run(seed, "config", "user.email", "t@t.t")
+	run(seed, "config", "user.name", "t")
+	run(seed, "commit", "--allow-empty", "-m", "initial")
+	run(seed, "remote", "add", "origin", remote)
+	run(seed, "push", "-u", "origin", "main")
+	run(root, "clone", remote, local)
+	run(local, "checkout", "main")
+
+	// Advance the remote without fetching in local, leaving local main stale.
+	run(seed, "commit", "--allow-empty", "-m", "remote advance")
+	run(seed, "push", "origin", "main")
+
+	r := Repo{Name: "local", Path: local}
+	wt, err := CreateWorktree(r, ".worktrees/feat", "feat", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := Git(wt.Path, "log", "-1", "--format=%s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(subject); got != "remote advance" {
+		t.Fatalf("new worktree tip = %q, want fetched origin/main tip", got)
+	}
+}
 
 // TestWorktreeLifecycle exercises discovery + create/list/status/remove against a
 // real temporary git repo.

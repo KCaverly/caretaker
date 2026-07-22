@@ -418,9 +418,28 @@ func ValidateWorktreeName(name string) error {
 }
 
 // CreateWorktree adds a new worktree at relPath (relative to the repo) on a new
-// branch, based on baseRef. If baseRef is empty, the repo's current HEAD is used.
+// branch, based on baseRef. If baseRef is empty and the repository has an origin,
+// the primary worktree's branch is fetched and origin/<branch> is used. Repos
+// without an origin retain the local-only behavior of branching from HEAD.
 // Returns the created Worktree.
 func CreateWorktree(r Repo, relPath, branch, baseRef string) (Worktree, error) {
+	if baseRef == "" {
+		if _, err := Git(r.Path, "remote", "get-url", "origin"); err == nil {
+			wts, err := ListWorktrees(r)
+			if err != nil {
+				return Worktree{}, fmt.Errorf("finding primary branch: %w", err)
+			}
+			if len(wts) == 0 || wts[0].Branch == "" {
+				return Worktree{}, fmt.Errorf("cannot fetch base for a detached primary worktree")
+			}
+			mainBranch := wts[0].Branch
+			if _, err := Git(r.Path, "fetch", "origin", mainBranch); err != nil {
+				return Worktree{}, fmt.Errorf("fetching origin/%s: %w", mainBranch, err)
+			}
+			baseRef = "origin/" + mainBranch
+		}
+	}
+
 	abs := filepath.Join(r.Path, relPath)
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return Worktree{}, fmt.Errorf("creating worktree parent dir: %w", err)
