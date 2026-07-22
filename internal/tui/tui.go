@@ -16,6 +16,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/sahilm/fuzzy"
 
@@ -445,12 +446,24 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 
 	promptInput := textarea.New()
 	promptInput.Placeholder = "What should Claude do?"
-	promptInput.Prompt = "› "
+	promptInput.Prompt = ""
 	promptInput.ShowLineNumbers = false
 	promptInput.DynamicHeight = true
 	promptInput.MinHeight = 3
 	promptInput.MaxHeight = 8
 	promptInput.SetHeight(promptInput.MinHeight)
+	promptStyles := promptInput.Styles()
+	promptStyles.Focused.Base = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cAccent).
+		Padding(0, 1)
+	promptStyles.Blurred.Base = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cFaint).
+		Padding(0, 1)
+	promptStyles.Focused.Placeholder = dimStyle
+	promptStyles.Blurred.Placeholder = dimStyle
+	promptInput.SetStyles(promptStyles)
 
 	paletteInput := textinput.New()
 	paletteInput.Placeholder = "run a command…"
@@ -956,7 +969,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.SetWidth(inputW)
 		m.rootInput.SetWidth(clamp(m.width-14, 20, 52))
 		m.promptInput.MaxHeight = clamp(m.height-barHeight-10, 3, 8)
-		m.promptInput.SetWidth(clamp(m.width-16, 20, 52))
+		m.promptInput.SetWidth(clamp(m.width-16, 20, 80))
 		m.paletteInput.SetWidth(clamp(m.width-16, 20, 52))
 		// Only the current workspace is resized; background ones are brought up
 		// to date by Activate when they next become current.

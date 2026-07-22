@@ -354,6 +354,22 @@ func TestBoardRender(t *testing.T) {
 	}
 }
 
+func TestNewAgentFormIsWideWritingSurface(t *testing.T) {
+	m := modelWithAgents(1)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = mm.(Model).openNewAgentForm().(Model)
+
+	// Width reports the writable content after the border and horizontal
+	// padding; SetWidth(80) leaves 76 cells for prompt text.
+	if got, want := m.promptInput.Width(), 76; got != want {
+		t.Fatalf("prompt content width = %d, want %d", got, want)
+	}
+	out := m.renderBoard(m.height - barHeight)
+	if !strings.Contains(ansi.Strip(out), "╭"+strings.Repeat("─", 78)+"╮") {
+		t.Fatalf("new-agent prompt should render as a bordered 80-column writing surface:\n%s", out)
+	}
+}
+
 func TestBoardUsesFullPanelWidth(t *testing.T) {
 	m := modelWithAgents(2)
 	m.width, m.height = 120, 30

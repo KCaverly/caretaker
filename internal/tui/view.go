@@ -521,7 +521,7 @@ func (m Model) notifZoneAt(x, y int) bool {
 // trailing "+ new agent" row. Delegates to renderBoardForm in form state.
 func (m Model) renderBoard(h int) string {
 	if m.formOpen {
-		return m.renderBoardForm(h, clamp(m.width-8, 32, 64))
+		return m.renderBoardForm(h, clamp(m.width-8, 32, 84))
 	}
 	// Match the help overlay's readable maximum while allowing every agent row
 	// and its selection bar to use the full width inside the panel.
