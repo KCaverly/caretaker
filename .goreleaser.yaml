@@ -35,6 +35,21 @@ checksum:
   name_template: checksums.txt
   algorithm: sha256
 
+homebrew_casks:
+  - name: ct
+    ids: [ct]
+    binaries: [ct]
+    homepage: https://github.com/KCaverly/caretaker
+    description: Terminal deck for managing git worktrees and coding agents
+    skip_upload: '{{ if eq .Env.HOMEBREW_TAP_TOKEN "" }}true{{ else }}false{{ end }}'
+    repository:
+      owner: KCaverly
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    commit_author:
+      name: caretaker-release
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+
 changelog:
   use: github
   sort: asc
