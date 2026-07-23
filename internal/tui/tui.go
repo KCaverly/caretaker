@@ -146,8 +146,7 @@ func (m Model) confirmActive() bool {
 }
 
 // confirmIsNav reports whether key moves the confirm panel's cursor rather than
-// resolving it. It is what keeps j/k (and the arrow/ctrl aliases) from being
-// swept up by the "anything else cancels" fallback the mnemonic handlers keep.
+// resolving it. Unrecognized keys are contained by every confirmation handler.
 func confirmIsNav(key string) bool {
 	switch key {
 	case "up", "down", "k", "j", "ctrl+p", "ctrl+n":
@@ -3864,7 +3863,7 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // under it; every other key is dispatched by mnemonic, so the direct-key paths
 // are byte-identical to the old status-line prompt: "y" removes the worktree
 // and deletes its branch, "b" removes it but keeps the branch, "v" opens the
-// diff for the review loop, and anything else cancels.
+// diff for the review loop. Escape cancels; unrelated keys are ignored.
 func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if confirmIsNav(key) {
@@ -3902,7 +3901,9 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		remove := func() tea.Msg { return actionDoneMsg{err: m.ctrl.Remove(r, wt, deleteBranch)} }
 		return m, tea.Batch(remove, flashTick)
 	}
-	m = m.clearConfirm()
+	if key == "esc" {
+		m = m.clearConfirm()
+	}
 	return m, nil
 }
 
@@ -3955,7 +3956,7 @@ func (m Model) handleConfirmArchiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 
 // handleConfirmQuitKey resolves the quit guard: navigation moves the cursor,
 // enter fires the option under it, "y" quits directly (running CloseAll, which
-// kills every hosted pty), and anything else cancels back to the picker.
+// kills every hosted pty). Escape cancels; unrelated keys are ignored.
 func (m Model) handleConfirmQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if confirmIsNav(key) {
@@ -3968,13 +3969,15 @@ func (m Model) handleConfirmQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key == "y" {
 		return m, tea.Quit
 	}
-	m = m.clearConfirm()
+	if key == "esc" {
+		m = m.clearConfirm()
+	}
 	return m, nil
 }
 
 // handleConfirmStopKey resolves the stop guard: navigation moves the cursor,
 // enter fires the option under it, "y" stops the selected worktree directly,
-// and anything else cancels. The target is re-read from the cursor here (it
+// while escape cancels and unrelated keys are ignored. The target is re-read from the cursor here (it
 // can't move while the prompt is modal), mirroring handleConfirmKey.
 func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
@@ -3994,7 +3997,9 @@ func (m Model) handleConfirmStopKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
 		return m, tea.Batch(m.loadCmd(), m.flashCmd("stopped "+it.view.WT.Name))
 	}
-	m = m.clearConfirm()
+	if key == "esc" {
+		m = m.clearConfirm()
+	}
 	return m, nil
 }
 
@@ -4012,8 +4017,10 @@ func (m Model) handleConfirmAgentKey(msg tea.KeyPressMsg, restart bool) (tea.Mod
 	if restart {
 		actionKey = "r"
 	}
+	if key == "esc" {
+		return m.clearConfirm(), nil
+	}
 	if key != actionKey || target == nil {
-		m = m.clearConfirm()
 		return m, nil
 	}
 	r := *target
