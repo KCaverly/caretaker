@@ -87,6 +87,47 @@ func BenchmarkSetVisible(b *testing.B) {
 	})
 }
 
+// BenchmarkWorkspaceActivate measures one full Manager.Activate for a fresh
+// workspace — the synchronous UI-goroutine work behind opening a worktree,
+// creating one, or switching to a not-yet-active one for the first time. The
+// spec set mirrors a real activation: editor + 2 agents + terminal, each a
+// process spawned on its own pty. This is the latency the user waits through
+// before the editor appears.
+func BenchmarkWorkspaceActivate(b *testing.B) {
+	sleep := []string{"sleep", "60"}
+	specs := []Spec{
+		{Kind: Editor, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+		{Kind: Agent, Argv: sleep},
+		{Kind: Terminal, Argv: sleep},
+	}
+	dir := b.TempDir()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		m := NewManager()
+		key := fmt.Sprintf("repo/wt-%d", i)
+		if _, err := m.Activate(key, dir, specs, 120, 40); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		m.CloseAll()
+		b.StartTimer()
+	}
+}
+
+// BenchmarkBuildEnv measures buildEnv in isolation — the per-session
+// environment construction StartSpec runs for every pane it spawns (editor,
+// each agent, terminal). It snapshots os.Environ() and applies the TERM default
+// plus provider env changes; a workspace activation pays it once per session.
+func BenchmarkBuildEnv(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = buildEnv([]string{"FOO=bar"}, []string{"TMUX", "TERM_PROGRAM"})
+	}
+}
+
 // BenchmarkEmulatorRender measures the cost of serialising a full emulator
 // screen to a styled string — the work every repaint pays per visible session.
 // This is what makes dropping repaints for invisible sessions worthwhile: the

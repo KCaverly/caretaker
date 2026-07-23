@@ -273,16 +273,14 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 		return ws, nil
 	}
 
+	sessions, err := startSpecs(specs, dir, w, h, m.signalDirty)
+	if err != nil {
+		return nil, err
+	}
+
 	ws := &Workspace{w: w, h: h}
 	for i, sp := range specs {
-		s, err := StartSpec(sp, dir, w, h, m.signalDirty)
-		if err != nil {
-			for _, started := range ws.all() {
-				started.Close()
-			}
-			closeSpecCompanions(specs[i+1:])
-			return nil, err
-		}
+		s := sessions[i]
 		switch {
 		case sp.Kind == Editor && ws.Editor == nil:
 			ws.Editor = s
@@ -298,6 +296,42 @@ func (m *Manager) Activate(key, dir string, specs []Spec, w, h int) (*Workspace,
 	}
 	m.spaces[key] = ws
 	return ws, nil
+}
+
+// startSpecs launches every spec concurrently and returns the started sessions
+// in spec order. Each StartSpec is independent — it forks its own process and
+// allocates its own terminal emulator (a multi-megabyte parser buffer that must
+// be zeroed) — so overlapping them collapses the wall-clock latency a workspace
+// activation adds before the editor appears, instead of paying editor + agents
+// + terminal one after another. The fork/exec syscalls still serialise on the
+// runtime's fork lock, but the emulator allocation and pty setup around them run
+// in parallel across cores. On any failure every session that did start is
+// closed; StartSpec already releases the companion of a spec it failed to start,
+// so activation stays all-or-nothing.
+func startSpecs(specs []Spec, dir string, w, h int, dirty func(*Session)) ([]*Session, error) {
+	sessions := make([]*Session, len(specs))
+	errs := make([]error, len(specs))
+	var wg sync.WaitGroup
+	wg.Add(len(specs))
+	for i := range specs {
+		go func(i int) {
+			defer wg.Done()
+			sessions[i], errs[i] = StartSpec(specs[i], dir, w, h, dirty)
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			for _, s := range sessions {
+				if s != nil {
+					s.Close()
+				}
+			}
+			return nil, err
+		}
+	}
+	return sessions, nil
 }
 
 // SpawnAgent starts a new agent session in an active workspace, appends it to
