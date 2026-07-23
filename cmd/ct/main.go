@@ -16,6 +16,18 @@ import (
 	"github.com/KCaverly/caretaker/internal/tui"
 )
 
+// These values are replaced by the release build. They live in main.go so
+// `go run ./cmd/ct/main.go` remains a complete development entrypoint.
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
+func versionString() string {
+	return fmt.Sprintf("ct %s (commit %s, built %s)", version, commit, date)
+}
+
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "--version") {
 		fmt.Println(versionString())
