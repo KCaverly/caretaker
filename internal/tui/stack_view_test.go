@@ -902,3 +902,514 @@ func runPaletteRow(t *testing.T, p *Model, prefix string) tea.Cmd {
 	t.Fatalf("no palette row with prefix %q", prefix)
 	return nil
 }
+
+// --- split mode (per-commit diff preview) ---
+
+// splitCommitDiff is a small but structurally real patch body: one file header,
+// one hunk, one deletion and one addition. Paired with splitCommitStat it feeds
+// applyStackCommitDiff the same shape a git fetch would.
+const splitCommitDiff = `diff --git a/core.go b/core.go
+index 1111111..2222222 100644
+--- a/core.go
++++ b/core.go
+@@ -1,2 +1,2 @@
+-old token line
++new token line
+`
+
+func splitCommitStat() []repo.FileStat {
+	return []repo.FileStat{{Path: "core.go", Add: 1, Del: 1}}
+}
+
+// stackSplitModel opens the stack overlay on a two-commit status whose commits
+// carry SHAs, which split mode keys its per-commit diff cache by. The params
+// point at a directory that does not exist: the tests only ever assert that a
+// fetch command was issued, never run it, so no git call is made.
+func stackSplitModel() (Model, string) {
+	m, key := stackModel()
+	st := statusWith(
+		stack.Stack{Size: 2, BaseChainOK: true, NextAction: "merge",
+			Counts: map[stack.State]int{stack.StateOpen: 2}},
+		stack.Commit{Position: 1, SHA: "aaa111", ShortSHA: "aaa111", State: stack.StateOpen,
+			Subject: "core tokens",
+			PR:      &stack.PR{Number: 11, URL: "https://example.test/pr/11", Checks: stack.Checks{Summary: "passing"}}},
+		stack.Commit{Position: 2, SHA: "bbb222", ShortSHA: "bbb222", State: stack.StateOpen,
+			Subject: "refresh flow",
+			PR:      &stack.PR{Number: 12, URL: "https://example.test/pr/12", Checks: stack.Checks{Summary: "passing"}}})
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{
+		RepoName: "repo", WorktreeName: "wt", WorktreeDir: "/repo/wt",
+		Branch: "wt", MainBranch: "main"})
+	m.stackView.working = false
+	m.stackView.status = &st
+	return m, key
+}
+
+// keyPress builds a plain printable key press (Text set, so String() returns it
+// verbatim — matching how the handler switches on msg.String()).
+func keyPress(r rune) tea.KeyPressMsg {
+	return tea.KeyPressMsg{Code: r, Text: string(r)}
+}
+
+// enterSplit presses d and fails unless split mode opened with a fetch issued.
+func enterSplit(t *testing.T, m Model) Model {
+	t.Helper()
+	mm, cmd := m.handleStack(keyPress('d'))
+	m = mm.(Model)
+	if !m.stackView.split || m.stackView.splitFocus != paneStack || cmd == nil {
+		t.Fatalf("d should open split mode focused on the list with a fetch: split=%v focus=%v cmd=%v",
+			m.stackView.split, m.stackView.splitFocus, cmd != nil)
+	}
+	return m
+}
+
+// TestStackSplitToggle covers the d round trip: it opens split mode, marks the
+// cursored commit's diff loading and issues its fetch, and a second d closes the
+// preview while leaving the overlay itself open.
+func TestStackSplitToggle(t *testing.T) {
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+
+	cd, ok := m.stackView.diffCache["aaa111"]
+	if !ok || !cd.loading {
+		t.Fatalf("d should mark the cursored commit's diff loading, cache = %+v", m.stackView.diffCache)
+	}
+
+	// A second d closes the preview but not the overlay, and issues no fetch.
+	mm, cmd := m.handleStack(keyPress('d'))
+	m = mm.(Model)
+	if m.stackView.split || m.stackView.splitFocus != paneStack {
+		t.Fatalf("a second d should leave split mode, got split=%v focus=%v",
+			m.stackView.split, m.stackView.splitFocus)
+	}
+	if !m.stackOpen {
+		t.Fatal("leaving split mode must keep the stack overlay open")
+	}
+	if cmd != nil {
+		t.Fatal("closing the preview should not issue a command")
+	}
+	// Re-entering reuses the cache rather than re-fetching.
+	mm, cmd = m.handleStack(keyPress('d'))
+	if !mm.(Model).stackView.split || cmd != nil {
+		t.Fatal("re-entering split should reuse the cached diff, not re-fetch")
+	}
+}
+
+// TestStackSplitDiffMsgPopulatesCacheAndRenders checks that an arriving
+// stackCommitDiffMsg becomes a rendered scope in the cache and that the split
+// layout then shows both the left column's commit subjects and the patch text.
+func TestStackSplitDiffMsgPopulatesCacheAndRenders(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+	cd, ok := m.stackView.diffCache["aaa111"]
+	if !ok || cd.loading || cd.err != nil {
+		t.Fatalf("diff msg should land as a loaded cache entry, got %+v (ok=%v)", cd, ok)
+	}
+	if cd.scope.files != 1 || cd.scope.add != 1 || cd.scope.del != 1 {
+		t.Errorf("scope summary = files %d +%d −%d, want 1 file +1 −1",
+			cd.scope.files, cd.scope.add, cd.scope.del)
+	}
+	if len(cd.scope.fileLines) != 1 {
+		t.Errorf("the file header should be indexed for ]/[ jumps, got %v", cd.scope.fileLines)
+	}
+
+	out := ansi.Strip(m.renderStack(m.height - barHeight))
+	for _, want := range []string{
+		"core tokens",     // left column (and the section title)
+		"refresh flow",    // the second commit still listed on the left
+		"[split]",         // the mode label in the header
+		"core.go",         // the diff's file index row
+		"-old token line", // the patch body
+		"+new token line",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("split render missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStackSplitLayout pins the two-column geometry: the commit list occupies a
+// fixed-width left column, a │ divider sits at a stable offset on every body
+// row, and the cursored commit is the one whose diff fills the right pane.
+func TestStackSplitLayout(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+	lines := strings.Split(ansi.Strip(m.renderStack(m.height-barHeight)), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("split render should have a header, rule, body and footer:\n%s", strings.Join(lines, "\n"))
+	}
+
+	// At width 72 the left column is 24 columns wide, so the divider lands at
+	// display column 25 (leftW + one space) on every body row. The rows carry
+	// multi-byte glyphs (▸, ○, │), so index by rune, not byte.
+	const wantDividerCol = 25
+	body := lines[2 : len(lines)-1]
+	left := make([]string, len(body))
+	right := make([]string, len(body))
+	for i, row := range body {
+		runes := []rune(row)
+		col := -1
+		for j, r := range runes {
+			if r == '│' {
+				col = j
+				break
+			}
+		}
+		if col != wantDividerCol {
+			t.Fatalf("body row %d: divider at column %d, want %d:\n%q", i, col, wantDividerCol, row)
+		}
+		left[i], right[i] = string(runes[:col]), string(runes[col+1:])
+	}
+
+	// Row 0 is the cursored commit, drawn as the selection bar; row 1 is its
+	// neighbour. Both live entirely inside the left column.
+	if !strings.HasPrefix(left[0], "▸ core tokens") {
+		t.Errorf("first left row should be the cursored commit: %q", left[0])
+	}
+	if !strings.Contains(left[1], "refresh flow") {
+		t.Errorf("second left row should list the next commit: %q", left[1])
+	}
+
+	// The right pane carries the cursored commit's patch, not the neighbour's.
+	joined := strings.Join(right, "\n")
+	if !strings.Contains(joined, "core.go") || !strings.Contains(joined, "+new token line") {
+		t.Errorf("right pane should hold the cursored commit's patch:\n%s", joined)
+	}
+}
+
+// TestStackSplitStaleDiffDropped checks the key guard: a per-commit diff that
+// lands for a different worktree (the overlay moved on) is discarded rather than
+// poisoning the current cache.
+func TestStackSplitStaleDiffDropped(t *testing.T) {
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: wsKey("other", "tree"), sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+	if cd := m.stackView.diffCache["aaa111"]; !cd.loading || cd.scope.files != 0 {
+		t.Fatalf("a diff for another worktree must be dropped, cache entry = %+v", cd)
+	}
+
+	// The same message under the right key does land, proving the guard is the
+	// key and not something else rejecting it.
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: m.stackView.key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+	if cd := m.stackView.diffCache["aaa111"]; cd.loading || cd.scope.files != 1 {
+		t.Fatalf("the matching-key diff should land, got %+v", cd)
+	}
+}
+
+// TestStackSplitDiffError renders a failed per-commit fetch as an error line
+// instead of a blank or stale pane.
+func TestStackSplitDiffError(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{key: key, sha: "aaa111", err: errors.New("bad object")})
+
+	if cd := m.stackView.diffCache["aaa111"]; cd.err == nil || cd.loading {
+		t.Fatalf("an errored fetch should cache the error, got %+v", cd)
+	}
+	if out := ansi.Strip(m.renderStack(m.height - barHeight)); !strings.Contains(out, "bad object") {
+		t.Errorf("split render should surface the diff error:\n%s", out)
+	}
+}
+
+// TestStackSplitFocusFlip checks tab moves focus between the two panes and that
+// the footer legend follows it.
+func TestStackSplitFocusFlip(t *testing.T) {
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+
+	listOut := m.renderStack(m.height - barHeight)
+	if !strings.Contains(ansi.Strip(listOut), "branch diff") {
+		t.Errorf("the list pane's footer should offer the whole-branch diff:\n%s", ansi.Strip(listOut))
+	}
+
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+	if m.stackView.splitFocus != paneDiff || cmd != nil {
+		t.Fatalf("tab should focus the diff pane, got focus=%v cmd=%v", m.stackView.splitFocus, cmd != nil)
+	}
+	diffOut := m.renderStack(m.height - barHeight)
+	stripped := ansi.Strip(diffOut)
+	if !strings.Contains(stripped, "scroll") || !strings.Contains(stripped, "n / p") {
+		t.Errorf("the diff pane's footer should offer scroll and commit stepping:\n%s", stripped)
+	}
+	if strings.Contains(stripped, "branch diff") {
+		t.Errorf("the diff pane's footer should drop the list-only hints:\n%s", stripped)
+	}
+	// The header's active-pane label is styled, so the raw frames must differ
+	// even where the stripped text overlaps.
+	if listOut == diffOut {
+		t.Error("the active pane should be visibly highlighted in the header")
+	}
+
+	// shift+tab flips back.
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
+	if got := mm.(Model).stackView.splitFocus; got != paneStack {
+		t.Fatalf("shift+tab should return focus to the list, got %v", got)
+	}
+}
+
+// TestStackSplitCursorMovement covers both ways to walk commits: j with the list
+// focused and n with the diff focused. Both advance the cursor and fetch the new
+// commit's diff on a cache miss; n must not steal focus back to the list.
+func TestStackSplitCursorMovement(t *testing.T) {
+	// j from the list pane.
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+	mm, cmd := m.handleStack(keyPress('j'))
+	m = mm.(Model)
+	if m.stackView.cursor != 1 || cmd == nil {
+		t.Fatalf("j should advance the cursor and fetch: cursor=%d cmd=%v", m.stackView.cursor, cmd != nil)
+	}
+	if m.stackView.splitFocus != paneStack {
+		t.Fatalf("j should keep the list focused, got %v", m.stackView.splitFocus)
+	}
+	if cd, ok := m.stackView.diffCache["bbb222"]; !ok || !cd.loading {
+		t.Fatalf("j should mark the newly cursored commit loading, cache = %+v", m.stackView.diffCache)
+	}
+	// k walks back; that diff is already cached, so no second fetch.
+	mm, cmd = m.handleStack(keyPress('k'))
+	if got := mm.(Model).stackView.cursor; got != 0 || cmd != nil {
+		t.Fatalf("k should step back without re-fetching: cursor=%d cmd=%v", got, cmd != nil)
+	}
+
+	// n from the diff pane.
+	m, _ = stackSplitModel()
+	m = enterSplit(t, m)
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+	mm, cmd = m.handleStack(keyPress('n'))
+	m = mm.(Model)
+	if m.stackView.cursor != 1 || cmd == nil {
+		t.Fatalf("n should advance the cursor and fetch: cursor=%d cmd=%v", m.stackView.cursor, cmd != nil)
+	}
+	if m.stackView.splitFocus != paneDiff {
+		t.Fatalf("n must stay in the diff pane, got %v", m.stackView.splitFocus)
+	}
+	mm, cmd = m.handleStack(keyPress('p'))
+	m = mm.(Model)
+	if m.stackView.cursor != 0 || cmd != nil {
+		t.Fatalf("p should step back without re-fetching: cursor=%d cmd=%v", m.stackView.cursor, cmd != nil)
+	}
+	if m.stackView.splitFocus != paneDiff {
+		t.Fatalf("p must stay in the diff pane, got %v", m.stackView.splitFocus)
+	}
+}
+
+// TestStackSplitDiffScroll checks the diff pane scrolls its cached commit and
+// that ]/[ jump to file headers, with both clamped to the content.
+func TestStackSplitDiffScroll(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+
+	// A patch long enough to overflow the pane.
+	var b strings.Builder
+	b.WriteString("diff --git a/one.go b/one.go\n@@ -1,1 +1,1 @@\n")
+	for i := 0; i < 60; i++ {
+		b.WriteString("+line\n")
+	}
+	b.WriteString("diff --git a/two.go b/two.go\n@@ -1,1 +1,1 @@\n+tail\n")
+	m.applyStackCommitDiff(stackCommitDiffMsg{key: key, sha: "aaa111", body: b.String(),
+		stat: []repo.FileStat{{Path: "one.go", Add: 60}, {Path: "two.go", Add: 1}}})
+	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+
+	mm, _ = m.handleStack(keyPress('j'))
+	m = mm.(Model)
+	if got := m.stackView.diffCache["aaa111"].offset; got != 1 {
+		t.Fatalf("j should scroll the diff pane by one, got %d", got)
+	}
+	mm, _ = m.handleStack(keyPress('k'))
+	m = mm.(Model)
+	if got := m.stackView.diffCache["aaa111"].offset; got != 0 {
+		t.Fatalf("k should scroll back to the top, got %d", got)
+	}
+	// k at the top clamps rather than going negative.
+	mm, _ = m.handleStack(keyPress('k'))
+	m = mm.(Model)
+	if got := m.stackView.diffCache["aaa111"].offset; got != 0 {
+		t.Fatalf("k at the top should clamp to 0, got %d", got)
+	}
+
+	// ] jumps to the second file header, [ returns to the first.
+	mm, _ = m.handleStack(keyPress(']'))
+	m = mm.(Model)
+	jumped := m.stackView.diffCache["aaa111"].offset
+	if jumped == 0 {
+		t.Fatal("] should jump forward to the next file header")
+	}
+	mm, _ = m.handleStack(keyPress('['))
+	m = mm.(Model)
+	if got := m.stackView.diffCache["aaa111"].offset; got >= jumped {
+		t.Fatalf("[ should jump back above %d, got %d", jumped, got)
+	}
+
+	// G/g run to the ends, both clamped.
+	mm, _ = m.handleStack(keyPress('G'))
+	m = mm.(Model)
+	bottom := m.stackView.diffCache["aaa111"].offset
+	if bottom == 0 {
+		t.Fatal("G should scroll to the bottom of a long diff")
+	}
+	mm, _ = m.handleStack(keyPress('G'))
+	if got := mm.(Model).stackView.diffCache["aaa111"].offset; got != bottom {
+		t.Fatalf("G at the bottom should stay put, got %d want %d", got, bottom)
+	}
+	mm, _ = m.handleStack(keyPress('g'))
+	if got := mm.(Model).stackView.diffCache["aaa111"].offset; got != 0 {
+		t.Fatalf("g should return to the top, got %d", got)
+	}
+}
+
+// TestStackSplitScrollWithoutCache is the no-panic guard: with the diff pane
+// focused but nothing cached (or still loading), every scroll and file-jump key
+// is an inert no-op and the pane renders its loading notice.
+func TestStackSplitScrollWithoutCache(t *testing.T) {
+	keys := []tea.KeyPressMsg{
+		{Code: tea.KeyDown}, {Code: tea.KeyUp},
+		keyPress('j'), keyPress('k'), keyPress('g'), keyPress('G'),
+		keyPress(']'), keyPress('['), keyPress('J'), keyPress('K'),
+		ctrlKey('d'), ctrlKey('u'),
+	}
+
+	for _, tc := range []struct {
+		name  string
+		cache map[string]stackCommitDiff
+	}{
+		{"missing entry", nil},
+		{"still loading", map[string]stackCommitDiff{"aaa111": {loading: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := stackSplitModel()
+			m.stackView.split = true
+			m.stackView.splitFocus = paneDiff
+			m.stackView.diffCache = tc.cache
+
+			for _, k := range keys {
+				mm, _ := m.handleStack(k)
+				m = mm.(Model)
+				if cd := m.stackView.diffCache["aaa111"]; cd.offset != 0 {
+					t.Fatalf("%s should leave the offset at 0, got %d after %q",
+						tc.name, cd.offset, k.String())
+				}
+				if m.stackView.cursor != 0 {
+					t.Fatalf("scroll keys must not move the commit cursor, got %d", m.stackView.cursor)
+				}
+			}
+			if out := ansi.Strip(m.renderStack(m.height - barHeight)); !strings.Contains(out, "loading diff") {
+				t.Errorf("%s should render the loading notice:\n%s", tc.name, out)
+			}
+		})
+	}
+}
+
+// TestStackSplitEscIsTwoStep checks esc unwinds one layer at a time: the first
+// closes the preview, the second closes the overlay.
+func TestStackSplitEscIsTwoStep(t *testing.T) {
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+
+	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.stackView.split {
+		t.Fatal("the first esc should leave split mode")
+	}
+	if !m.stackOpen || m.stackView.status == nil {
+		t.Fatal("the first esc must keep the stack overlay and its status")
+	}
+
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.stackOpen {
+		t.Fatal("the second esc should close the stack overlay")
+	}
+}
+
+// TestStackSplitActionsStillReachTheStack checks split mode does not shadow the
+// whole-stack actions: o still opens the cursored commit's PR and v still hands
+// off to the deck's whole-branch diff viewer.
+func TestStackSplitActionsStillReachTheStack(t *testing.T) {
+	// o from the list pane.
+	m, _ := stackSplitModel()
+	m = enterSplit(t, m)
+	if _, cmd := m.handleStack(keyPress('o')); cmd == nil {
+		t.Error("o in split mode should still issue the open-PR command")
+	}
+	// o from the diff pane too.
+	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	if _, cmd := mm.(Model).handleStack(keyPress('o')); cmd == nil {
+		t.Error("o with the diff pane focused should still open the PR")
+	}
+
+	// v hands off to the whole-branch diff viewer, closing the stack overlay.
+	m, _ = stackSplitModel()
+	m = enterSplit(t, m)
+	mm, _ = m.handleStack(keyPress('v'))
+	m = mm.(Model)
+	if m.stackOpen || !m.diffOpen || m.screen != screenPicker {
+		t.Fatalf("v should still open the branch diff: stackOpen=%v diffOpen=%v screen=%v",
+			m.stackOpen, m.diffOpen, m.screen)
+	}
+	if m.stackView.split {
+		t.Error("handing off to the diff viewer should clear the split state")
+	}
+}
+
+// TestStackSplitRefreshDropsCachedDiffs checks a fresh status invalidates the
+// per-commit diffs, so a rewritten SHA can never show a stale patch.
+func TestStackSplitRefreshDropsCachedDiffs(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+	if len(m.stackView.diffCache) == 0 {
+		t.Fatal("precondition: the cache should hold the fetched diff")
+	}
+
+	m.applyStackStatus(stackStatusMsg{key: key, status: *m.stackView.status})
+	if m.stackView.diffCache != nil {
+		t.Fatalf("a fresh status should drop the per-commit diff cache, got %+v", m.stackView.diffCache)
+	}
+}
+
+// TestStackEnterStaysInertWithSplit is the regression guard for the key that was
+// deliberately left alone: enter neither opens nor navigates the preview.
+func TestStackEnterStaysInertWithSplit(t *testing.T) {
+	// On a plain status row enter does nothing at all.
+	m, _ := stackSplitModel()
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.stackView.split || cmd != nil || !m.stackOpen {
+		t.Fatalf("enter must not open split mode: split=%v cmd=%v open=%v",
+			m.stackView.split, cmd != nil, m.stackOpen)
+	}
+
+	// Inside split mode enter does not move focus either — that is tab's job.
+	m, _ = stackSplitModel()
+	m = enterSplit(t, m)
+	mm, cmd = m.handleStack(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if m.stackView.splitFocus != paneStack || !m.stackView.split || cmd != nil {
+		t.Fatalf("enter must not change split focus: focus=%v split=%v cmd=%v",
+			m.stackView.splitFocus, m.stackView.split, cmd != nil)
+	}
+}
+
+// TestStackStatusFooterAdvertisesPreview checks the non-split footer tells the
+// user the preview exists.
+func TestStackStatusFooterAdvertisesPreview(t *testing.T) {
+	m, _ := stackSplitModel()
+	out := ansi.Strip(m.renderStack(m.height - barHeight))
+	if !strings.Contains(out, "preview") {
+		t.Errorf("the status footer should advertise the d preview:\n%s", out)
+	}
+}
