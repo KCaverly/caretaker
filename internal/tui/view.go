@@ -682,7 +682,7 @@ func (m Model) renderBoard(h int) string {
 			keyhint("↑↓", "move"), keyhint("1-9", "jump"), keyhint("enter", "focus"),
 		}, separator),
 		"  "+strings.Join([]string{
-			keyhint("n", "new"), keyhint("r", "restart agent"), keyhint("d", "close agent"), keyhint("esc", "close"),
+			keyhint("n", "new"), keyhint("r", "restart agent"), keyhint("d", "remove agent"), keyhint("esc", "close"),
 		}, separator),
 	)
 

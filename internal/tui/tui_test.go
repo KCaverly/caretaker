@@ -614,11 +614,12 @@ func TestBoardCloseRequiresConfirmation(t *testing.T) {
 	if m.mode != modeConfirmAgentClose || m.confirm.agent == nil {
 		t.Fatalf("close should capture its agent in a confirmation: mode=%v target=%v", m.mode, m.confirm.agent)
 	}
-	if m.confirm.title != "CLOSE AGENT" || !confirmHasOption(m.confirm, "d") ||
+	if m.confirm.title != "REMOVE AGENT" || !confirmHasOption(m.confirm, "d") ||
 		!confirmHasOption(m.confirm, "esc") {
 		t.Fatalf("close confirmation is incomplete: %+v", m.confirm)
 	}
-	if out := m.View().Content; !strings.Contains(out, "CLOSE AGENT") || !strings.Contains(out, "keep agent") {
+	if out := m.View().Content; !strings.Contains(out, "REMOVE AGENT") || !strings.Contains(out, "remove agent") ||
+		!strings.Contains(out, "cancel") {
 		t.Fatalf("close confirmation should render above the board:\n%s", out)
 	}
 	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: 'z', Text: "z"})
@@ -1991,7 +1992,7 @@ func TestCloseTermPaneGuardsForegroundProcess(t *testing.T) {
 	mm, cmd = m.handleSessionKey(altKey('x'))
 	m = mm.(Model)
 	if cmd != nil || m.mode != modeConfirmTermClose || m.confirm.cursor != 0 {
-		t.Fatal("busy terminal pane should open the confirmation on keep pane")
+		t.Fatal("busy terminal pane should open the confirmation on cancel")
 	}
 	if out := m.renderConfirm(m.height - barHeight); !strings.Contains(out, "CLOSE TERMINAL PANE") ||
 		!strings.Contains(out, "active foreground process") || !strings.Contains(out, "close pane and stop process") {
@@ -2045,7 +2046,7 @@ func TestPaletteIncludesContextualFooterActions(t *testing.T) {
 		"stop repo/a",
 		"remove repo/a",
 		"restart agent: repo/a",
-		"close agent: repo/a",
+		"remove agent: repo/a",
 		"focus terminal pane left",
 		"cycle view next",
 		"cycle view previous",
@@ -2267,8 +2268,12 @@ func TestQuitGuardBusyConfirms(t *testing.T) {
 	if m.confirm.title != "QUIT CT" {
 		t.Fatalf("expected the QUIT CT panel, got title %q", m.confirm.title)
 	}
-	if len(m.confirm.context) == 0 || !strings.Contains(m.confirm.context[0], "quitting kills them") {
+	if !confirmHasContext(m.confirm, "busy agent(s) still running") ||
+		!confirmHasContext(m.confirm, "quitting ct will stop all hosted agents and terminals") {
 		t.Fatalf("expected a quit-guard context line, got %q", m.confirm.context)
+	}
+	if !confirmHasOption(m.confirm, "y") || m.confirm.options[1].label != "quit ct" {
+		t.Fatalf("quit confirmation should name its action precisely: %+v", m.confirm.options)
 	}
 	// The safe "cancel" row is the default, so a reflexive enter must not quit.
 	if key := m.confirm.options[m.confirm.cursor].key; key != "esc" {
@@ -2328,8 +2333,12 @@ func TestStopGuardBusyConfirms(t *testing.T) {
 	if m.confirm.title != "STOP WORKSPACE" {
 		t.Fatalf("expected the STOP WORKSPACE panel, got title %q", m.confirm.title)
 	}
-	if len(m.confirm.context) == 0 || !strings.Contains(m.confirm.context[0], "stopping kills it") {
+	if !confirmHasContext(m.confirm, "has running processes") ||
+		!confirmHasContext(m.confirm, "stopping the workspace will stop its agents and terminals") {
 		t.Fatalf("expected a stop-guard context line, got %q", m.confirm.context)
+	}
+	if !confirmHasOption(m.confirm, "y") || m.confirm.options[1].label != "stop workspace" {
+		t.Fatalf("stop confirmation should name its action precisely: %+v", m.confirm.options)
 	}
 	// The safe "cancel" row is the default, so a reflexive enter must not stop.
 	if key := m.confirm.options[m.confirm.cursor].key; key != "esc" {
@@ -2743,11 +2752,11 @@ func TestConfirmPanelRender(t *testing.T) {
 
 	out := renderToTerminal(t, m.renderConfirm(m.height-barHeight), m.width, m.height-barHeight)
 	for _, want := range []string{
-		"REMOVE WORKTREE",                  // header title
-		"r / dirtywt",                      // repo / worktree context
-		"uncommitted changes will be lost", // dirty warning
-		"remove worktree, keep branch",     // safe option
-		"remove worktree + delete branch",  // danger option
+		"REMOVE WORKTREE",                   // header title
+		"r / dirtywt",                       // repo / worktree context
+		"uncommitted changes will be lost",  // dirty warning
+		"remove worktree, keep branch",      // safe option
+		"remove worktree and delete branch", // danger option
 		"view diff first",
 		"cancel",
 		"move", "confirm", // footer legend
