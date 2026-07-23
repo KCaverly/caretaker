@@ -50,7 +50,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -64,11 +64,67 @@ func runStack(args []string) int {
 		return runStackFinish(args[1:])
 	case "merge":
 		return runStackMerge(args[1:])
+	case "setup":
+		return runStackSetup(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+func runStackSetup(args []string) int {
+	var asJSON, enable bool
+	var dir string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--enable-auto-delete":
+			enable = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack setup: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack setup: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack setup:", err)
+			return 1
+		}
+	}
+	settings, err := stack.Setup(stack.SetupOptions{Dir: dir, EnableAutoDelete: enable})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack setup:", err)
+		return 1
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(settings); err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack setup:", err)
+			return 1
+		}
+		return 0
+	}
+	state := "disabled"
+	if settings.DeleteBranchOnMerge {
+		state = "enabled"
+	}
+	fmt.Printf("%s\n  automatic branch deletion: %s\n", settings.Repository, state)
+	if !settings.DeleteBranchOnMerge {
+		fmt.Println("  enable with: ct stack setup --enable-auto-delete")
+	}
+	return 0
 }
 
 func runStackFinish(args []string) int {
