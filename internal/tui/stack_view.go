@@ -507,13 +507,13 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.flashCmd("no PR for this commit")
 		}
-	case "j", "down", "ctrl+n":
+	case "j", "down":
 		if sv.status != nil {
 			m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
 		} else {
 			m.stackView.offset = clamp(sv.offset+1, 0, maxOff)
 		}
-	case "k", "up", "ctrl+p":
+	case "k", "up":
 		if sv.status != nil {
 			m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
 		} else {
@@ -595,7 +595,7 @@ func (m Model) stackViewport() int {
 func (m Model) renderStack(h int) string {
 	sv := m.stackView
 	confirmFooter := keyhint("enter", "run") + "   " + keyhint("esc", "cancel")
-	closeFooter := keyhint("↑↓ / j k / ^n ^p", "scroll") + "   " + keyhint("r", "refresh") + "   " + keyhint("esc", "close")
+	closeFooter := keyhint("↑↓ / j k", "scroll") + "   " + keyhint("r", "refresh") + "   " + keyhint("esc", "close")
 	switch {
 	case sv.working:
 		return m.renderStackText([]string{dimStyle.Render("working…")}, closeFooter, h)
@@ -677,7 +677,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 
 	// Action footer: move always, submit/restack conditionally, then the rest.
 	// refresh trails so it is the first to drop if the row must be truncated.
-	parts := []string{keyhint("↑↓ / j k / ^n ^p", "move")}
+	parts := []string{keyhint("↑↓ / j k", "move")}
 	if stackHasSubmitWork(st) {
 		parts = append(parts, keyhint("s", "submit"))
 	}

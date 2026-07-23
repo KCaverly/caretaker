@@ -158,7 +158,7 @@ func (m Model) confirmActive() bool {
 // resolving it. Unrecognized keys are contained by every confirmation handler.
 func confirmIsNav(key string) bool {
 	switch key {
-	case "up", "down", "k", "j", "ctrl+p", "ctrl+n":
+	case "up", "down", "k", "j":
 		return true
 	}
 	return false
@@ -169,11 +169,11 @@ func confirmIsNav(key string) bool {
 func (m Model) confirmMove(key string) int {
 	cur := m.confirm.cursor
 	switch key {
-	case "up", "k", "ctrl+p":
+	case "up", "k":
 		if cur > 0 {
 			cur--
 		}
-	case "down", "j", "ctrl+n":
+	case "down", "j":
 		if cur < len(m.confirm.options)-1 {
 			cur++
 		}
@@ -1766,12 +1766,12 @@ func (m Model) handleBoard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case m.keys.Attention:
 		// The jump works from within the board too: focusBoardAgent closes it.
 		return m.jumpAttention()
-	case "up", "k", "ctrl+p":
+	case "up", "k":
 		if m.boardCursor > 0 {
 			m.boardCursor--
 		}
 		return m, nil
-	case "down", "j", "ctrl+n":
+	case "down", "j":
 		if m.boardCursor < len(nav)-1 {
 			m.boardCursor++
 		}
@@ -2350,7 +2350,7 @@ func (m Model) closePalette() Model {
 }
 
 // handlePalette routes key events while the command palette is open: esc or the
-// palette key closes it; up/ctrl+p and down/ctrl+n move the cursor (clamped to
+// palette key closes it; up/down move the cursor (clamped to
 // the filtered list); enter closes the palette and then runs the selected row on
 // the post-close model; every other key is typed into the query, resetting the
 // cursor to the top whenever the query changed. Up/down never fall through to the
@@ -2359,12 +2359,12 @@ func (m Model) handlePalette(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", m.keys.CommandPalette:
 		return m.closePalette(), nil
-	case "up", "ctrl+p":
+	case "up":
 		if m.paletteCursor > 0 {
 			m.paletteCursor--
 		}
 		return m, nil
-	case "down", "ctrl+n":
+	case "down":
 		if n := len(m.filteredPaletteCommands()); m.paletteCursor < n-1 {
 			m.paletteCursor++
 		}
@@ -2468,7 +2468,7 @@ func (m *Model) cycleFormProvider(delta int) {
 
 // handleBoardForm drives the new-agent form. The prompt accepts ordinary
 // multi-line editing; tab changes fields and ctrl+enter launches. On toggles,
-// enter also launches and ↑/↓ (or ctrl+n/ctrl+p) move between fields.
+// enter also launches and ↑/↓ move between fields.
 func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -2488,9 +2488,9 @@ func (m Model) handleBoardForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	switch msg.String() {
-	case "down", "ctrl+n":
+	case "down":
 		return m.moveFormFocus(1)
-	case "up", "ctrl+p":
+	case "up":
 		return m.moveFormFocus(-1)
 	case "enter":
 		return m.launchAgent()
@@ -2750,10 +2750,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// keystroke into the embedded session drawn beneath the overlay, which must
 	// never happen.
 	if m.helpOpen {
-		if s := msg.String(); s == "down" || s == "j" || s == "ctrl+n" {
+		if s := msg.String(); s == "down" || s == "j" {
 			m.helpOffset++
 			return m, nil
-		} else if s == "up" || s == "k" || s == "ctrl+p" {
+		} else if s == "up" || s == "k" {
 			m.helpOffset = max(0, m.helpOffset-1)
 			return m, nil
 		}
@@ -3557,12 +3557,12 @@ func (m Model) toggleFocus() (tea.Model, tea.Cmd) {
 
 func (m Model) handleNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "up", "ctrl+p":
+	case "up":
 		if m.newCursor > 0 {
 			m.newCursor--
 		}
 		return m, nil
-	case "down", "ctrl+n":
+	case "down":
 		// j/k are left to fall through to the fuzzy filter, which owns this
 		// section's input.
 		if m.newCursor < len(m.repoMatches)-1 {
@@ -3605,13 +3605,12 @@ func (m Model) beginCreateFor(r repo.Repo) (tea.Model, tea.Cmd) {
 
 func (m Model) handleActiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	// Shared list-nav dialect: arrows and ctrl+p/ctrl+n move, and — because the
-	// ACTIVE list owns no text input — j/k do too.
-	case "up", "k", "ctrl+p":
+	// Arrows move, and — because the ACTIVE list owns no text input — j/k do too.
+	case "up", "k":
 		if m.activeCursor > 0 {
 			m.activeCursor--
 		}
-	case "down", "j", "ctrl+n":
+	case "down", "j":
 		if m.activeCursor < len(m.active)-1 {
 			m.activeCursor++
 		}
@@ -3986,7 +3985,7 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleConfirmKey resolves the remove-worktree confirm panel. Navigation keys
-// (arrows / j / k / ctrl+p / ctrl+n) move the cursor and enter fires the option
+// (arrows / j / k) move the cursor and enter fires the option
 // under it; every other key is dispatched by mnemonic, so the direct-key paths
 // are byte-identical to the old status-line prompt: "y" removes the worktree
 // and deletes its branch, "b" removes it but keeps the branch, "v" opens the
@@ -4254,9 +4253,9 @@ func (m Model) handleDiff(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		m.diffOpen = false
 		m.diffView = diffState{}
-	case "j", "down", "ctrl+n":
+	case "j", "down":
 		m.diffView.offset = clamp(m.diffView.offset+1, 0, maxOff)
-	case "k", "up", "ctrl+p":
+	case "k", "up":
 		m.diffView.offset = clamp(m.diffView.offset-1, 0, maxOff)
 	case "ctrl+d":
 		m.diffView.offset = clamp(m.diffView.offset+avail/2, 0, maxOff)
