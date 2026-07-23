@@ -1814,7 +1814,7 @@ func (m Model) closeBoardAgent(r boardRow) (tea.Model, tea.Cmd) {
 	save := m.saveAgents(r.key)
 	_, nav := m.buildBoard()
 	m.boardCursor = clamp(m.boardCursor, 0, max(0, len(nav)-1))
-	return m, tea.Batch(save, m.flashCmd("closed agent "+r.label))
+	return m, tea.Batch(save, m.flashCmd("removed agent "+r.label))
 }
 
 // restartBoardAgent transactionally replaces the selected process in place.
@@ -2134,7 +2134,7 @@ func (m Model) paletteCommands() []paletteCmd {
 				}
 				return m.restartBoardAgent(target)
 			}},
-			paletteCmd{title: "close agent: " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
+			paletteCmd{title: "remove agent: " + identity, run: func(m Model) (tea.Model, tea.Cmd) {
 				m.boardOpen = true
 				return m.beginAgentCloseConfirm(target), nil
 			}},
@@ -3562,7 +3562,7 @@ func (m Model) beginRemove(it activeItem) Model {
 		context: removeConfirmContext(it),
 		options: []confirmOption{
 			{label: "remove worktree, keep branch", key: "b"},
-			{label: "remove worktree + delete branch", key: "y", danger: true},
+			{label: "remove worktree and delete branch", key: "y", danger: true},
 			{label: "view diff first", key: "v"},
 			{label: "cancel", key: "esc"},
 		},
@@ -3606,11 +3606,14 @@ func (m Model) beginQuitConfirm(n int) Model {
 	m.mode = modeConfirmQuit
 	m.status = ""
 	m.confirm = confirmState{
-		title:   "QUIT CT",
-		context: []string{dimStyle.Render(fmt.Sprintf("%d busy agent(s) still running — quitting kills them", n))},
+		title: "QUIT CT",
+		context: []string{
+			dimStyle.Render(fmt.Sprintf("%d busy agent(s) still running", n)),
+			errStyle.Render("! quitting ct will stop all hosted agents and terminals"),
+		},
 		options: []confirmOption{
 			{label: "cancel", key: "esc"},
-			{label: "quit anyway", key: "y", danger: true},
+			{label: "quit ct", key: "y", danger: true},
 		},
 	}
 	return m
@@ -3623,11 +3626,14 @@ func (m Model) beginStopConfirm(name string) Model {
 	m.mode = modeConfirmStop
 	m.status = ""
 	m.confirm = confirmState{
-		title:   "STOP WORKSPACE",
-		context: []string{dimStyle.Render(fmt.Sprintf("%q has a busy agent — stopping kills it", name))},
+		title: "STOP WORKSPACE",
+		context: []string{
+			dimStyle.Render(fmt.Sprintf("%q has running processes", name)),
+			errStyle.Render("! stopping the workspace will stop its agents and terminals"),
+		},
 		options: []confirmOption{
 			{label: "cancel", key: "esc"},
-			{label: "stop anyway", key: "y", danger: true},
+			{label: "stop workspace", key: "y", danger: true},
 		},
 	}
 	return m
@@ -3642,11 +3648,11 @@ func (m Model) beginAgentCloseConfirm(r boardRow) Model {
 		context = append(context, errStyle.Render("! current work will be interrupted"))
 	}
 	m.confirm = confirmState{
-		title:   "CLOSE AGENT",
+		title:   "REMOVE AGENT",
 		context: context,
 		options: []confirmOption{
-			{label: "keep agent", key: "esc"},
-			{label: "close agent", key: "d", danger: true},
+			{label: "cancel", key: "esc"},
+			{label: "remove agent", key: "d", danger: true},
 		},
 		agent: &target,
 	}
@@ -3665,7 +3671,7 @@ func (m Model) beginAgentRestartConfirm(r boardRow) Model {
 		title:   "RESTART AGENT",
 		context: context,
 		options: []confirmOption{
-			{label: "keep running", key: "esc"},
+			{label: "cancel", key: "esc"},
 			{label: "restart agent", key: "r", danger: true},
 		},
 		agent: &target,
@@ -3766,7 +3772,7 @@ func (m Model) beginTermCloseConfirm() Model {
 			errStyle.Render("! closing it will stop that process"),
 		},
 		options: []confirmOption{
-			{label: "keep pane", key: "esc"},
+			{label: "cancel", key: "esc"},
 			{label: "close pane and stop process", key: "x", danger: true},
 		},
 		term: &target,

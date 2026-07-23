@@ -79,7 +79,7 @@ func TestResponsiveSurfaceMatrix(t *testing.T) {
 		{"confirmation", func(m *Model) {
 			m.mode = modeConfirmStop
 			m.confirm = confirmState{title: "STOP WORKSPACE", context: []string{"repo / worktree"},
-				options: []confirmOption{{label: "cancel", key: "esc"}, {label: "stop anyway", key: "y", danger: true}}}
+				options: []confirmOption{{label: "cancel", key: "esc"}, {label: "stop workspace", key: "y", danger: true}}}
 		}},
 		{"help", func(m *Model) { m.helpOpen = true }},
 		{"setup", func(m *Model) { m.screen = screenSetup; m.configPath = "/a/very/long/config/path/config.toml" }},

@@ -89,7 +89,7 @@ goto_editor = "alt+1"  # jump to the editor view
 goto_agent  = "alt+2"  # jump to the agent view
 goto_term   = "alt+3"  # jump to the terminal view
 picker      = "ctrl+g" # return to the CT picker
-palette     = "alt+a"  # agent board: focus, create, restart, or close agents
+palette     = "alt+a"  # agent board: focus, create, restart, or remove agents
 next_agent  = "f4"     # next agent in the active worktree
 prev_agent  = "f3"     # previous agent in the active worktree
 global_config = "alt+g" # open the home-directory workspace
@@ -271,7 +271,7 @@ Picker keys: `tab` switch section · `enter` open · `d` stop · `v` view diff �
 `x` opens a centered **remove** panel rather than a one-line prompt: it shows the worktree's
 divergence and uncommitted diffstat (with a red warning when the tree is dirty) above a vertical
 list of options — `remove worktree, keep branch` (the safe default the cursor starts on),
-`remove worktree + delete branch` (destructive, red), `view diff first`, and `cancel`. Arrow
+`remove worktree and delete branch` (destructive, red), `view diff first`, and `cancel`. Arrow
 keys (or `j`/`k`) move and `enter` fires the highlighted option, while the mnemonics still work
 directly, so the old `x` `b` (keep branch) and `x` `y` (delete branch) muscle memory is
 unchanged. The quit and stop guards use the same panel, defaulting to `cancel`.

@@ -78,7 +78,7 @@ Keyboard-first must not mean memory-first.
 - Never perform a destructive action from an ambiguous selection or a transient status line.
 - Use a dedicated confirmation panel with a clear object identity and consequence.
 - Put the safe option first and focus it by default.
-- Use specific labels: `remove worktree, keep branch`, not `yes`; `quit anyway`, not `confirm`.
+- Use specific labels: `remove worktree, keep branch`, not `yes`; `quit ct`, not `confirm`.
 - Show relevant evidence before the choice: branch divergence, uncommitted diffstat, busy work, or what will be interrupted.
 - Offer review in the same flow when review can change the decision. Returning from review restores the confirmation context.
 - Red is reserved for the destructive option and irreversible consequence, not the whole panel.
