@@ -3213,6 +3213,15 @@ func TestDiffScrollClamping(t *testing.T) {
 	if m.diffView.offset != 0 {
 		t.Fatalf("g should return to the top, got %d", m.diffView.offset)
 	}
+	mm, _ = m.handleDiff(ctrlKey('n'))
+	m = mm.(Model)
+	if m.diffView.offset != 1 {
+		t.Fatalf("ctrl+n should scroll down by one, got %d", m.diffView.offset)
+	}
+	mm, _ = m.handleDiff(ctrlKey('p'))
+	if got := mm.(Model).diffView.offset; got != 0 {
+		t.Fatalf("ctrl+p should scroll up by one, got %d", got)
+	}
 }
 
 func TestDiffScopeToggleResetsOffset(t *testing.T) {

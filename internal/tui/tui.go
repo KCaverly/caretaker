@@ -4133,9 +4133,9 @@ func (m Model) handleDiff(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		m.diffOpen = false
 		m.diffView = diffState{}
-	case "j", "down":
+	case "j", "down", "ctrl+n":
 		m.diffView.offset = clamp(m.diffView.offset+1, 0, maxOff)
-	case "k", "up":
+	case "k", "up", "ctrl+p":
 		m.diffView.offset = clamp(m.diffView.offset-1, 0, maxOff)
 	case "ctrl+d":
 		m.diffView.offset = clamp(m.diffView.offset+avail/2, 0, maxOff)

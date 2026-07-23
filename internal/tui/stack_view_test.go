@@ -688,6 +688,15 @@ func TestStackOverlayScroll(t *testing.T) {
 	if m.stackView.offset != 1 {
 		t.Fatalf("down should scroll by one, got %d", m.stackView.offset)
 	}
+	mm, _ = m.handleStack(ctrlKey('n'))
+	m = mm.(Model)
+	if m.stackView.offset != 2 {
+		t.Fatalf("ctrl+n should scroll by one, got %d", m.stackView.offset)
+	}
+	mm, _ = m.handleStack(ctrlKey('p'))
+	if got := mm.(Model).stackView.offset; got != 1 {
+		t.Fatalf("ctrl+p should scroll up by one, got %d", got)
+	}
 }
 
 // TestStackScreenStructured renders the structured chain view from a loaded
@@ -778,6 +787,16 @@ func TestStackScreenNav(t *testing.T) {
 	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyDown})
 	if got := mm.(Model).stackView.cursor; got != 1 {
 		t.Fatalf("down should move the cursor to 1, got %d", got)
+	}
+	m, _ = stackNavModel(t)
+	mm, _ = m.handleStack(ctrlKey('n'))
+	m = mm.(Model)
+	if m.stackView.cursor != 1 {
+		t.Fatalf("ctrl+n should move the cursor to 1, got %d", m.stackView.cursor)
+	}
+	mm, _ = m.handleStack(ctrlKey('p'))
+	if got := mm.(Model).stackView.cursor; got != 0 {
+		t.Fatalf("ctrl+p should move the cursor to 0, got %d", got)
 	}
 
 	// s submits (submit-able work present): working set, command issued.
