@@ -1742,10 +1742,11 @@ func markLegend() string {
 // ahead/behind cluster) shown once cached `ct stack status` data is available.
 func stackLegend() string {
 	return strings.Join([]string{
-		aheadStyle.Render("✓") + helpStyle.Render(" stack passing"),
-		stackWaitStyle.Render("…") + helpStyle.Render(" checks pending"),
-		errStyle.Render("⟳") + helpStyle.Render(" restack"),
-		errStyle.Render("!") + helpStyle.Render(" attention"),
+		aheadStyle.Render(stackGlyphReady) + helpStyle.Render(" passing"),
+		stackWaitStyle.Render(stackGlyphPending) + helpStyle.Render(" pending"),
+		errStyle.Render(stackGlyphAttention) + helpStyle.Render(" attention"),
+		stackWaitStyle.Render(stackGlyphRestack) + helpStyle.Render(" restack"),
+		dimStyle.Render(stackGlyphInactive) + helpStyle.Render(" inactive/draft"),
 	}, helpStyle.Render("   "))
 }
 

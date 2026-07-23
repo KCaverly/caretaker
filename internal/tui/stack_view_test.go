@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
@@ -66,7 +67,7 @@ func TestDeckStackGlyph(t *testing.T) {
 				stack.Stack{Size: 2, BaseChainOK: true, NextAction: "restack",
 					Counts: map[stack.State]int{stack.StateMerged: 1, stack.StateOpen: 1}},
 				stack.Commit{State: stack.StateMerged}, openPR(1, "passing")),
-			glyph: "⟳",
+			glyph: "↻",
 		},
 		{
 			name: "fully landed is complete",
@@ -173,8 +174,45 @@ func TestStackCommitRowShowsConflicts(t *testing.T) {
 			t.Errorf("selected=%v: checks should not obscure conflict:\n%s", selected, row)
 		}
 	}
-	if glyph := glyphFor(c); !strings.Contains(glyph, "✗") {
+	if glyph := glyphFor(c); !strings.Contains(glyph, "!") {
 		t.Errorf("conflicting PR should use the error glyph, got %q", glyph)
+	}
+}
+
+func TestStackCommitRowsUseOneSemanticGlyphAndWordedFacts(t *testing.T) {
+	m, _ := stackModel()
+	cases := []struct {
+		name   string
+		commit stack.Commit
+		glyph  string
+		fact   string
+	}{
+		{"passing", openPR(1, "passing"), stackGlyphReady, "checks passing"},
+		{"pending", openPR(2, "pending"), stackGlyphPending, "checks pending"},
+		{"failing", openPR(3, "failing"), stackGlyphAttention, "checks failing"},
+		{"draft", stack.Commit{State: stack.StateOpen, PR: &stack.PR{Number: 4, Draft: true}}, stackGlyphInactive, "draft"},
+		{"diverged", stack.Commit{State: stack.StateDiverged, PR: &stack.PR{Number: 5}}, stackGlyphRestack, "restack needed"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ansi.Strip(glyphFor(tc.commit)); got != tc.glyph {
+				t.Fatalf("want glyph %q, got %q", tc.glyph, got)
+			}
+			plainFacts := factsPlain(tc.commit)
+			if !strings.Contains(plainFacts, tc.fact) {
+				t.Fatalf("want facts to contain %q, got %q", tc.fact, plainFacts)
+			}
+			for _, duplicate := range []string{stackGlyphReady, stackGlyphPending, stackGlyphAttention, stackGlyphRestack} {
+				if strings.Contains(plainFacts, duplicate) {
+					t.Fatalf("facts should use words, not duplicate status glyph %q: %q", duplicate, plainFacts)
+				}
+			}
+			selected := ansi.Strip(m.stackCommitRow(tc.commit, true, 60))
+			if !strings.Contains(selected, "▸") || !strings.Contains(selected, tc.fact) {
+				t.Fatalf("selected row should retain cursor and state facts: %q", selected)
+			}
+		})
 	}
 }
 
@@ -292,13 +330,13 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 }
 
 func TestStackDetailSegment(t *testing.T) {
-	// Single-commit stack reads the PR number, state, and a check glyph.
+	// Single-commit stack reads the PR number, state, and check status.
 	single := statusWith(
 		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "merge",
 			Counts: map[stack.State]int{stack.StateOpen: 1}},
 		stack.Commit{Position: 1, State: stack.StateOpen,
 			PR: &stack.PR{Number: 42, Checks: stack.Checks{Summary: "passing"}}})
-	if got, want := stackDetailSegment(single), "PR #42 open · checks ✓"; got != want {
+	if got, want := stackDetailSegment(single), "PR #42 open · checks passing"; got != want {
 		t.Errorf("single: want %q, got %q", want, got)
 	}
 

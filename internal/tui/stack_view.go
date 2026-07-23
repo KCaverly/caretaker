@@ -720,33 +720,48 @@ func (m Model) stackCommitRow(c stack.Commit, selected bool, innerW int) string 
 	return glyphFor(c) + " " + nameStyle.Render(name) + strings.Repeat(" ", gap) + facts(c)
 }
 
-// glyphFor returns the styled single-glyph state marker for a commit list row: a
-// green ✓ for a landed/open PR (a dim ○ when that PR is a draft), a dim ○ for
-// work not yet in review, a yellow … for a diverged commit, and a red ✗ for a
-// conflicting PR, closed PR, or duplicate-id escalation.
+const (
+	stackGlyphReady     = "✓"
+	stackGlyphPending   = "…"
+	stackGlyphAttention = "!"
+	stackGlyphRestack   = "↻"
+	stackGlyphInactive  = "○"
+)
+
+// glyphFor returns one overall status marker for a commit. Priority is human
+// attention, restack, pending, healthy, then inactive; the facts column spells
+// out the underlying state so selected rows remain understandable without it.
 func glyphFor(c stack.Commit) string {
-	if c.PR != nil && c.PR.Mergeable == "CONFLICTING" {
-		return errStyle.Render("✗")
+	if c.PR != nil && (c.PR.Mergeable == "CONFLICTING" || c.PR.Checks.Summary == "failing") {
+		return errStyle.Render(stackGlyphAttention)
 	}
 	switch c.State {
-	case stack.StateMerged, stack.StateOpen:
-		if c.PR != nil && c.PR.Draft {
-			return dimStyle.Render("○")
-		}
-		return aheadStyle.Render("✓")
-	case stack.StateUnsubmitted, stack.StateUnpushed, stack.StateMissingPR:
-		return dimStyle.Render("○")
-	case stack.StateDiverged:
-		return stackWaitStyle.Render("…")
 	case stack.StateClosed, stack.StateDuplicateID:
-		return errStyle.Render("✗")
+		return errStyle.Render(stackGlyphAttention)
+	case stack.StateDiverged:
+		return stackWaitStyle.Render(stackGlyphRestack)
+	case stack.StateMerged:
+		return aheadStyle.Render(stackGlyphReady)
+	case stack.StateOpen:
+		if c.PR != nil && c.PR.Draft {
+			return dimStyle.Render(stackGlyphInactive)
+		}
+		if c.PR != nil && c.PR.Checks.Summary == "pending" {
+			return stackWaitStyle.Render(stackGlyphPending)
+		}
+		if c.PR != nil && c.PR.Checks.Summary == "passing" {
+			return aheadStyle.Render(stackGlyphReady)
+		}
+		return dimStyle.Render(stackGlyphInactive)
+	case stack.StateUnsubmitted, stack.StateUnpushed, stack.StateMissingPR:
+		return dimStyle.Render(stackGlyphInactive)
 	default:
-		return dimStyle.Render("○")
+		return dimStyle.Render(stackGlyphInactive)
 	}
 }
 
-// facts renders a commit's PR/state facts for a list row, dim with a colored
-// check mark; factsPlain is the unstyled variant for the selection bar.
+// facts renders a commit's PR/state facts for a list row, with check state
+// written as a word; factsPlain is the unstyled variant for the selection bar.
 func facts(c stack.Commit) string {
 	if c.PR == nil {
 		return dimStyle.Render(factsPlain(c))
@@ -760,9 +775,11 @@ func facts(c stack.Commit) string {
 		return dimStyle.Render(base + " · landed")
 	case stack.StateClosed:
 		return errStyle.Render(base)
+	case stack.StateDiverged:
+		return dimStyle.Render(base+" · ") + stackWaitStyle.Render("restack needed")
 	default:
 		if s := c.PR.Checks.Summary; s != "" && s != "none" {
-			return dimStyle.Render(base+" · checks ") + coloredCheckMark(s)
+			return dimStyle.Render(base+" · checks ") + coloredCheckWord(s)
 		}
 		return dimStyle.Render(base)
 	}
@@ -792,9 +809,11 @@ func factsPlain(c stack.Commit) string {
 		return base + " · landed"
 	case stack.StateClosed:
 		return base
+	case stack.StateDiverged:
+		return base + " · restack needed"
 	default:
 		if s := c.PR.Checks.Summary; s != "" && s != "none" {
-			return base + " · checks " + checksMark(s)
+			return base + " · checks " + s
 		}
 		return base
 	}
@@ -818,18 +837,18 @@ func prWord(c stack.Commit) string {
 	}
 }
 
-// coloredCheckMark renders a checks summary as a colored glyph: green ✓ passing,
-// yellow … pending, red ✗ failing, reusing checksMark for the glyph itself.
-func coloredCheckMark(summary string) string {
+// coloredCheckWord reinforces the leading overall glyph without introducing a
+// second, potentially contradictory symbol in the facts column.
+func coloredCheckWord(summary string) string {
 	switch summary {
 	case "passing":
-		return aheadStyle.Render(checksMark(summary))
+		return aheadStyle.Render(summary)
 	case "pending":
-		return stackWaitStyle.Render(checksMark(summary))
+		return stackWaitStyle.Render(summary)
 	case "failing":
-		return errStyle.Render(checksMark(summary))
+		return errStyle.Render(summary)
 	default:
-		return dimStyle.Render(checksMark(summary))
+		return dimStyle.Render(summary)
 	}
 }
 
@@ -862,7 +881,7 @@ func (m Model) stackGlyph(key string) (string, int) {
 // show=false (nothing to draw) when GitHub is unavailable, the stack is empty or
 // entirely unsubmitted, or the state matches no glyph. Escalations (closed PR,
 // duplicate id, orphan, broken base chain) win as a red "!"; a needed restack is a
-// red "⟳"; then the CI ladder — a yellow "…" for any pending check, a green "✓"
+// red "↻"; then the CI ladder — a yellow "…" for any pending check, a green "✓"
 // when every commit is open with checks passing.
 func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 	if !st.GitHub.Available {
@@ -878,7 +897,7 @@ func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 		return "!", errStyle, true
 	}
 	if stk.NextAction == "restack" {
-		return "⟳", errStyle, true
+		return stackGlyphRestack, errStyle, true
 	}
 	if stk.NextAction == "complete" {
 		return "✓", aheadStyle, true
@@ -899,10 +918,10 @@ func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 		}
 	}
 	if anyPending {
-		return "…", stackWaitStyle, true
+		return stackGlyphPending, stackWaitStyle, true
 	}
 	if allOpen && allPassing {
-		return "✓", aheadStyle, true
+		return stackGlyphReady, aheadStyle, true
 	}
 	return "", lipgloss.Style{}, false
 }
@@ -936,7 +955,7 @@ func stackDetailSegment(st stack.StackStatus) string {
 	if stk.Size == 1 && len(st.Commits) == 1 {
 		c := st.Commits[0]
 		if c.PR != nil {
-			return fmt.Sprintf("PR #%d %s · checks %s", c.PR.Number, c.State, checksMark(c.PR.Checks.Summary))
+			return fmt.Sprintf("PR #%d %s · checks %s", c.PR.Number, c.State, checksLabel(c.PR.Checks.Summary))
 		}
 		return stackActionLabel(stk.NextAction)
 	}
@@ -972,17 +991,16 @@ func stackActionLabel(action string) string {
 	}
 }
 
-// checksMark renders a check summary as a compact glyph for the detail line.
-func checksMark(summary string) string {
+func checksLabel(summary string) string {
 	switch summary {
 	case "passing":
-		return "✓"
+		return "passing"
 	case "pending":
-		return "…"
+		return "pending"
 	case "failing":
-		return "✗"
+		return "failing"
 	default:
-		return "—"
+		return "unknown"
 	}
 }
 
