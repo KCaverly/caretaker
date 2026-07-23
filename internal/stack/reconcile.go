@@ -287,8 +287,18 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 			// continues, so wait rather than restack.
 			return "wait"
 		}
-		// No open PR above the landed prefix — drop it (and re-submit anything
-		// still stranded above the landed commits).
+		allLanded := len(commits) > 0
+		for _, c := range commits {
+			if c.State != StateMerged {
+				allLanded = false
+				break
+			}
+		}
+		if allLanded {
+			return "finish"
+		}
+		// No open PR above the landed prefix, but local work remains stranded
+		// above it. Restack drops the prefix and submits the survivors.
 		return "restack"
 	}
 

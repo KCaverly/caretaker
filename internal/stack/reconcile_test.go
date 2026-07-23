@@ -128,12 +128,12 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: false,
 		},
 		{
-			name:        "merged: PR merged but commit still local -> restack",
+			name:        "merged: fully landed single commit -> finish",
 			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
 			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
 			prs:         []prRecord{pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing")},
 			wantStates:  []State{StateMerged},
-			wantAction:  "restack",
+			wantAction:  "finish",
 			wantChainOK: true,
 		},
 		{
@@ -170,7 +170,7 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: true,
 		},
 		{
-			name: "all-merged -> restack",
+			name: "all-merged -> finish",
 			commits: []LocalCommit{
 				commit("aaaaaaa1111", "aaaaaaaa", "one"),
 				commit("bbbbbbb2222", "bbbbbbbb", "two"),
@@ -181,7 +181,7 @@ func TestReconcile(t *testing.T) {
 				pr(2, "MERGED", br("bbbbbbbb"), br("aaaaaaaa"), "APPROVED", "passing"),
 			},
 			wantStates:  []State{StateMerged, StateMerged},
-			wantAction:  "restack",
+			wantAction:  "finish",
 			wantChainOK: true,
 		},
 		{
