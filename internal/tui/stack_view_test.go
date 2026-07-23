@@ -489,6 +489,50 @@ func TestStackPaletteRows(t *testing.T) {
 	}
 }
 
+func TestPaletteListsFreshOpenPRsAcrossWorktrees(t *testing.T) {
+	m, key := stackModel()
+	open := openPR(42, "passing")
+	open.Subject = "ship palette inventory"
+	open.PR.URL = "https://example.test/pr/42"
+	draft := openPR(43, "pending")
+	draft.Subject = "draft follow-up"
+	draft.PR.URL = "https://example.test/pr/43"
+	draft.PR.Draft = true
+	closed := stack.Commit{State: stack.StateClosed, Subject: "closed",
+		PR: &stack.PR{Number: 44, URL: "https://example.test/pr/44"}}
+	m.stackInfo[key] = stackEntry{status: statusWith(
+		stack.Stack{Size: 3, Counts: map[stack.State]int{stack.StateOpen: 2, stack.StateClosed: 1}},
+		open, draft, closed), fetchedAt: time.Now()}
+
+	var titles []string
+	for _, c := range m.paletteCommands() {
+		if strings.HasPrefix(c.title, "open PR #") {
+			titles = append(titles, c.title)
+		}
+	}
+	joined := strings.Join(titles, "\n")
+	for _, want := range []string{
+		"open PR #42: repo/wt — ship palette inventory",
+		"open PR #43: repo/wt — draft follow-up",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("palette missing %q from:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "#44") {
+		t.Error("closed PR should not appear in the palette")
+	}
+
+	e := m.stackInfo[key]
+	e.fetchedAt = time.Now().Add(-2 * stackFreshFor)
+	m.stackInfo[key] = e
+	for _, c := range m.paletteCommands() {
+		if strings.HasPrefix(c.title, "open PR #") {
+			t.Fatal("stale stack data should not produce open-PR palette rows")
+		}
+	}
+}
+
 // TestStackOverlayStatus opens the overlay via the palette status row and checks
 // the title and body render from the fetched status.
 func TestStackOverlayStatus(t *testing.T) {

@@ -2006,6 +2006,50 @@ func TestCloseTermPaneGuardsForegroundProcess(t *testing.T) {
 	}
 }
 
+func TestPaletteIncludesContextualFooterActions(t *testing.T) {
+	m, _ := busyGuardModel(t)
+	m.active[0].view.Live = true
+	m.screen = screenTerminal
+	w, h := m.sessionSize()
+	if _, err := m.mgr.SplitTermPane(m.current.key, m.current.path, m.ctrl.TermSpec(), session.SplitV, w, h); err != nil {
+		t.Fatal(err)
+	}
+
+	titles := map[string]string{}
+	for _, c := range m.paletteCommands() {
+		titles[c.title] = c.hint
+	}
+	for _, want := range []string{
+		"stop repo/a",
+		"remove repo/a",
+		"restart agent: repo/a",
+		"close agent: repo/a",
+		"focus terminal pane left",
+		"cycle view next",
+		"cycle view previous",
+	} {
+		found := false
+		for title := range titles {
+			if strings.HasPrefix(title, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("palette missing contextual action %q", want)
+		}
+	}
+	if titles["focus terminal pane left"] != m.keys.TermFocusLeft ||
+		titles["cycle view next"] != m.keys.Cycle || titles["cycle view previous"] != m.keys.CycleBack {
+		t.Error("palette should display live configured bindings for added actions")
+	}
+	for title := range titles {
+		if strings.HasPrefix(title, "focus terminal pane right") {
+			t.Error("palette should hide directional focus at the current layout edge")
+		}
+	}
+}
+
 // TestBoardSortsAttentionFirst activates two real workspaces and checks that
 // the one with an unread marker sorts above the current one, and that the
 // board cursor opens on it.
