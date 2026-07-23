@@ -1930,6 +1930,82 @@ func TestMouseClickFocusesTermPane(t *testing.T) {
 	}
 }
 
+func TestCloseTermPaneGuardsForegroundProcess(t *testing.T) {
+	keys := config.Default().Keys
+	ctrl := &Controller{cfg: config.Config{
+		Editor: "cat", Agent: "cat", Shell: "sh", Keys: keys,
+	}}
+	mgr := session.NewManager()
+	defer mgr.CloseAll()
+
+	m := New(ctrl, mgr)
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = mm.(Model)
+	mm, _ = m.activate("repo", "wt", t.TempDir())
+	m = mm.(Model)
+	m.screen = screenTerminal
+
+	// An idle shell closes immediately without adding friction.
+	w, h := m.sessionSize()
+	if _, err := mgr.SplitTermPane("repo/wt", m.current.path, ctrl.TermSpec(), session.SplitV, w, h); err != nil {
+		t.Fatal(err)
+	}
+	m.termPaneBusy = func(*session.Session) bool { return false }
+	before := len(m.current.ws.Terms)
+	mm, cmd := m.handleSessionKey(altKey('x'))
+	m = mm.(Model)
+	if cmd != nil || m.mode != modeNormal || len(m.current.ws.Terms) != before-1 {
+		t.Fatal("idle terminal pane should close immediately")
+	}
+
+	// A foreground job opens a safe-first decision and preserves pane context
+	// when cancelled.
+	if _, err := mgr.SplitTermPane("repo/wt", m.current.path, ctrl.TermSpec(), session.SplitV, w, h); err != nil {
+		t.Fatal(err)
+	}
+	m.current.ws.TermZoomed = true
+	focus, count := m.current.ws.ActiveTerm, len(m.current.ws.Terms)
+	m.termPaneBusy = func(*session.Session) bool { return true }
+	mm, cmd = m.handleSessionKey(altKey('x'))
+	m = mm.(Model)
+	if cmd != nil || m.mode != modeConfirmTermClose || m.confirm.cursor != 0 {
+		t.Fatal("busy terminal pane should open the confirmation on keep pane")
+	}
+	if out := m.renderConfirm(m.height - barHeight); !strings.Contains(out, "CLOSE TERMINAL PANE") ||
+		!strings.Contains(out, "active foreground process") || !strings.Contains(out, "close pane and stop process") {
+		t.Errorf("terminal close confirmation should name the consequence:\n%s", out)
+	}
+	mm, cmd = m.handleGlobalConfirmKey(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	m = mm.(Model)
+	if cmd != nil || m.mode != modeConfirmTermClose {
+		t.Fatal("unrelated input should be swallowed by the terminal confirmation")
+	}
+	mm, cmd = m.handlePaste(tea.PasteMsg{Content: "must-not-reach-hidden-terminal"})
+	m = mm.(Model)
+	if cmd != nil || m.mode != modeConfirmTermClose {
+		t.Fatal("paste should be swallowed by the terminal confirmation")
+	}
+	mm, _ = m.handleGlobalConfirmKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.mode != modeNormal || len(m.current.ws.Terms) != count ||
+		m.current.ws.ActiveTerm != focus || !m.current.ws.TermZoomed {
+		t.Fatal("cancel should preserve pane focus, count, and zoom")
+	}
+
+	// The palette reaches the same decision; confirming closes the captured pane.
+	cmd = runPaletteRow(t, &m, "close terminal pane")
+	if cmd != nil || m.mode != modeConfirmTermClose || m.confirm.term == nil {
+		t.Fatal("palette close should open the shared confirmation")
+	}
+	mm, _ = m.handleGlobalConfirmKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = mm.(Model)
+	mm, cmd = m.handleGlobalConfirmKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if cmd != nil || m.mode != modeNormal || len(m.current.ws.Terms) != count-1 {
+		t.Fatal("confirmed close should remove the focused pane")
+	}
+}
+
 // TestBoardSortsAttentionFirst activates two real workspaces and checks that
 // the one with an unread marker sorts above the current one, and that the
 // board cursor opens on it.

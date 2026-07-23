@@ -95,6 +95,7 @@ const (
 	modeConfirmAgentClose
 	modeConfirmAgentRestart
 	modeConfirmMerge
+	modeConfirmTermClose
 )
 
 // confirmOption is one selectable row of a destructive-confirm panel: a
@@ -121,6 +122,7 @@ type confirmState struct {
 	target      *activeItem       // captured worktree target; immune to deck reordering
 	fingerprint string            // exact porcelain status disclosed before archive
 	merge       *stackMergeTarget // captured stack target; preserves its originating overlay
+	term        *termCloseTarget  // captured terminal target; immune to hidden-surface focus changes
 }
 
 type stackMergeTarget struct {
@@ -128,12 +130,19 @@ type stackMergeTarget struct {
 	params stack.Params
 }
 
+type termCloseTarget struct {
+	key      string
+	index    int
+	worktree string
+}
+
 // confirmActive reports whether one of the three destructive-confirm panels is
 // up, so the view can layer it over the deck and the key router can keep it
 // modal.
 func (m Model) confirmActive() bool {
 	return m.mode == modeConfirmRemove || m.mode == modeConfirmArchive || m.mode == modeConfirmQuit || m.mode == modeConfirmStop ||
-		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart || m.mode == modeConfirmMerge
+		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart || m.mode == modeConfirmMerge ||
+		m.mode == modeConfirmTermClose
 }
 
 // confirmIsNav reports whether key moves the confirm panel's cursor rather than
@@ -353,6 +362,7 @@ type Model struct {
 	stackAutoMerge bool
 	stackOpen      bool
 	stackView      stackView
+	termPaneBusy   func(*session.Session) bool
 
 	// Codex exposes its stable conversation history in a transcript overlay.
 	// Caretaker tracks its default Ctrl+T toggle per hosted session so the wheel
@@ -525,6 +535,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		stackArchive:    stack.ArchiveCleanup,
 		stackMerge:      stack.Merge,
 		stackAutoMerge:  ctrl.StackAutoMerge(),
+		termPaneBusy:    func(s *session.Session) bool { return s.HasForegroundProcess() },
 	}
 }
 
@@ -1422,7 +1433,8 @@ func (m Model) routeToFocusedInputs(msg tea.Msg) (Model, tea.Cmd) {
 //     bracketed-paste mode.
 func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 	onSession := m.screen != screenPicker && m.screen != screenSetup &&
-		!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen && !m.stackOpen
+		!m.helpOpen && !m.boardOpen && !m.usageOpen && !m.paletteOpen && !m.diffOpen && !m.stackOpen &&
+		!m.confirmActive()
 	if onSession {
 		if s := m.activeSession(); s != nil {
 			m = m.dismissHint() // first input into a session retires the hint
@@ -1443,6 +1455,9 @@ func (m Model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 		m.paletteInput, cmd = m.paletteInput.Update(msg)
 		m.paletteCursor = 0
 		return m, cmd
+	}
+	if m.confirmActive() {
+		return m, nil
 	}
 	mm, cmd := m.routeToFocusedInputs(msg)
 	// Mirror handleNewKey: keep the repo matches in sync when the paste lands
@@ -2603,8 +2618,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.paletteOpen {
 		return m.handlePalette(msg)
 	}
-	if m.mode == modeConfirmMerge {
-		return m.handleConfirmMergeKey(msg)
+	if m.mode == modeConfirmMerge || m.mode == modeConfirmTermClose {
+		return m.handleGlobalConfirmKey(msg)
 	}
 	if msg.String() == m.keys.CommandPalette {
 		if m.confirmActive() || (m.screen == screenPicker && m.mode != modeNormal) {
@@ -2848,6 +2863,21 @@ func (m Model) splitTerm(dir session.SplitDir) (tea.Model, tea.Cmd) {
 // the remaining layout. Shared by the terminal-screen close key and the
 // palette's close row. A no-op without a current workspace.
 func (m Model) closeTermPane() (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	ws := m.current.ws
+	if ws == nil {
+		return m, nil
+	}
+	pane := ws.ActiveTermSession()
+	if pane != nil && m.termPaneBusy != nil && m.termPaneBusy(pane) {
+		return m.beginTermCloseConfirm(), nil
+	}
+	return m.closeTermPaneNow()
+}
+
+func (m Model) closeTermPaneNow() (tea.Model, tea.Cmd) {
 	if m.current == nil {
 		return m, nil
 	}
@@ -3572,6 +3602,13 @@ func (m Model) beginMergeConfirm(key string, p stack.Params, st stack.StackStatu
 	return m
 }
 
+func (m Model) handleGlobalConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.mode == modeConfirmTermClose {
+		return m.handleConfirmTermCloseKey(msg)
+	}
+	return m.handleConfirmMergeKey(msg)
+}
+
 func (m Model) handleConfirmMergeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if confirmIsNav(key) {
@@ -3591,6 +3628,55 @@ func (m Model) handleConfirmMergeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m = m.clearConfirm()
 	m.stackView.working = true
 	return m, m.mergeStackCmd(target.key, target.params)
+}
+
+func (m Model) beginTermCloseConfirm() Model {
+	if m.current == nil || m.current.ws == nil {
+		return m
+	}
+	ws := m.current.ws
+	target := termCloseTarget{
+		key: m.current.key, index: ws.ActiveTerm, worktree: m.current.worktree,
+	}
+	m.mode = modeConfirmTermClose
+	m.confirm = confirmState{
+		title: "CLOSE TERMINAL PANE",
+		context: []string{
+			repoHdrStyle.Render(m.current.repo + " / " + m.current.worktree),
+			dimStyle.Render(fmt.Sprintf("pane %d/%d has an active foreground process", ws.ActiveTerm+1, len(ws.Terms))),
+			errStyle.Render("! closing it will stop that process"),
+		},
+		options: []confirmOption{
+			{label: "keep pane", key: "esc"},
+			{label: "close pane and stop process", key: "x", danger: true},
+		},
+		term: &target,
+	}
+	return m
+}
+
+func (m Model) handleConfirmTermCloseKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	if key == "esc" {
+		return m.clearConfirm(), nil
+	}
+	if key != "x" || m.confirm.term == nil {
+		return m, nil
+	}
+	target := *m.confirm.term
+	if m.current == nil || m.current.key != target.key || m.current.ws == nil ||
+		m.current.ws.ActiveTerm != target.index {
+		return m.clearConfirm(), nil
+	}
+	m = m.clearConfirm()
+	return m.closeTermPaneNow()
 }
 
 func agentConfirmContext(r boardRow) []string {
