@@ -94,6 +94,7 @@ type Stack struct {
 	Size        int           `json:"size"`
 	BaseChainOK bool          `json:"base_chain_ok"`
 	NextAction  string        `json:"next_action"`
+	Actions     []string      `json:"actions,omitempty"`
 	Counts      map[State]int `json:"counts"`
 	Orphans     []Orphan      `json:"orphans"`
 }

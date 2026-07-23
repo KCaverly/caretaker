@@ -36,6 +36,9 @@ func Render(st StackStatus) string {
 
 	fmt.Fprintf(&b, "  stack: %d commit(s), base_chain=%s, next=%s\n",
 		st.Stack.Size, okLabel(st.Stack.BaseChainOK), st.Stack.NextAction)
+	if len(st.Stack.Actions) > 0 {
+		fmt.Fprintf(&b, "  actions: %s\n", strings.Join(st.Stack.Actions, ", "))
+	}
 	for _, o := range st.Stack.Orphans {
 		fmt.Fprintf(&b, "  orphan PR #%d (%s) head=%s\n", o.Number, o.URL, o.Head)
 	}
@@ -80,6 +83,9 @@ func RenderPlan(st StackStatus, plan Plan) string {
 	if plan.IsEmpty() {
 		b.WriteString("  everything is in sync — nothing to submit\n")
 		return b.String()
+	}
+	for _, d := range plan.Cleanup {
+		fmt.Fprintf(&b, "  would clear landed %s #%d %q\n", d.ShortSHA, d.Number, d.Subject)
 	}
 
 	for _, a := range plan.Assigns {
@@ -162,10 +168,10 @@ func RenderRestackPlan(res RestackResult) string {
 	return b.String()
 }
 
-// RenderFinishPlan uses the restack plan's details but names the user-facing
+// RenderReusePlan uses the restack plan's details but names the user-facing
 // operation accurately for a stack with no surviving commits.
-func RenderFinishPlan(res FinishResult) string {
-	return strings.Replace(RenderRestackPlan(res), "restack plan (dry-run)", "finish plan (dry-run)", 1)
+func RenderReusePlan(res ReuseResult) string {
+	return strings.Replace(RenderRestackPlan(res), "restack plan (dry-run)", "reuse plan (dry-run)", 1)
 }
 
 // glyph is the single-character status mark for a commit state: a check for

@@ -89,6 +89,7 @@ const (
 	modeNormal mode = iota
 	modeCreateName
 	modeConfirmRemove
+	modeConfirmArchive
 	modeConfirmQuit // guarding ctrl+c while a hosted agent is busy
 	modeConfirmStop // guarding "d" while the target worktree has a busy agent
 	modeConfirmAgentClose
@@ -111,18 +112,20 @@ type confirmOption struct {
 // keys; this only holds the panel's content, so it replaces the old
 // status-line sentence entirely. cursor starts on the SAFE option.
 type confirmState struct {
-	title   string          // "REMOVE WORKTREE", "QUIT CT", "STOP WORKSPACE"
-	context []string        // pre-styled context lines drawn above the options
-	options []confirmOption // vertical, arrow-selectable
-	cursor  int             // index into options; starts on the safe row
-	agent   *boardRow       // captured board target; immune to live status reordering
+	title       string          // "REMOVE WORKTREE", "QUIT CT", "STOP WORKSPACE"
+	context     []string        // pre-styled context lines drawn above the options
+	options     []confirmOption // vertical, arrow-selectable
+	cursor      int             // index into options; starts on the safe row
+	agent       *boardRow       // captured board target; immune to live status reordering
+	target      *activeItem     // captured worktree target; immune to deck reordering
+	fingerprint string          // exact porcelain status disclosed before archive
 }
 
 // confirmActive reports whether one of the three destructive-confirm panels is
 // up, so the view can layer it over the deck and the key router can keep it
 // modal.
 func (m Model) confirmActive() bool {
-	return m.mode == modeConfirmRemove || m.mode == modeConfirmQuit || m.mode == modeConfirmStop ||
+	return m.mode == modeConfirmRemove || m.mode == modeConfirmArchive || m.mode == modeConfirmQuit || m.mode == modeConfirmStop ||
 		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart
 }
 
@@ -337,6 +340,8 @@ type Model struct {
 	stackFetch   func(stack.Params) (stack.StackStatus, error)
 	stackSubmit  func(stack.SubmitOptions) (stack.SubmitResult, error)
 	stackRestack func(stack.RestackOptions) (stack.RestackResult, error)
+	stackReuse   func(stack.ReuseOptions) (stack.ReuseResult, error)
+	stackArchive func(stack.Params) (stack.ArchiveResult, error)
 	stackMerge   func(stack.MergeOptions) (stack.MergeResult, error)
 	stackOpen    bool
 	stackView    stackView
@@ -508,6 +513,8 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		stackFetch:      stack.Status,
 		stackSubmit:     stack.Submit,
 		stackRestack:    stack.Restack,
+		stackReuse:      stack.Reuse,
+		stackArchive:    stack.ArchiveCleanup,
 		stackMerge:      stack.Merge,
 	}
 }
@@ -573,6 +580,13 @@ type createdMsg struct {
 }
 
 type actionDoneMsg struct{ err error }
+
+type archivePreflightMsg struct {
+	it          activeItem
+	fingerprint string
+	dirty       bool
+	err         error
+}
 
 type dirtyMsg struct{}
 
@@ -1010,6 +1024,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError(msg.err.Error())
 		}
 		return m, m.loadCmd()
+
+	case archivePreflightMsg:
+		if msg.err != nil {
+			m.stackView.working = false
+			m.setError("archive: " + msg.err.Error())
+			return m, nil
+		}
+		return m.beginArchive(msg), nil
 
 	case dirtyMsg:
 		return m, m.repaintCmd()
@@ -1974,17 +1996,27 @@ func (m Model) paletteCommands() []paletteCmd {
 		if !cached || e.loading || e.err != nil {
 			continue
 		}
+		if e.status.Stack.NextAction == "complete" {
+			cmds = append(cmds, paletteCmd{
+				title: "archive worktree: " + repoName + "/" + wtName,
+				hint:  "all PRs landed",
+				run: func(m Model) (tea.Model, tea.Cmd) {
+					return m, m.archivePreflightCmd(it, p)
+				},
+			})
+		}
 		if stackCanRestack(e.status) {
 			title := "restack: " + repoName + "/" + wtName
-			if e.status.Stack.NextAction == "finish" {
-				title = "finish stack: " + repoName + "/" + wtName
+			reuse := e.status.Stack.NextAction == "complete"
+			if reuse {
+				title = "reuse worktree: " + repoName + "/" + wtName
 			}
 			cmds = append(cmds, paletteCmd{
 				title: title,
 				hint:  stackRestackReason(e.status),
 				run: func(m Model) (tea.Model, tea.Cmd) {
 					m = m.enterStackOverlay(key, repoName, wtName, p)
-					return m, m.restackStackCmd(key, p, true)
+					return m, m.restackStackCmd(key, p, true, reuse)
 				},
 			})
 		}
@@ -3188,6 +3220,8 @@ func (m Model) handlePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreateKey(msg)
 	case modeConfirmRemove:
 		return m.handleConfirmKey(msg)
+	case modeConfirmArchive:
+		return m.handleConfirmArchiveKey(msg)
 	case modeConfirmQuit:
 		return m.handleConfirmQuitKey(msg)
 	case modeConfirmStop:
@@ -3372,6 +3406,36 @@ func (m Model) beginRemove(it activeItem) Model {
 	return m
 }
 
+func (m Model) beginArchive(msg archivePreflightMsg) Model {
+	it := msg.it
+	it.view.Dirty = msg.dirty
+	context := removeConfirmContext(it)
+	context = append([]string{
+		repoHdrStyle.Render(it.repo.Name + " / " + it.view.WT.Name),
+		dimStyle.Render("all stack PRs landed · archive removes this worktree and local branch"),
+	}, context[1:]...)
+	if it.view.Dirty {
+		context = append(context, errStyle.Render("✷ untracked files will also be lost"))
+	}
+	m.screen = screenPicker
+	m.stackOpen = false
+	m.stackView = stackView{}
+	m.mode = modeConfirmArchive
+	m.status = ""
+	m.confirm = confirmState{
+		title:       "ARCHIVE WORKTREE",
+		context:     context,
+		fingerprint: msg.fingerprint,
+		target:      &it,
+		options: []confirmOption{
+			{label: "cancel", key: "esc"},
+			{label: "view diff first", key: "v"},
+			{label: "archive worktree + delete local branch", key: "y", danger: true},
+		},
+	}
+	return m
+}
+
 // beginQuitConfirm enters the quit guard's confirm panel, warning that n busy
 // hosted agents are still running. The cursor starts on the safe "cancel" row.
 func (m Model) beginQuitConfirm(n int) Model {
@@ -3550,6 +3614,53 @@ func (m Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	m = m.clearConfirm()
 	return m, nil
+}
+
+func (m Model) handleConfirmArchiveKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	if m.confirm.target == nil {
+		return m.clearConfirm(), nil
+	}
+	it := *m.confirm.target
+	if key == "v" {
+		m = m.clearConfirm()
+		return m.openDiff(it)
+	}
+	if key != "y" {
+		return m.clearConfirm(), nil
+	}
+	fingerprint := m.confirm.fingerprint
+	p, ok := stackParams(it)
+	m = m.clearConfirm()
+	if !ok {
+		return m, m.flashCmd("archive unavailable for this worktree")
+	}
+	m.stopWorkspace(wsKey(it.repo.Name, it.view.WT.Name))
+	r, wt, ctrl, cleanup := it.repo, it.view.WT, m.ctrl, m.stackArchive
+	archive := func() tea.Msg {
+		fresh, _, err := archiveWorktreeFingerprint(wt.Path)
+		if err != nil {
+			return actionDoneMsg{err: fmt.Errorf("archive preflight: %w", err)}
+		}
+		if fresh != fingerprint {
+			return actionDoneMsg{err: fmt.Errorf("worktree changed while archive confirmation was open; review and archive again")}
+		}
+		if _, err := cleanup(p); err != nil {
+			return actionDoneMsg{err: fmt.Errorf("archive cleanup: %w", err)}
+		}
+		if err := ctrl.Remove(r, wt, true); err != nil {
+			return actionDoneMsg{err: fmt.Errorf("archive worktree: %w", err)}
+		}
+		return actionDoneMsg{}
+	}
+	return m, tea.Batch(archive, m.flashCmd("archiving "+wt.Name+"…"))
 }
 
 // handleConfirmQuitKey resolves the quit guard: navigation moves the cursor,

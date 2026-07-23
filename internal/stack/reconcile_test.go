@@ -2,6 +2,7 @@ package stack
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -128,12 +129,12 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: false,
 		},
 		{
-			name:        "merged: fully landed single commit -> finish",
+			name:        "merged: fully landed single commit -> complete",
 			commits:     []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "feat")},
 			remotes:     map[string]string{"aaaaaaaa": "aaaaaaa1111"},
 			prs:         []prRecord{pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing")},
 			wantStates:  []State{StateMerged},
-			wantAction:  "finish",
+			wantAction:  "complete",
 			wantChainOK: true,
 		},
 		{
@@ -170,7 +171,7 @@ func TestReconcile(t *testing.T) {
 			wantChainOK: true,
 		},
 		{
-			name: "all-merged -> finish",
+			name: "all-merged -> complete",
 			commits: []LocalCommit{
 				commit("aaaaaaa1111", "aaaaaaaa", "one"),
 				commit("bbbbbbb2222", "bbbbbbbb", "two"),
@@ -181,15 +182,15 @@ func TestReconcile(t *testing.T) {
 				pr(2, "MERGED", br("bbbbbbbb"), br("aaaaaaaa"), "APPROVED", "passing"),
 			},
 			wantStates:  []State{StateMerged, StateMerged},
-			wantAction:  "finish",
+			wantAction:  "complete",
 			wantChainOK: true,
 		},
 		{
-			name:        "fully landed after restack: empty + merged PR -> archive",
+			name:        "reused after landing: empty + historical merged PR -> clean",
 			commits:     nil,
 			prs:         []prRecord{pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing")},
 			wantStates:  []State{},
-			wantAction:  "archive",
+			wantAction:  "clean",
 			wantChainOK: true,
 		},
 		{
@@ -263,6 +264,20 @@ func TestReconcile(t *testing.T) {
 			prs:         []prRecord{pr(1, "OPEN", br("aaaaaaaa"), main, "APPROVED", "pending")},
 			wantStates:  []State{StateOpen},
 			wantAction:  "wait",
+			wantChainOK: true,
+		},
+		{
+			name: "complete stack with new local commit -> submit",
+			commits: []LocalCommit{
+				commit("aaaaaaa1111", "aaaaaaaa", "landed"),
+				commit("bbbbbbb2222", "", "new work"),
+			},
+			remotes: map[string]string{"aaaaaaaa": "aaaaaaa1111"},
+			prs: []prRecord{
+				pr(1, "MERGED", br("aaaaaaaa"), main, "APPROVED", "passing"),
+			},
+			wantStates:  []State{StateMerged, StateUnsubmitted},
+			wantAction:  "submit",
 			wantChainOK: true,
 		},
 		{
@@ -449,6 +464,19 @@ func TestReconcilePRProjection(t *testing.T) {
 	}
 	if got2[0].StackID == nil || *got2[0].StackID != "aaaaaaaa" {
 		t.Errorf("stack_id = %v, want aaaaaaaa", got2[0].StackID)
+	}
+}
+
+func TestCompleteStackOffersArchiveAndReuse(t *testing.T) {
+	commits := []LocalCommit{commit("aaaaaaa1111", "aaaaaaaa", "done")}
+	stk, _ := reconcile("wt", "main", commits, map[string]string{"aaaaaaaa": "aaaaaaa1111"}, []prRecord{
+		pr(1, "MERGED", "ct/wt/aaaaaaaa", "main", "APPROVED", "passing"),
+	})
+	if stk.NextAction != "complete" || !reflect.DeepEqual(stk.Actions, []string{"archive", "reuse"}) {
+		t.Fatalf("complete stack = %+v", stk)
+	}
+	if out := Render(StackStatus{Stack: stk}); !strings.Contains(out, "actions: archive, reuse") {
+		t.Fatalf("complete status did not render actions:\n%s", out)
 	}
 }
 
