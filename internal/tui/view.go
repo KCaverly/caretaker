@@ -95,7 +95,7 @@ var (
 // View implements tea.Model.
 func (m Model) View() tea.View {
 	w, h := m.width, m.height
-	if w < 24 || h < 12 {
+	if w < minViableWidth || h < minViableHeight {
 		v := tea.NewView("ct — please enlarge the terminal")
 		v.AltScreen = true
 		return v
@@ -145,6 +145,11 @@ func (m Model) View() tea.View {
 	return v
 }
 
+const (
+	minViableWidth  = 24
+	minViableHeight = 16
+)
+
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
 	iconDeck   = "\U0000EDA7" // fa-seedling (U+EDA7) — the deck: a grove of worktrees
@@ -169,6 +174,19 @@ const (
 // dim otherwise (faint until a workspace exists). Agent attention lives in the
 // "! N" badge, not the icons. The current repo / worktree sits on the right.
 func (m Model) renderBar() string {
+	left := m.renderBarLeft()
+
+	// Right side: notification zone (! N  ✓ N) then the workspace context. Its
+	// layout (and the click targets within it) is derived once by barRightZones.
+	right := m.barRightZones().text
+
+	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
+	bar := ansi.Truncate(left+strings.Repeat(" ", gap)+right, m.width, "")
+	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
+	return bar + "\n" + sep
+}
+
+func (m Model) renderBarLeft() string {
 	left := "  "
 	for i, z := range m.barZones() {
 		if i > 0 {
@@ -176,15 +194,7 @@ func (m Model) renderBar() string {
 		}
 		left += z.glyph
 	}
-
-	// Right side: notification zone (! N  ✓ N) then the workspace context. Its
-	// layout (and the click targets within it) is derived once by barRightZones.
-	right := m.barRightZones().text
-
-	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
-	bar := left + strings.Repeat(" ", gap) + right
-	sep := barSep.Render(strings.Repeat("─", max(1, m.width)))
-	return bar + "\n" + sep
+	return left
 }
 
 // renderNotifZone builds the right-side attention summary: "! N" (red) for
@@ -429,12 +439,22 @@ func (m Model) barZones() []barZone {
 
 	agent := glyph(iconAgent, boldPurple, m.screen == screenAgent, has)
 
-	return []barZone{
+	zones := []barZone{
 		{screenPicker, ct},
 		{screenEditor, glyph(iconEditor, boldGreen, m.screen == screenEditor, has)},
 		{screenAgent, agent},
 		{screenTerminal, glyph(iconTerm, boldAccent, m.screen == screenTerminal, has)},
 	}
+	// On narrow terminals, optional inactive destinations yield before the
+	// anchored workspace identity. Every destination remains keyboard-reachable.
+	if m.width < 48 {
+		for _, z := range zones {
+			if z.s == m.screen {
+				return []barZone{z}
+			}
+		}
+	}
+	return zones
 }
 
 // tabAt maps bar coordinates to the tab/screen under them, if a click landed on
@@ -481,24 +501,43 @@ type barRight struct {
 func (m Model) barRightZones() barRight {
 	z := barRight{notif: m.renderNotifZone()}
 	label := m.barContextLabel()
-	if z.notif != "" {
-		z.text += z.notif + "   "
+	fullLabel := label
+	available := max(0, m.width-lipgloss.Width(m.renderBarLeft())-1)
+	assemble := func() string {
+		text := ""
+		if z.notif != "" {
+			text = z.notif + "   "
+		}
+		text += label
+		if text != "" {
+			text += "  "
+		}
+		return text
 	}
-	z.text += label
-	if z.text != "" {
-		z.text += "  "
+	if lipgloss.Width(assemble()) > available && m.current != nil {
+		// Volatile usage/agent/pane facts disappear before stable identity.
+		label = dimStyle.Render(m.current.repo + " / " + m.current.worktree)
 	}
+	if lipgloss.Width(assemble()) > available {
+		z.notif = ""
+	}
+	if lipgloss.Width(assemble()) > available {
+		label = ansi.Truncate(label, max(0, available-2), "…")
+	}
+	z.text = assemble()
 
 	z.notifStart = m.width - lipgloss.Width(z.text)
 	labelStart := z.notifStart
 	if z.notif != "" {
 		labelStart += lipgloss.Width(z.notif + "   ")
 	}
-	if seg, ok := m.usageSegment(); ok {
-		z.usage, z.usageStart = seg, labelStart
-	}
-	if seg, ok := m.paneSegment(); ok {
-		z.pane, z.paneStart = seg, labelStart
+	if label == fullLabel {
+		if seg, ok := m.usageSegment(); ok {
+			z.usage, z.usageStart = seg, labelStart
+		}
+		if seg, ok := m.paneSegment(); ok {
+			z.pane, z.paneStart = seg, labelStart
+		}
 	}
 	return z
 }
@@ -521,11 +560,11 @@ func (m Model) notifZoneAt(x, y int) bool {
 // trailing "+ new agent" row. Delegates to renderBoardForm in form state.
 func (m Model) renderBoard(h int) string {
 	if m.formOpen {
-		return m.renderBoardForm(h, clamp(m.width-8, 32, 84))
+		return m.renderBoardForm(h, panelInnerWidth(m.width, 84))
 	}
 	// Match the help overlay's readable maximum while allowing every agent row
 	// and its selection bar to use the full width inside the panel.
-	innerW := clamp(m.width-8, 32, 72)
+	innerW := panelInnerWidth(m.width, 72)
 
 	rows, nav := m.buildBoard()
 	selRow := -1
@@ -582,8 +621,7 @@ func (m Model) renderBoard(h int) string {
 		}, separator),
 	)
 
-	boxStr := box(lines, innerW, len(lines), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(lines, innerW, m.width, h)
 }
 
 // boardAgentLine renders one agent row: quick-jump number, attention glyph,
@@ -678,8 +716,7 @@ func (m Model) renderBoardForm(h, innerW int) string {
 			keyhint("←→", "change"), keyhint("esc", "back"),
 		}, helpStyle.Render("  ·  ")),
 	)
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(rows, innerW, m.width, h)
 }
 
 // renderPalette draws the command-palette overlay: a titled box holding the
@@ -687,7 +724,7 @@ func (m Model) renderBoardForm(h, innerW int) string {
 // right-aligned in a faint style. The row list is windowed to the available
 // height (as the deck lists are) with the selection drawn as a full-width bar.
 func (m Model) renderPalette(h int) string {
-	innerW := clamp(m.width-8, 40, 72)
+	innerW := panelInnerWidth(m.width, 72)
 	cmds := m.filteredPaletteCommands()
 
 	// header, blank, input, blank up top; blank + footer legend at the bottom.
@@ -706,8 +743,7 @@ func (m Model) renderPalette(h int) string {
 		keyhint("↑↓", "move"), keyhint("enter", "run"), keyhint("esc", "close"),
 	}, helpStyle.Render("  ·  ")))
 
-	boxStr := box(lines, innerW, len(lines), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(lines, innerW, m.width, h)
 }
 
 // paletteLine renders one command row: the verb-phrase title on the left and the
@@ -741,7 +777,7 @@ const usageBurnMinSpan = 5 * time.Minute
 // threshold and staleness gates — when the user explicitly asks, they get
 // whatever ct knows.
 func (m Model) renderUsage(h int) string {
-	innerW := clamp(m.width-8, 32, 56)
+	innerW := panelInnerWidth(m.width, 56)
 	rows := []string{header("usage", -1), ""}
 	for i, provider := range m.agentProviders {
 		if i > 0 {
@@ -762,8 +798,7 @@ func (m Model) renderUsage(h int) string {
 		rows = append(rows, usageBurnRows(snap, hist)...)
 	}
 	rows = append(rows, "", "  "+keyhint("esc", "close"))
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(rows, innerW, m.width, h)
 }
 
 // usageWindowRows renders a gauge line (and an indented reset line) per
@@ -1323,6 +1358,11 @@ func (m Model) activeRow(it activeItem, highlight bool, innerW int) string {
 		cluster = cluster + " " + gl
 		clusterW += 1 + glW
 	}
+	// On the focused row, identity outranks optional right-side facts. Drop the
+	// cluster before truncating the selected worktree name.
+	if highlight && lipgloss.Width(it.view.WT.Name) > innerW-activeRowPrefixW-clusterW-1 {
+		cluster, clusterW = "", 0
+	}
 	nameMax := max(1, innerW-activeRowPrefixW-clusterW-1)
 	name := truncateTo(it.view.WT.Name, nameMax)
 	gap := max(1, innerW-activeRowPrefixW-lipgloss.Width(name)-clusterW)
@@ -1440,7 +1480,7 @@ func activeDetail(v WorktreeView, stackSeg string, innerW int) string {
 // mnemonic key right-aligned and dim. A footer legend advertises the keys.
 func (m Model) renderConfirm(h int) string {
 	c := m.confirm
-	innerW := clamp(m.width-8, 32, 56)
+	innerW := panelInnerWidth(m.width, 56)
 
 	lines := []string{header(c.title, -1), ""}
 	for _, ctx := range c.context {
@@ -1454,8 +1494,7 @@ func (m Model) renderConfirm(h int) string {
 		keyhint("↑↓", "move"), keyhint("enter", "confirm"), keyhint("esc", "cancel"),
 	}, helpStyle.Render("  ·  ")))
 
-	boxStr := box(lines, innerW, len(lines), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(lines, innerW, m.width, h)
 }
 
 // confirmOptionLine renders one option row: the label on the left and its
@@ -1528,7 +1567,7 @@ func divergencePhrase(v WorktreeView) string {
 // session bindings are read from the model so the overlay can never drift from
 // the real (configurable) keys.
 func (m Model) renderHelp(h int) string {
-	innerW := clamp(m.width-8, 28, 72)
+	innerW := panelInnerWidth(m.width, 72)
 
 	row := func(key, desc string) string {
 		k := padLine(key, 12)
@@ -1583,13 +1622,24 @@ func (m Model) renderHelp(h int) string {
 		"  "+markLegend(),
 		"  "+stackLegend(),
 		"",
-		"  "+helpStyle.Render("toggle with ")+helpKeyStyle.Render(m.keys.Help)+
-			helpStyle.Render(" (or ")+helpKeyStyle.Render("?")+
-			helpStyle.Render(" in the deck) · any key closes"),
+		"  "+strings.Join([]string{
+			keyhint("j/k", "scroll"), keyhint("esc", "close"),
+			helpStyle.Render("toggle ") + helpKeyStyle.Render(m.keys.Help),
+		}, helpStyle.Render(" · ")),
 	)
 
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	// Help is the one panel whose complete content routinely exceeds a normal
+	// terminal. Window its middle while keeping title and navigation anchored.
+	footer := rows[len(rows)-1]
+	body := rows[2 : len(rows)-2]
+	visibleH := max(1, h-6) // borders + title/blank + blank/footer
+	maxOffset := max(0, len(body)-visibleH)
+	start := clamp(m.helpOffset, 0, maxOffset)
+	end := min(len(body), start+visibleH)
+	visible := []string{rows[0], ""}
+	visible = append(visible, body[start:end]...)
+	visible = append(visible, "", footer)
+	return renderPanel(visible, innerW, m.width, h)
 }
 
 // statusLegend / markLegend explain the deck's status glyphs, split across two
@@ -1623,7 +1673,7 @@ func stackLegend() string {
 
 // renderSetup draws the first-run setup overlay centered in the body area.
 func (m Model) renderSetup(h int) string {
-	innerW := clamp(m.width-8, 32, 60)
+	innerW := panelInnerWidth(m.width, 60)
 
 	rows := []string{
 		header("setup", -1),
@@ -1643,8 +1693,7 @@ func (m Model) renderSetup(h int) string {
 	}
 	rows = append(rows, "  "+keyhint("enter", "confirm")+"   "+keyhint("esc", "quit"))
 
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(rows, innerW, m.width, h)
 }
 
 // centerBlock centers a rendered block within w×h by padding above and to the
@@ -1667,6 +1716,42 @@ func centerBlock(block string, w, h int) string {
 		out = append(out, prefix+ln)
 	}
 	return strings.Join(out, "\n")
+}
+
+// panelInnerWidth keeps a rounded, horizontally padded panel inside the
+// viewport. The frame consumes four columns: two borders and two padding cells.
+func panelInnerWidth(viewport, preferred int) int {
+	if viewport <= 0 {
+		return preferred
+	}
+	return max(1, min(preferred, viewport-4))
+}
+
+// renderPanel fits a centered panel to the available body. On short terminals,
+// stable orientation (title) and the action footer survive while middle detail
+// yields, with an explicit omission marker rather than clipped borders.
+func renderPanel(rows []string, innerW, viewportW, viewportH int) string {
+	contentH := max(1, viewportH-2) // rounded top and bottom borders
+	fitted := rows
+	if len(fitted) > contentH {
+		switch contentH {
+		case 1:
+			fitted = rows[:1]
+		case 2:
+			fitted = []string{rows[0], rows[len(rows)-1]}
+		default:
+			middle := contentH - 2
+			fitted = append([]string{rows[0]}, rows[1:1+middle]...)
+			if middle > 0 {
+				fitted[len(fitted)-1] = dimStyle.Render("  …")
+			}
+			fitted = append(fitted, rows[len(rows)-1])
+		}
+	}
+	for i := range fitted {
+		fitted[i] = ansi.Truncate(fitted[i], innerW, "…")
+	}
+	return centerBlock(box(fitted, innerW, len(fitted), true), viewportW, viewportH)
 }
 
 func (m Model) renderFooter() string {
@@ -1772,9 +1857,11 @@ func (m Model) centerFooter(content string) string {
 	}
 	lines := strings.Split(content, "\n")
 	for i, ln := range lines {
+		ln = ansi.Truncate(ln, m.width, "")
 		if pad := (m.width - lipgloss.Width(ln)) / 2; pad > 0 {
-			lines[i] = strings.Repeat(" ", pad) + ln
+			ln = strings.Repeat(" ", pad) + ln
 		}
+		lines[i] = ln
 	}
 	return strings.Join(lines, "\n")
 }

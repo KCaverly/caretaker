@@ -452,11 +452,21 @@ func TestHelpOverlayToggle(t *testing.T) {
 	if !m.helpOpen {
 		t.Fatal("the help key should open help from a session")
 	}
-	out := m.renderHelp(m.height - barHeight)
+	out := renderAllHelp(m)
 	for _, want := range []string{"HELP", "Session", "Legend", m.keys.Cycle, m.keys.Picker, m.keys.Palette, "uncommitted"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help overlay missing %q:\n%s", want, out)
 		}
+	}
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: 'j', Text: "j"})
+	m = mm.(Model)
+	if !m.helpOpen || m.helpOffset != 1 {
+		t.Fatal("j should scroll help without dismissing it")
+	}
+	mm, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = mm.(Model)
+	if m.helpOpen || m.helpOffset != 0 {
+		t.Fatal("esc should close help and reset its scroll position")
 	}
 }
 
@@ -760,7 +770,9 @@ func mixedProviderModel(defaultProvider agent.Provider) Model {
 	ctrl.startCodex = func(context.Context, codex.Config) (codexRuntime, error) {
 		return newFakeCodexRuntime("unix:///tmp/caretaker-fake-codex.sock"), nil
 	}
-	return New(ctrl, session.NewManager())
+	m := New(ctrl, session.NewManager())
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	return mm.(Model)
 }
 
 type fakeCodexRuntime struct {
