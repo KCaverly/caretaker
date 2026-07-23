@@ -621,6 +621,11 @@ func TestBoardCloseRequiresConfirmation(t *testing.T) {
 	if out := m.View().Content; !strings.Contains(out, "CLOSE AGENT") || !strings.Contains(out, "keep agent") {
 		t.Fatalf("close confirmation should render above the board:\n%s", out)
 	}
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	m = mm.(Model)
+	if m.mode != modeConfirmAgentClose || len(m.current.ws.Agents) != 1 {
+		t.Fatal("unrelated input should leave the close-agent confirmation intact")
+	}
 
 	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: tea.KeyEscape})
 	m = mm.(Model)
@@ -643,6 +648,11 @@ func TestBusyBoardRestartRequiresConfirmation(t *testing.T) {
 	}
 	if !confirmHasContext(m.confirm, "current turn") || !confirmHasOption(m.confirm, "r") {
 		t.Fatalf("restart confirmation should explain interruption and expose restart: %+v", m.confirm)
+	}
+	mm, _ = m.handleBoard(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	m = mm.(Model)
+	if m.mode != modeConfirmAgentRestart || m.confirm.agent == nil {
+		t.Fatal("unrelated input should leave the restart-agent confirmation intact")
 	}
 }
 
@@ -2274,14 +2284,18 @@ func TestQuitGuardBusyConfirms(t *testing.T) {
 		t.Fatal("'y' should quit from the confirm prompt")
 	}
 
-	// Any other key cancels back to normal without quitting.
+	// Unrelated keys are contained; only an explicit cancel dismisses the panel.
 	mm, cmd = m.handlePicker(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	m = mm.(Model)
-	if m.mode != modeNormal {
-		t.Fatalf("'n' should cancel the quit, got mode %v", m.mode)
+	if m.mode != modeConfirmQuit {
+		t.Fatalf("'n' should leave the quit confirmation open, got mode %v", m.mode)
 	}
 	if isQuit(cmd) {
 		t.Fatal("'n' must not quit")
+	}
+	mm, _ = m.handlePicker(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if mm.(Model).mode != modeNormal {
+		t.Fatal("escape should cancel the quit confirmation")
 	}
 }
 
@@ -2326,11 +2340,11 @@ func TestStopGuardBusyConfirms(t *testing.T) {
 		t.Fatal("enter on the default (cancel) row should cancel and leave the workspace running")
 	}
 
-	// A non-'y' key cancels, leaving the workspace running.
+	// A non-'y' key is ignored, leaving both the prompt and workspace intact.
 	mm, _ = m.handlePicker(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	cancel := mm.(Model)
-	if cancel.mode != modeNormal {
-		t.Fatalf("'n' should cancel the stop, got mode %v", cancel.mode)
+	if cancel.mode != modeConfirmStop {
+		t.Fatalf("'n' should leave the stop confirmation open, got mode %v", cancel.mode)
 	}
 	if !cancel.mgr.Has("repo/a") {
 		t.Fatal("'n' must leave the workspace running")
@@ -2426,17 +2440,18 @@ func TestRemovePromptCancels(t *testing.T) {
 	m.activeCursor = 0
 	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	m = mm.(Model)
-	// Any key that isn't y/b cancels without removing anything.
+	// Unrelated input is ignored without removing anything.
 	mm, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	m = mm.(Model)
-	if m.mode != modeNormal {
-		t.Fatalf("'n' should cancel back to normal mode, got %v", m.mode)
-	}
-	if m.status != "" {
-		t.Fatalf("cancel should clear the prompt, got %q", m.status)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'n' should leave the remove confirmation open, got %v", m.mode)
 	}
 	if cmd != nil {
-		t.Fatal("cancel must not schedule a removal command")
+		t.Fatal("ignored input must not schedule a removal command")
+	}
+	mm, _ = m.handleConfirmKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if mm.(Model).mode != modeNormal {
+		t.Fatal("escape should cancel the remove confirmation")
 	}
 }
 
@@ -2672,7 +2687,7 @@ func TestRemoveConfirmArrowToDangerDeletesBranch(t *testing.T) {
 }
 
 // TestRemoveConfirmNavDoesNotCancel: j/k move the cursor without dismissing the
-// panel — the "anything else cancels" fallback must never sweep them up.
+// panel.
 func TestRemoveConfirmNavDoesNotCancel(t *testing.T) {
 	m := removePromptModel()
 	m.activeCursor = 0
@@ -2699,20 +2714,19 @@ func TestRemoveConfirmNavDoesNotCancel(t *testing.T) {
 	}
 }
 
-// TestRemoveConfirmStrayKeyCancels: a key bound to nothing (e.g. 'q') cancels
-// the panel, preserving the old "anything else cancels" behavior.
-func TestRemoveConfirmStrayKeyCancels(t *testing.T) {
+// TestRemoveConfirmStrayKeyIsContained verifies modal input containment.
+func TestRemoveConfirmStrayKeyIsContained(t *testing.T) {
 	m := removePromptModel()
 	m.activeCursor = 0
 	mm, _ := m.handleActiveKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	m = mm.(Model)
 	mm, cmd := m.handleConfirmKey(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	m = mm.(Model)
-	if m.mode != modeNormal {
-		t.Fatalf("'q' should cancel back to normal mode, got %v", m.mode)
+	if m.mode != modeConfirmRemove {
+		t.Fatalf("'q' should leave the panel open, got mode %v", m.mode)
 	}
-	if m.confirm.title != "" {
-		t.Fatalf("cancel should clear the panel state, got title %q", m.confirm.title)
+	if m.confirm.title != "REMOVE WORKTREE" {
+		t.Fatalf("ignored input should preserve panel state, got title %q", m.confirm.title)
 	}
 	if cmd != nil {
 		t.Fatal("cancel must not schedule a removal command")
