@@ -50,7 +50,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -68,11 +68,85 @@ func runStack(args []string) int {
 		return runStackSetup(args[1:])
 	case "repair":
 		return runStackRepair(args[1:])
+	case "reorder":
+		return runStackReorder(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder) [flags] [-C <dir>]")
 		return 2
 	}
+}
+
+func runStackReorder(args []string) int {
+	var asJSON, dryRun, yes bool
+	var dir string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--dry-run":
+			dryRun = true
+		case "--yes":
+			yes = true
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack reorder: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack reorder: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack reorder:", err)
+			return 1
+		}
+	}
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack reorder:", err)
+		return 1
+	}
+	confirm := func(plan stack.ReorderPlan) bool {
+		fmt.Print(stack.RenderReorderPlan(stack.ReorderResult{Status: stack.StackStatus{Repo: params.RepoName, Worktree: params.WorktreeName}, Plan: plan}))
+		fmt.Print("Apply reorder and update GitHub? [y/N] ")
+		var answer string
+		fmt.Scanln(&answer)
+		return answer == "y" || answer == "Y" || answer == "yes"
+	}
+	res, err := stack.Reorder(stack.ReorderOptions{Params: params, DryRun: dryRun, Yes: yes, Confirm: confirm})
+	if err != nil {
+		for _, done := range res.Executed {
+			fmt.Fprintln(os.Stderr, "  did:", done)
+		}
+		fmt.Fprintln(os.Stderr, "ct stack reorder:", err)
+		return 1
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(res); err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack reorder:", err)
+			return 1
+		}
+		return 0
+	}
+	if res.Nothing {
+		fmt.Println("stack order unchanged")
+		return 0
+	}
+	if dryRun {
+		fmt.Print(stack.RenderReorderPlan(res))
+	} else {
+		fmt.Print(stack.Render(res.Status))
+	}
+	return 0
 }
 
 func runStackRepair(args []string) int {
