@@ -126,10 +126,18 @@ func WorktreeStatus(wt Worktree) (Status, error) {
 }
 
 // BranchTip is a local branch tip's metadata, gathered in one for-each-ref
-// pass: the committer time (unix seconds) and the commit subject.
+// pass: the committer time (unix seconds), the commit subject, and — when a
+// base branch was supplied — how far the branch sits ahead of and behind that
+// base.
 type BranchTip struct {
 	Time    int64  // committer time (unix seconds)
 	Subject string // first line of the tip commit message
+	// Ahead/Behind count the branch's divergence from the base branch passed to
+	// BranchTips; HasBase gates whether that reading is present at all (false
+	// when no base was supplied, or for the base branch itself measured against
+	// itself is still reported but the caller ignores it for the main worktree).
+	Ahead, Behind int
+	HasBase       bool
 }
 
 // BranchTips returns the tip metadata of every local branch in r, keyed by
@@ -137,26 +145,48 @@ type BranchTip struct {
 // per-worktree `git log -1`. Worktree HEADs equal their branch tips in ct's
 // branch-per-worktree model; detached worktrees simply miss the map (a zero
 // BranchTip).
-func BranchTips(r Repo) (map[string]BranchTip, error) {
+//
+// When mainBranch is non-empty, the same for-each-ref folds in each branch's
+// ahead/behind against it via the %(ahead-behind:<base>) atom (git 2.41+),
+// computing every branch's divergence in one graph walk instead of a
+// per-worktree `git rev-list`. aheadBehind reports whether that reading is
+// present: it is false when no base was requested, or when the atom-bearing
+// format failed (an older git, or a base ref that won't resolve) and BranchTips
+// retried the plain three-field format so commit times and subjects still load.
+// A false return with a non-empty mainBranch is the caller's cue to fall back
+// to the per-worktree AheadBehind path, which works on any git.
+func BranchTips(r Repo, mainBranch string) (tips map[string]BranchTip, aheadBehind bool, err error) {
 	// %00 expands to a NUL in the output, an unambiguous separator no branch
 	// name or subject can contain (a raw NUL can't be passed as an exec
-	// argument). Two of them fence three fields; a NUL beats spaces here because
-	// commit subjects contain spaces freely.
-	out, err := Git(r.Path, "for-each-ref", "--format=%(refname:short)%00%(committerdate:unix)%00%(subject)", "refs/heads")
-	if err != nil {
-		return nil, err
+	// argument). It beats spaces here because commit subjects — and the
+	// ahead-behind atom's own "N M" pair — contain spaces freely.
+	const baseFormat = "--format=%(refname:short)%00%(committerdate:unix)%00%(subject)"
+	if mainBranch != "" {
+		format := baseFormat + "%00%(ahead-behind:" + mainBranch + ")"
+		out, ferr := Git(r.Path, "for-each-ref", format, "refs/heads")
+		if ferr == nil {
+			return parseBranchTips(out, true), true, nil
+		}
+		// Fall through to the base format on failure so tips still load; the
+		// caller recomputes ahead/behind per worktree.
 	}
-	return parseBranchTips(out), nil
+	out, err := Git(r.Path, "for-each-ref", baseFormat, "refs/heads")
+	if err != nil {
+		return nil, false, err
+	}
+	return parseBranchTips(out, false), false, nil
 }
 
-// parseBranchTips parses the NUL-fenced for-each-ref output (three fields per
-// line: short name, committer unix time, subject) into the tip map. Lines
-// missing a field or with an unparseable time are skipped; the NUL separator
-// keeps subjects — which contain spaces freely — intact.
-func parseBranchTips(out string) map[string]BranchTip {
+// parseBranchTips parses the NUL-fenced for-each-ref output into the tip map.
+// The first three fields are short name, committer unix time, and subject; a
+// fourth field (present only when withAheadBehind is set) holds the
+// %(ahead-behind:<base>) atom's "<ahead> <behind>" pair. Lines missing a
+// required field or with an unparseable time are skipped; a branch whose
+// ahead-behind pair is empty or malformed keeps its tip but reports no base.
+func parseBranchTips(out string, withAheadBehind bool) map[string]BranchTip {
 	tips := make(map[string]BranchTip)
 	for _, line := range strings.Split(out, "\n") {
-		fields := strings.SplitN(strings.TrimRight(line, "\r"), "\x00", 3)
+		fields := strings.SplitN(strings.TrimRight(line, "\r"), "\x00", 4)
 		if len(fields) < 3 {
 			continue
 		}
@@ -165,9 +195,31 @@ func parseBranchTips(out string) map[string]BranchTip {
 		if err != nil {
 			continue
 		}
-		tips[name] = BranchTip{Time: t, Subject: subject}
+		tip := BranchTip{Time: t, Subject: subject}
+		if withAheadBehind && len(fields) == 4 {
+			if ahead, behind, ok := parseAheadBehindPair(fields[3]); ok {
+				tip.Ahead, tip.Behind, tip.HasBase = ahead, behind, true
+			}
+		}
+		tips[name] = tip
 	}
 	return tips
+}
+
+// parseAheadBehindPair parses the %(ahead-behind:<base>) atom's output — two
+// space-separated integers, ahead then behind. ok is false when the field is
+// empty (git omits it for a ref it cannot compare) or malformed.
+func parseAheadBehindPair(s string) (ahead, behind int, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) != 2 {
+		return 0, 0, false
+	}
+	a, err1 := strconv.Atoi(fields[0])
+	b, err2 := strconv.Atoi(fields[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return a, b, true
 }
 
 // AheadBehind reports how far a worktree's branch has diverged from the repo's

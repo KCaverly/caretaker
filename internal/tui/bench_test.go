@@ -46,8 +46,17 @@ func benchRoot(b *testing.B, nRepos, nWorktrees int) string {
 		benchGit(b, rp, "commit", "-q", "-m", "init")
 		for j := 0; j < nWorktrees; j++ {
 			name := fmt.Sprintf("feat-%02d", j)
-			benchGit(b, rp, "worktree", "add", "-q", "-b", name, filepath.Join(rp, ".worktrees", name))
+			wtPath := filepath.Join(rp, ".worktrees", name)
+			benchGit(b, rp, "worktree", "add", "-q", "-b", name, wtPath)
+			// Diverge each worktree from main so the deck's ahead/behind columns
+			// have real work to report: a couple of commits ahead, and one commit
+			// added to main afterward puts every worktree one behind too. This is
+			// what a live root looks like, and it exercises the ahead-behind path
+			// (folded into BranchTips) rather than the trivial 0/0 case.
+			benchGit(b, wtPath, "commit", "-q", "--allow-empty", "-m", "wip-1")
+			benchGit(b, wtPath, "commit", "-q", "--allow-empty", "-m", "wip-2")
 		}
+		benchGit(b, rp, "commit", "-q", "--allow-empty", "-m", "main-moves-on")
 	}
 	return root
 }

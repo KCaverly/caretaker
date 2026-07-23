@@ -103,7 +103,7 @@ type Group struct {
 }
 
 // loadConcurrency bounds how many git subprocesses one Load runs at a time.
-const loadConcurrency = 8
+const loadConcurrency = 16
 
 // Load discovers repos and their worktrees with git status. Live status is
 // filled in by the model from the session manager. Repos and their worktree
@@ -128,16 +128,18 @@ func (c *Controller) Load() ([]Group, error) {
 				<-sem
 				return // skip repos that fail to list, as before
 			}
-			tips, _ := repo.BranchTips(r)
-			<-sem
 
 			// The primary worktree's branch is the base every other worktree's
 			// ahead/behind is measured against; empty (a detached main) leaves
-			// ahead/behind unavailable everywhere.
+			// ahead/behind unavailable everywhere. BranchTips folds each branch's
+			// ahead/behind against it into its single for-each-ref pass, so the
+			// per-worktree rev-list is gone.
 			mainBranch := ""
 			if len(wts) > 0 {
 				mainBranch = wts[0].Branch
 			}
+			tips, tipsAheadBehind, _ := repo.BranchTips(r, mainBranch)
+			<-sem
 
 			views := make([]WorktreeView, len(wts))
 			var wtWG sync.WaitGroup
@@ -151,12 +153,25 @@ func (c *Controller) Load() ([]Group, error) {
 					tip := tips[wt.Branch]
 					v := WorktreeView{WT: wt, Dirty: st.Dirty, CommitTime: tip.Time, Subject: tip.Subject}
 					// Record the base every non-main worktree's ahead/behind was
-					// measured against, so the diff viewer can diff against it.
+					// measured against, so the diff viewer can diff against it, and
+					// carry the ahead/behind BranchTips already computed for it. The
+					// main worktree is skipped: its "divergence from itself" is 0/0
+					// and meaningless.
 					if !wt.IsMain {
 						v.BaseBranch = mainBranch
-					}
-					if ahead, behind, ok := repo.AheadBehind(wt, mainBranch); ok {
-						v.Ahead, v.Behind, v.HasBase = ahead, behind, true
+						switch {
+						case tipsAheadBehind:
+							// Fast path: BranchTips already folded ahead/behind in.
+							if tip.HasBase {
+								v.Ahead, v.Behind, v.HasBase = tip.Ahead, tip.Behind, true
+							}
+						default:
+							// Older git without the ahead-behind atom: recompute per
+							// worktree so the feature still works.
+							if ahead, behind, ok := repo.AheadBehind(wt, mainBranch); ok {
+								v.Ahead, v.Behind, v.HasBase = ahead, behind, true
+							}
+						}
 					}
 					// The dirty flag already covers untracked-only trees; the
 					// diffstat (staged+unstaged vs HEAD) only adds value when there
