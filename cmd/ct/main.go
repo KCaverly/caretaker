@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -50,7 +53,7 @@ func main() {
 // lives in the output, not the exit code.
 func runStack(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder|watch) [flags] [-C <dir>]")
 		return 2
 	}
 	switch args[0] {
@@ -70,15 +73,103 @@ func runStack(args []string) int {
 		return runStackRepair(args[1:])
 	case "reorder":
 		return runStackReorder(args[1:])
+	case "watch":
+		return runStackWatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "ct stack: unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder) [flags] [-C <dir>]")
+		fmt.Fprintln(os.Stderr, "usage: ct stack (status|submit|restack|finish|merge|setup|repair|reorder|watch) [flags] [-C <dir>]")
 		return 2
 	}
 }
 
+func runStackWatch(args []string) int {
+	var asJSON bool
+	var dir string
+	interval, timeout := 5*time.Second, 30*time.Minute
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--interval", "--timeout":
+			flag := args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "ct stack watch: %s requires a duration\n", flag)
+				return 2
+			}
+			i++
+			d, err := time.ParseDuration(args[i])
+			if err != nil || d < 0 {
+				fmt.Fprintf(os.Stderr, "ct stack watch: invalid %s duration %q\n", flag, args[i])
+				return 2
+			}
+			if flag == "--interval" {
+				if d == 0 {
+					fmt.Fprintln(os.Stderr, "ct stack watch: --interval must be greater than zero")
+					return 2
+				}
+				interval = d
+			} else {
+				timeout = d
+			}
+		case "-C":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ct stack watch: -C requires a directory argument")
+				return 2
+			}
+			i++
+			dir = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "ct stack watch: unknown argument %q\n", args[i])
+			return 2
+		}
+	}
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack watch:", err)
+			return 1
+		}
+	}
+	params, err := resolveStackParams(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ct stack watch:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	onEvent := func(e stack.WatchEvent) {
+		if !asJSON {
+			from := e.From
+			if from == "" {
+				from = "observed"
+			}
+			fmt.Printf("PR #%d: %s -> %s\n", e.PR, from, e.To)
+		}
+	}
+	res, err := stack.Watch(stack.WatchOptions{Params: params, Context: ctx, Interval: interval, Timeout: timeout, OnEvent: onEvent})
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(res); encErr != nil {
+			fmt.Fprintln(os.Stderr, "ct stack watch:", encErr)
+			return 1
+		}
+	}
+	if err != nil {
+		if !asJSON {
+			fmt.Fprintln(os.Stderr, "ct stack watch:", err)
+		}
+		return 1
+	}
+	if !asJSON {
+		fmt.Println("all stack checks are passing")
+	}
+	return 0
+}
+
 func runStackReorder(args []string) int {
-	var asJSON, dryRun, yes bool
+	var asJSON, dryRun, yes, watch bool
 	var dir string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -88,6 +179,8 @@ func runStackReorder(args []string) int {
 			dryRun = true
 		case "--yes":
 			yes = true
+		case "--watch":
+			watch = true
 		case "-C":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "ct stack reorder: -C requires a directory argument")
@@ -99,6 +192,10 @@ func runStackReorder(args []string) int {
 			fmt.Fprintf(os.Stderr, "ct stack reorder: unknown argument %q\n", args[i])
 			return 2
 		}
+	}
+	if dryRun && watch {
+		fmt.Fprintln(os.Stderr, "ct stack reorder: --watch cannot be used with --dry-run")
+		return 2
 	}
 	if dir == "" {
 		var err error
@@ -127,6 +224,14 @@ func runStackReorder(args []string) int {
 		}
 		fmt.Fprintln(os.Stderr, "ct stack reorder:", err)
 		return 1
+	}
+	if watch && !res.Nothing {
+		st, err := watchStackAfter(params, asJSON)
+		res.Status = st
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack reorder --watch:", err)
+			return 1
+		}
 	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -461,6 +566,7 @@ func runStackSubmit(args []string) int {
 		asJSON bool
 		dryRun bool
 		draft  bool
+		watch  bool
 		dir    string
 	)
 	for i := 0; i < len(args); i++ {
@@ -471,6 +577,8 @@ func runStackSubmit(args []string) int {
 			dryRun = true
 		case "--draft":
 			draft = true
+		case "--watch":
+			watch = true
 		case "-C":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "ct stack submit: -C requires a directory argument")
@@ -482,6 +590,10 @@ func runStackSubmit(args []string) int {
 			fmt.Fprintf(os.Stderr, "ct stack submit: unknown argument %q\n", args[i])
 			return 2
 		}
+	}
+	if dryRun && watch {
+		fmt.Fprintln(os.Stderr, "ct stack submit: --watch cannot be used with --dry-run")
+		return 2
 	}
 
 	if dir == "" {
@@ -499,7 +611,6 @@ func runStackSubmit(args []string) int {
 		fmt.Fprintln(os.Stderr, "ct stack submit:", err)
 		return 1
 	}
-
 	res, err := stack.Submit(stack.SubmitOptions{Params: params, DryRun: dryRun, Draft: draft})
 	if err != nil {
 		for _, done := range res.Executed {
@@ -516,6 +627,14 @@ func runStackSubmit(args []string) int {
 		fmt.Println("nothing to submit")
 		return 0
 	}
+	if watch {
+		st, err := watchStackAfter(params, asJSON)
+		res.Status = st
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ct stack submit --watch:", err)
+			return 1
+		}
+	}
 
 	if dryRun {
 		if asJSON {
@@ -530,6 +649,23 @@ func runStackSubmit(args []string) int {
 	}
 	fmt.Print(stack.Render(res.Status))
 	return 0
+}
+
+func watchStackAfter(params stack.Params, quiet bool) (stack.StackStatus, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	onEvent := func(e stack.WatchEvent) {
+		if quiet {
+			return
+		}
+		from := e.From
+		if from == "" {
+			from = "observed"
+		}
+		fmt.Printf("PR #%d: %s -> %s\n", e.PR, from, e.To)
+	}
+	res, err := stack.Watch(stack.WatchOptions{Params: params, Context: ctx, Interval: 5 * time.Second, Timeout: 30 * time.Minute, OnEvent: onEvent})
+	return res.Status, err
 }
 
 // encodeStackJSON prints a StackStatus as indented JSON. When plan is non-nil (a
