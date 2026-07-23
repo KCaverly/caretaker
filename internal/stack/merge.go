@@ -2,6 +2,7 @@ package stack
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -84,6 +85,69 @@ func settledStatus(p Params, mergedNumber int) (StackStatus, error) {
 	}
 }
 
+// waitForMerged waits only for the merge itself to be visible. Dependent-PR
+// retargeting is handled explicitly afterwards, so correctness does not depend
+// on the repository's automatic branch-deletion setting.
+func waitForMerged(p Params, mergedNumber int) (StackStatus, error) {
+	deadline := time.Now().Add(postMergeSettleTimeout)
+	for {
+		st, err := Status(p)
+		if err != nil {
+			return st, err
+		}
+		for _, c := range st.Commits {
+			if c.State == StateMerged && c.PR != nil && c.PR.Number == mergedNumber {
+				return st, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return st, fmt.Errorf("GitHub did not reflect merge of PR #%d within %s", mergedNumber, postMergeSettleTimeout)
+		}
+		time.Sleep(postMergeSettleInterval)
+	}
+}
+
+// retargetOpenDependents moves every open stack PR still based on oldBase to
+// newBase and verifies the resulting state. Usually there is one immediate
+// child, but handling all matches keeps cleanup safe in a malformed or
+// concurrently-edited stack.
+func retargetOpenDependents(dir, worktree, oldBase, newBase string) ([]string, error) {
+	prs, gh := gatherGitHub(dir, worktree)
+	if !gh.Available {
+		return nil, fmt.Errorf("cannot verify dependents of %s: %s", oldBase, strings.Join(gh.Warnings, "; "))
+	}
+	var changed []string
+	for _, p := range openPRsBasedOn(prs, oldBase) {
+		if err := ghEditBase(dir, p.Number, newBase); err != nil {
+			// GitHub may have auto-retargeted between the read and edit. Verify
+			// the desired state before treating that race as a failure.
+			fresh, freshGH := gatherGitHub(dir, worktree)
+			if !freshGH.Available || !prOpenOnBase(fresh, p.Number, newBase) {
+				return changed, fmt.Errorf("retargeting dependent PR #%d from %s to %s: %w", p.Number, oldBase, newBase, err)
+			}
+		}
+		changed = append(changed, fmt.Sprintf("retargeted dependent PR #%d -> %s", p.Number, newBase))
+	}
+
+	fresh, freshGH := gatherGitHub(dir, worktree)
+	if !freshGH.Available {
+		return changed, fmt.Errorf("cannot verify dependents of %s after retargeting: %s", oldBase, strings.Join(freshGH.Warnings, "; "))
+	}
+	if dependents := openPRsBasedOn(fresh, oldBase); len(dependents) > 0 {
+		return changed, fmt.Errorf("open PR #%d still targets %s after retargeting", dependents[0].Number, oldBase)
+	}
+	return changed, nil
+}
+
+func prOpenOnBase(prs []prRecord, number int, base string) bool {
+	for _, p := range prs {
+		if p.Number == number {
+			return p.State == "OPEN" && p.Base == base
+		}
+	}
+	return false
+}
+
 // Merge refreshes status, revalidates the target, squash-merges it, then waits
 // for GitHub's dependent-PR retargeting to settle before returning status.
 // Branch cleanup is deliberately left to GitHub's repository-level setting so
@@ -104,6 +168,27 @@ func Merge(o MergeOptions) (MergeResult, error) {
 		return res, fmt.Errorf("merging PR #%d: %w", st.MergeHint.Number, err)
 	}
 	res.Executed = append(res.Executed, fmt.Sprintf("merged PR #%d (squash)", st.MergeHint.Number))
+
+	merged := bottomOpenCommit(st.Commits)
+	if merged == nil || merged.RemoteBranch == nil || merged.PR == nil {
+		return res, fmt.Errorf("merged PR #%d has no tracked stack branch", st.MergeHint.Number)
+	}
+	if _, err := waitForMerged(o.Params, st.MergeHint.Number); err != nil {
+		return res, err
+	}
+	steps, err := retargetOpenDependents(p.WorktreeDir, st.Worktree, *merged.RemoteBranch, merged.PR.Base)
+	res.Executed = append(res.Executed, steps...)
+	if err != nil {
+		return res, err
+	}
+	if err := ensureBranchHasNoOpenDependents(p.WorktreeDir, st.Worktree, *merged.RemoteBranch); err != nil {
+		return res, err
+	}
+	if err := deleteRemoteBranch(p.WorktreeDir, *merged.RemoteBranch); err != nil {
+		return res, fmt.Errorf("deleting merged remote branch %s: %w", *merged.RemoteBranch, err)
+	}
+	res.Executed = append(res.Executed, "deleted merged remote branch "+*merged.RemoteBranch)
+
 	res.Status, err = settledStatus(o.Params, st.MergeHint.Number)
 	return res, err
 }
