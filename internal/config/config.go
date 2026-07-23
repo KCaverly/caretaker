@@ -116,8 +116,6 @@ type Keys struct {
 	Help string `toml:"help"`
 	// GlobalConfig opens the home-directory workspace for editing global config.
 	GlobalConfig string `toml:"global_config"`
-	// Prompt opens the new-agent form pre-set for a background home agent.
-	Prompt string `toml:"prompt"`
 	// Attention jumps straight into the session of the agent that most needs the
 	// user — live-waiting agents first, then unread completions — and cycles to
 	// the next such agent on each press, collapsing the open-board/scan/select
@@ -165,7 +163,7 @@ func Default() Config {
 			GotoEditor: "alt+1", GotoAgent: "alt+2", GotoTerm: "alt+3",
 			Picker:  "ctrl+g",
 			Palette: "alt+a", NextAgent: "f4", PrevAgent: "f3",
-			Help: "f1", GlobalConfig: "alt+g", Prompt: "alt+y", Attention: "alt+n",
+			Help: "f1", GlobalConfig: "alt+g", Attention: "alt+n",
 			TermSplitV: "alt+v", TermSplitH: "alt+s",
 			TermZoom: "alt+z", TermClose: "alt+x",
 			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",

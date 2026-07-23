@@ -214,8 +214,8 @@ func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir()
 
 // EnsureHomeDirTrusted marks the home directory as trusted in Claude's global
 // config (~/.claude.json, under projects[home].hasTrustDialogAccepted) so that
-// interactive sessions started there (e.g. background agents) don't pause to
-// show the workspace trust dialog. It is idempotent and safe to call before
+// agents started in the home workspace don't pause to show the workspace trust
+// dialog. It is idempotent and safe to call before
 // every spawn: it only rewrites the file when the flag isn't already true, and
 // preserves every other field byte-for-byte.
 func (c *Controller) EnsureHomeDirTrusted() error {
@@ -304,17 +304,6 @@ func agentTitle(provider agent.Provider, label string) string {
 	return label
 }
 
-// AgentMode controls whether an agent is launched interactively or with the
-// provider's autonomous background flags.
-type AgentMode int
-
-const (
-	AgentForeground AgentMode = iota
-	AgentBackground
-)
-
-func (m AgentMode) valid() bool { return m == AgentForeground || m == AgentBackground }
-
 // EnabledAgentProviders returns the configured provider choices in palette
 // order. The returned slice is independent of the controller's configuration.
 // A zero-value/legacy controller remains Claude-only.
@@ -388,10 +377,7 @@ func (c *Controller) PrepareAgentSpec(ctx context.Context, dir string, spec sess
 // NewProviderAgentSpec constructs a brand-new provider session. Claude owns a
 // caller-generated UUID from launch; Codex assigns its thread ID after launch,
 // so a fresh Codex spec deliberately starts with an empty SessionID.
-func (c *Controller) NewProviderAgentSpec(provider agent.Provider, label, prompt string, mode AgentMode) (session.Spec, error) {
-	if !mode.valid() {
-		return session.Spec{}, fmt.Errorf("invalid agent mode %d", mode)
-	}
+func (c *Controller) NewProviderAgentSpec(provider agent.Provider, label, prompt string) (session.Spec, error) {
 	providerCfg, err := c.providerConfig(provider)
 	if err != nil {
 		return session.Spec{}, err
@@ -399,12 +385,9 @@ func (c *Controller) NewProviderAgentSpec(provider agent.Provider, label, prompt
 
 	switch provider {
 	case agent.Claude:
-		return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, prompt, mode), nil
+		return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, prompt), nil
 	case agent.Codex:
 		argv := append([]string{providerCfg.Command}, providerCfg.Args...)
-		if mode == AgentBackground {
-			argv = append(argv, "--sandbox", "workspace-write", "--ask-for-approval", "never")
-		}
 		if prompt != "" {
 			argv = append(argv, prompt)
 		}
@@ -420,16 +403,13 @@ func (c *Controller) NewProviderAgentSpec(provider agent.Provider, label, prompt
 
 // RestoreProviderAgentSpec constructs a persisted provider session. Claude
 // keeps its missing-transcript fallback; Codex resumes through its resume
-// subcommand, with global background flags placed before that subcommand.
-func (c *Controller) RestoreProviderAgentSpec(provider agent.Provider, id, label, prompt string, mode AgentMode) (session.Spec, error) {
+// subcommand.
+func (c *Controller) RestoreProviderAgentSpec(provider agent.Provider, id, label, prompt string) (session.Spec, error) {
 	// A provider may not have reported its conversation ID before caretaker was
 	// stopped. Relaunch that entry as a fresh session rather than constructing a
 	// malformed resume command with an empty identifier.
 	if id == "" {
-		return c.NewProviderAgentSpec(provider, label, prompt, mode)
-	}
-	if !mode.valid() {
-		return session.Spec{}, fmt.Errorf("invalid agent mode %d", mode)
+		return c.NewProviderAgentSpec(provider, label, prompt)
 	}
 	providerCfg, err := c.providerConfig(provider)
 	if err != nil {
@@ -439,14 +419,11 @@ func (c *Controller) RestoreProviderAgentSpec(provider agent.Provider, id, label
 	switch provider {
 	case agent.Claude:
 		if !c.transcriptExists(id) {
-			return c.freshClaudeAgentSpec(providerCfg, id, label, prompt, mode), nil
+			return c.freshClaudeAgentSpec(providerCfg, id, label, prompt), nil
 		}
-		return c.resumeClaudeAgentSpec(providerCfg, id, label, prompt, mode), nil
+		return c.resumeClaudeAgentSpec(providerCfg, id, label, prompt), nil
 	case agent.Codex:
 		argv := append([]string{providerCfg.Command}, providerCfg.Args...)
-		if mode == AgentBackground {
-			argv = append(argv, "--sandbox", "workspace-write", "--ask-for-approval", "never")
-		}
 		argv = append(argv, "resume", id)
 		if prompt != "" {
 			argv = append(argv, prompt)
@@ -460,13 +437,6 @@ func (c *Controller) RestoreProviderAgentSpec(provider agent.Provider, id, label
 	}
 }
 
-// PromptAgentSpec returns a spec for a brand-new Claude agent session with
-// --dangerously-skip-permissions set, for autonomous background execution.
-func (c *Controller) PromptAgentSpec(label string) session.Spec {
-	providerCfg, _ := c.providerConfig(agent.Claude)
-	return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, "", AgentBackground)
-}
-
 // NewAgentSpec returns the spec for a brand-new Claude agent session, optionally
 // named. ct generates the session UUID and passes it as --session-id so it can
 // persist the id and resume the same conversation in a later run. The label is
@@ -475,22 +445,19 @@ func (c *Controller) PromptAgentSpec(label string) session.Spec {
 // in-process inside the pane ct controls.
 func (c *Controller) NewAgentSpec(label string) session.Spec {
 	providerCfg, _ := c.providerConfig(agent.Claude)
-	return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, "", AgentForeground)
+	return c.freshClaudeAgentSpec(providerCfg, newSessionID(), label, "")
 }
 
 // freshAgentSpec builds the spec for a brand-new claude session running under
 // the given id (shared by NewAgentSpec and the resume-fallback path).
 func (c *Controller) freshAgentSpec(id, label string) session.Spec {
 	providerCfg, _ := c.providerConfig(agent.Claude)
-	return c.freshClaudeAgentSpec(providerCfg, id, label, "", AgentForeground)
+	return c.freshClaudeAgentSpec(providerCfg, id, label, "")
 }
 
-func (c *Controller) freshClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string, mode AgentMode) session.Spec {
+func (c *Controller) freshClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string) session.Spec {
 	argv := append([]string{providerCfg.Command}, providerCfg.Args...)
 	argv = append(argv, "--session-id", id, "--teammate-mode", "in-process")
-	if mode == AgentBackground {
-		argv = append(argv, "--dangerously-skip-permissions")
-	}
 	if label != "" {
 		argv = append(argv, "-n", label)
 	}
@@ -544,15 +511,12 @@ func (c *Controller) transcriptExists(id string) bool {
 // claude on resume.
 func (c *Controller) ResumeAgentSpec(id, label string) session.Spec {
 	providerCfg, _ := c.providerConfig(agent.Claude)
-	return c.resumeClaudeAgentSpec(providerCfg, id, label, "", AgentForeground)
+	return c.resumeClaudeAgentSpec(providerCfg, id, label, "")
 }
 
-func (c *Controller) resumeClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string, mode AgentMode) session.Spec {
+func (c *Controller) resumeClaudeAgentSpec(providerCfg config.AgentProvider, id, label, prompt string) session.Spec {
 	argv := append([]string{providerCfg.Command}, providerCfg.Args...)
 	argv = append(argv, "--resume", id, "--teammate-mode", "in-process")
-	if mode == AgentBackground {
-		argv = append(argv, "--dangerously-skip-permissions")
-	}
 	if prompt != "" {
 		argv = append(argv, prompt)
 	}

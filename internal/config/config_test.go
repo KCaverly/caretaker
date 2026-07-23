@@ -153,7 +153,6 @@ func TestDefaultKeymap(t *testing.T) {
 		"goto_term":   d.Keys.GotoTerm,
 		"palette":     d.Keys.Palette,
 		"global":      d.Keys.GlobalConfig,
-		"prompt":      d.Keys.Prompt,
 		"split_v":     d.Keys.TermSplitV,
 		"split_h":     d.Keys.TermSplitH,
 		"zoom":        d.Keys.TermZoom,
