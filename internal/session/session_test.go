@@ -252,11 +252,18 @@ func TestSetVisibleUnchangedSetFastPath(t *testing.T) {
 // screen has settled, Session.Render() returns exactly what the uncached
 // emu.Render() would, and repeated calls return the identical string.
 func TestRenderCacheMatchesEmulator(t *testing.T) {
-	s, err := Start(Terminal, "term", t.TempDir(), []string{"cat"}, 80, 24, func(*Session) {})
+	// Disable the PTY's own echo before starting cat. With both terminal echo
+	// and cat active, the input's two copies can arrive in separate reads;
+	// waitFor caches after the first while emu.Render() later observes the
+	// second, so the comparison becomes timing dependent on slower CI runners.
+	s, err := Start(Terminal, "term", t.TempDir(),
+		[]string{"sh", "-c", "stty -echo; printf 'READY\\n'; exec cat"},
+		80, 24, func(*Session) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	waitFor(t, s, "READY")
 
 	_, _ = s.WriteInput([]byte("hello-cache\n"))
 	waitFor(t, s, "hello-cache")
