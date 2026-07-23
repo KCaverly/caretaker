@@ -361,15 +361,22 @@ func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
 }
 
 // DiffCommit returns the unified diff a single commit introduces, via `git diff
-// --binary sha^ sha` (the commit against its parent). A root commit has no
-// parent, so on the sha^ lookup failing it falls back to `git show --format=
-// --binary sha`, which diffs the root against the empty tree. dir is any path
-// inside the worktree the commit lives in.
+// sha^ sha` (the commit against its parent). A root commit has no parent, so on
+// the sha^ lookup failing it falls back to `git show --format= sha`, which diffs
+// the root against the empty tree. dir is any path inside the worktree the
+// commit lives in.
+//
+// No --binary: this output is for reading, not applying. With it git inlines a
+// base85 "GIT binary patch" literal for every changed binary file — hundreds of
+// lines for a small blob, enough to blow past the viewer's line cap for a large
+// one — and the base85 alphabet includes +/-, so those lines colour as bogus
+// additions and deletions. Plain diff prints one "Binary files differ" line
+// instead, matching DiffAgainstBase.
 func DiffCommit(dir, sha string) (string, error) {
 	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
-		return Git(dir, "show", "--format=", "--binary", sha)
+		return Git(dir, "show", "--format=", sha)
 	}
-	return Git(dir, "diff", "--binary", sha+"^", sha)
+	return Git(dir, "diff", sha+"^", sha)
 }
 
 // NumstatCommit returns a single commit's per-file change summary, parsed from
