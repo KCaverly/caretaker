@@ -39,11 +39,22 @@ func Render(st StackStatus) string {
 	for _, o := range st.Stack.Orphans {
 		fmt.Fprintf(&b, "  orphan PR #%d (%s) head=%s\n", o.Number, o.URL, o.Head)
 	}
+	for _, c := range st.Commits {
+		if c.State == StateClosed && c.PR != nil {
+			fmt.Fprintf(&b, "  repair: ct stack repair --pr %d\n", c.PR.Number)
+		}
+	}
 	if h := st.MergeHint; h != nil {
 		fmt.Fprintf(&b, "  merge: gh pr merge %d --squash --subject %q --body %q\n",
 			h.Number, h.Subject, h.Body)
 	}
 	return b.String()
+}
+
+func RenderRepairPlan(res RepairResult) string {
+	p := res.Plan
+	return fmt.Sprintf("%s/%s  repair plan (dry-run)\n  would restore %s at %s\n  would reopen PR #%d\n  would retarget PR #%d  %s -> %s\n  would delete temporary branch %s\n",
+		res.Status.Repo, res.Status.Worktree, p.FormerBase, p.FormerBaseSHA, p.PR, p.PR, p.FormerBase, p.NewBase, p.FormerBase)
 }
 
 // RenderPlan returns a human-readable dry-run plan: one line per action, grouped

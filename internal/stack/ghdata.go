@@ -21,6 +21,7 @@ type prRecord struct {
 	State     string // OPEN, CLOSED, MERGED
 	Draft     bool
 	Head      string // headRefName
+	HeadSHA   string // headRefOid; survives branch deletion on GitHub
 	Base      string // baseRefName
 	Review    string // reviewDecision
 	Mergeable string // MERGEABLE, CONFLICTING, UNKNOWN
@@ -39,6 +40,7 @@ type ghPR struct {
 	State             string    `json:"state"`
 	IsDraft           bool      `json:"isDraft"`
 	HeadRefName       string    `json:"headRefName"`
+	HeadRefOid        string    `json:"headRefOid"`
 	BaseRefName       string    `json:"baseRefName"`
 	ReviewDecision    string    `json:"reviewDecision"`
 	Mergeable         string    `json:"mergeable"`
@@ -77,7 +79,7 @@ func gatherGitHub(dir, worktree string) ([]prRecord, GitHub) {
 
 	out, err := runGH(dir,
 		"pr", "list", "--state", "all", "--limit", "200",
-		"--json", "number,url,title,body,state,isDraft,headRefName,baseRefName,reviewDecision,mergeable,statusCheckRollup,mergedAt")
+		"--json", "number,url,title,body,state,isDraft,headRefName,headRefOid,baseRefName,reviewDecision,mergeable,statusCheckRollup,mergedAt")
 	if err != nil {
 		gh.Warnings = append(gh.Warnings, "gh pr list failed (missing auth or repo?): "+err.Error())
 		return nil, gh
@@ -112,6 +114,7 @@ func filterStackPRs(prs []ghPR, worktree string) []prRecord {
 			State:     p.State,
 			Draft:     p.IsDraft,
 			Head:      p.HeadRefName,
+			HeadSHA:   p.HeadRefOid,
 			Base:      p.BaseRefName,
 			Review:    p.ReviewDecision,
 			Mergeable: p.Mergeable,
