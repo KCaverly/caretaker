@@ -21,6 +21,7 @@ import (
 	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
+	"github.com/KCaverly/caretaker/internal/stack"
 	"github.com/KCaverly/caretaker/internal/state"
 )
 
@@ -2402,6 +2403,70 @@ func TestRemoveConfirmYDeletesBranch(t *testing.T) {
 	}
 	if branchExists(t, repoDir, branch) {
 		t.Fatalf("'y' should delete branch %q", branch)
+	}
+}
+
+func TestArchiveConfirmRemovesWorktreeAndBranch(t *testing.T) {
+	m, repoDir, branch := removeGitModel(t)
+	it := m.active[0]
+	it.view.HasBase = true
+	it.view.BaseBranch = "main"
+	m.stackArchive = func(stack.Params) (stack.ArchiveResult, error) { return stack.ArchiveResult{}, nil }
+	fingerprint, _, err := archiveWorktreeFingerprint(it.view.WT.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = m.beginArchive(archivePreflightMsg{it: it, fingerprint: fingerprint})
+	if m.screen != screenPicker || m.stackOpen || m.mode != modeConfirmArchive {
+		t.Fatal("archive confirmation should close stack and return to deck")
+	}
+	if m.confirm.options[m.confirm.cursor].key != "esc" {
+		t.Fatal("archive confirmation must default to cancel")
+	}
+	mm, cmd := m.handleConfirmArchiveKey(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	m = mm.(Model)
+	if cmd == nil {
+		t.Fatal("archive confirmation should schedule removal")
+	}
+	if msg := actionDoneFromBatch(t, cmd); msg.err != nil {
+		t.Fatal(msg.err)
+	}
+	if branchExists(t, repoDir, branch) {
+		t.Fatalf("archive should delete local branch %q", branch)
+	}
+	if _, err := os.Stat(it.view.WT.Path); !os.IsNotExist(err) {
+		t.Fatalf("archived worktree still exists: %v", err)
+	}
+}
+
+func TestArchiveWarnsAndAbortsWhenWorktreeChanges(t *testing.T) {
+	m, _, _ := removeGitModel(t)
+	it := m.active[0]
+	it.view.HasBase = true
+	it.view.BaseBranch = "main"
+	dirtyPath := filepath.Join(it.view.WT.Path, "draft.txt")
+	if err := os.WriteFile(dirtyPath, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _, err := archiveWorktreeFingerprint(it.view.WT.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.stackArchive = func(stack.Params) (stack.ArchiveResult, error) { return stack.ArchiveResult{}, nil }
+	m = m.beginArchive(archivePreflightMsg{it: it, fingerprint: fingerprint, dirty: true})
+	if !confirmHasContext(m.confirm, "uncommitted changes will be lost") || !confirmHasContext(m.confirm, "untracked files will also be lost") {
+		t.Fatalf("dirty archive warning missing: %v", m.confirm.context)
+	}
+	if err := os.WriteFile(dirtyPath, []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, cmd := m.handleConfirmArchiveKey(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	msg := actionDoneFromBatch(t, cmd)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "worktree changed") {
+		t.Fatalf("archive error = %v", msg.err)
+	}
+	if _, err := os.Stat(it.view.WT.Path); err != nil {
+		t.Fatalf("changed worktree should remain: %v", err)
 	}
 }
 

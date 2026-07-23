@@ -172,15 +172,15 @@ func TestRenderRestackPlan(t *testing.T) {
 	}
 }
 
-func TestRenderFinishPlan(t *testing.T) {
-	res := FinishResult{
+func TestRenderReusePlan(t *testing.T) {
+	res := ReuseResult{
 		Status:    StackStatus{Repo: "demo", Worktree: "feat", MainBranch: "main"},
 		Drops:     []DropAction{{Position: 1, ShortSHA: "aaaaaaa", Subject: "one", Number: 41}},
 		RebaseCmd: []string{"git", "rebase", "--onto", "origin/main", "aaaaaaa", "feat"},
 	}
-	out := RenderFinishPlan(res)
-	if !strings.Contains(out, "finish plan (dry-run)") || strings.Contains(out, "restack plan (dry-run)") {
-		t.Fatalf("finish renderer did not rename the cleanup operation:\n%s", out)
+	out := RenderReusePlan(res)
+	if !strings.Contains(out, "reuse plan (dry-run)") || strings.Contains(out, "restack plan (dry-run)") {
+		t.Fatalf("reuse renderer did not rename the cleanup operation:\n%s", out)
 	}
 }
 

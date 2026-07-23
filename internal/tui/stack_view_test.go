@@ -69,12 +69,12 @@ func TestDeckStackGlyph(t *testing.T) {
 			glyph: "⟳",
 		},
 		{
-			name: "fully landed needs finish",
+			name: "fully landed is complete",
 			st: statusWith(
-				stack.Stack{Size: 1, BaseChainOK: true, NextAction: "finish",
+				stack.Stack{Size: 1, BaseChainOK: true, NextAction: "complete",
 					Counts: map[stack.State]int{stack.StateMerged: 1}},
 				stack.Commit{State: stack.StateMerged}),
-			glyph: "⟳",
+			glyph: "✓",
 		},
 		{
 			name: "all open passing",
@@ -415,11 +415,11 @@ func TestStackPaletteRows(t *testing.T) {
 
 	// Fully landed stacks use the same cleanup pipeline under a clearer verb.
 	m.stackInfo[key] = stackEntry{status: statusWith(
-		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "finish",
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "complete",
 			Counts: map[stack.State]int{stack.StateMerged: 1}},
 		stack.Commit{State: stack.StateMerged}), fetchedAt: time.Now()}
-	if !has(m, "finish stack: repo/wt") || has(m, "restack: repo/wt") {
-		t.Error("fully landed stack should offer finish rather than restack")
+	if !has(m, "reuse worktree: repo/wt") || !has(m, "archive worktree: repo/wt") || has(m, "restack: repo/wt") {
+		t.Error("complete stack should offer archive and reuse rather than restack")
 	}
 
 	// A conflicting cascade can use the same restack pipeline: drop the landed
@@ -721,6 +721,36 @@ func TestStackDeckOpensScreen(t *testing.T) {
 	if !m.stackOpen || m.stackView.key != key || cmd == nil {
 		t.Fatalf("s should open the stack screen and fetch: open=%v key=%q cmd=%v",
 			m.stackOpen, m.stackView.key, cmd != nil)
+	}
+}
+
+func TestStackOverlayReuseConfirm(t *testing.T) {
+	m, key := stackModel()
+	m.stackInfo[key] = stackEntry{status: statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "complete", Actions: []string{"archive", "reuse"}, Counts: map[stack.State]int{stack.StateMerged: 1}},
+		stack.Commit{State: stack.StateMerged}), fetchedAt: time.Now()}
+	var calls []bool
+	m.stackReuse = func(o stack.ReuseOptions) (stack.ReuseResult, error) {
+		calls = append(calls, o.DryRun)
+		return stack.ReuseResult{Status: statusWith(stack.Stack{NextAction: "clean"}), DryRun: o.DryRun, RebaseCmd: []string{"git", "rebase"}}, nil
+	}
+	cmd := runPaletteRow(t, &m, "reuse worktree: repo/wt")
+	msg := cmd().(stackRestackMsg)
+	if !msg.reuse {
+		t.Fatal("reuse palette action should use the guarded reuse pipeline")
+	}
+	m.applyStackRestack(msg)
+	if !m.stackView.confirmReuse || !strings.Contains(m.renderStack(m.height-barHeight), "reuse plan") {
+		t.Fatal("reuse dry-run should render and arm reuse confirmation")
+	}
+	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = mm.(Model)
+	if cmd == nil {
+		t.Fatal("confirming reuse should execute it")
+	}
+	m.applyStackRestack(cmd().(stackRestackMsg))
+	if len(calls) != 2 || !calls[0] || calls[1] {
+		t.Fatalf("reuse calls = %v, want dry-run then live", calls)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/stack"
 )
 
@@ -48,6 +49,7 @@ type stackView struct {
 
 	working        bool
 	confirmRestack bool
+	confirmReuse   bool
 }
 
 // --- messages ---
@@ -74,6 +76,7 @@ type stackRestackMsg struct {
 	key    string
 	res    stack.RestackResult
 	dryRun bool
+	reuse  bool
 	err    error
 }
 
@@ -168,11 +171,18 @@ func (m Model) submitStackCmd(key string, p stack.Params) tea.Cmd {
 	}
 }
 
-func (m Model) restackStackCmd(key string, p stack.Params, dryRun bool) tea.Cmd {
+func (m Model) restackStackCmd(key string, p stack.Params, dryRun, reuse bool) tea.Cmd {
 	restack := m.stackRestack
+	reuseFn := m.stackReuse
 	return func() tea.Msg {
-		res, err := restack(stack.RestackOptions{Params: p, DryRun: dryRun})
-		return stackRestackMsg{key: key, res: res, dryRun: dryRun, err: err}
+		var res stack.RestackResult
+		var err error
+		if reuse {
+			res, err = reuseFn(stack.ReuseOptions{Params: p, DryRun: dryRun})
+		} else {
+			res, err = restack(stack.RestackOptions{Params: p, DryRun: dryRun})
+		}
+		return stackRestackMsg{key: key, res: res, dryRun: dryRun, reuse: reuse, err: err}
 	}
 }
 
@@ -182,6 +192,49 @@ func (m Model) mergeStackCmd(key string, p stack.Params) tea.Cmd {
 		res, err := merge(stack.MergeOptions{Params: p})
 		return stackMergeMsg{key: key, res: res, err: err}
 	}
+}
+
+func (m Model) archivePreflightCmd(it activeItem, p stack.Params) tea.Cmd {
+	return func() tea.Msg {
+		p.Fetch = true
+		st, err := stack.Status(p)
+		if err == nil && st.Stack.NextAction != "complete" {
+			err = fmt.Errorf("stack is no longer complete (next action: %s)", st.Stack.NextAction)
+		}
+		fingerprint := ""
+		dirty := false
+		if err == nil {
+			fingerprint, dirty, err = archiveWorktreeFingerprint(it.view.WT.Path)
+		}
+		return archivePreflightMsg{it: it, fingerprint: fingerprint, dirty: dirty, err: err}
+	}
+}
+
+func archiveWorktreeFingerprint(dir string) (string, bool, error) {
+	status, err := repo.Git(dir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return "", false, err
+	}
+	diff, err := repo.Git(dir, "diff", "--binary", "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	untracked, err := repo.Git(dir, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return "", false, err
+	}
+	var hashes strings.Builder
+	for _, path := range strings.Split(untracked, "\x00") {
+		if path == "" {
+			continue
+		}
+		hash, err := repo.Git(dir, "hash-object", "--", path)
+		if err != nil {
+			return "", false, err
+		}
+		fmt.Fprintf(&hashes, "%s\x00%s\x00", path, strings.TrimSpace(hash))
+	}
+	return status + "\x00" + diff + "\x00" + hashes.String(), status != "", nil
 }
 
 // --- overlay entry ---
@@ -208,6 +261,7 @@ func (m *Model) applyStackStatus(msg stackStatusMsg) {
 	}
 	m.stackView.working = false
 	m.stackView.confirmRestack = false
+	m.stackView.confirmReuse = false
 	m.stackView.offset = 0
 	if msg.err != nil {
 		m.stackView.status = nil
@@ -238,6 +292,7 @@ func (m *Model) applyStackSubmit(msg stackSubmitMsg) {
 	}
 	m.stackView.working = false
 	m.stackView.confirmRestack = false
+	m.stackView.confirmReuse = false
 	m.stackView.offset = 0
 	if msg.err != nil {
 		m.stackView.status = nil
@@ -266,11 +321,16 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 	}
 	m.stackView.working = false
 	m.stackView.confirmRestack = false
+	m.stackView.confirmReuse = false
 	m.stackView.offset = 0
 	switch {
 	case msg.err != nil:
 		m.stackView.status = nil
-		m.stackView.body = stackErrorBody("restack failed: "+msg.err.Error(), msg.res.Executed)
+		verb := "restack"
+		if msg.reuse {
+			verb = "reuse"
+		}
+		m.stackView.body = stackErrorBody(verb+" failed: "+msg.err.Error(), msg.res.Executed)
 	case msg.res.Nothing:
 		st := msg.res.Status
 		m.stackView.status = &st
@@ -278,8 +338,13 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 		m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 	case msg.dryRun:
 		m.stackView.status = nil
-		m.stackView.body = renderStackBody(stack.RenderRestackPlan(msg.res))
+		if msg.reuse {
+			m.stackView.body = renderStackBody(stack.RenderReusePlan(msg.res))
+		} else {
+			m.stackView.body = renderStackBody(stack.RenderRestackPlan(msg.res))
+		}
 		m.stackView.confirmRestack = true
+		m.stackView.confirmReuse = msg.reuse
 	default:
 		st := msg.res.Status
 		m.stackView.status = &st
@@ -366,7 +431,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if sv.confirmRestack && !sv.working {
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
-			return m, m.restackStackCmd(sv.key, sv.params, false)
+			return m, m.restackStackCmd(sv.key, sv.params, false, sv.confirmReuse)
 		}
 	case "r":
 		if !sv.working {
@@ -394,7 +459,20 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
-			return m, m.restackStackCmd(sv.key, sv.params, true)
+			return m, m.restackStackCmd(sv.key, sv.params, true, false)
+		}
+	case "u":
+		if sv.status != nil && !sv.working && sv.status.Stack.NextAction == "complete" {
+			m.stackView.working = true
+			m.stackView.confirmRestack = false
+			return m, m.restackStackCmd(sv.key, sv.params, true, true)
+		}
+	case "a":
+		if sv.status != nil && !sv.working && sv.status.Stack.NextAction == "complete" {
+			if it, ok := m.activeByKey(sv.key); ok {
+				m.stackView.working = true
+				return m, m.archivePreflightCmd(it, sv.params)
+			}
 		}
 	case "M":
 		if sv.status != nil && !sv.working {
@@ -605,7 +683,9 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	if stackHasSubmitWork(st) {
 		parts = append(parts, keyhint("s", "submit"))
 	}
-	if stackCanRestack(st) {
+	if st.Stack.NextAction == "complete" {
+		parts = append(parts, keyhint("a", "archive"), keyhint("u", "reuse"))
+	} else if stackCanRestack(st) {
 		parts = append(parts, keyhint("R", "restack"))
 	}
 	if stackCanMerge(st) {
@@ -800,8 +880,11 @@ func deckStackGlyph(st stack.StackStatus) (string, lipgloss.Style, bool) {
 		stk.NextAction == "resolve-conflicts" {
 		return "!", errStyle, true
 	}
-	if stk.NextAction == "restack" || stk.NextAction == "finish" {
+	if stk.NextAction == "restack" {
 		return "⟳", errStyle, true
+	}
+	if stk.NextAction == "complete" {
+		return "✓", aheadStyle, true
 	}
 
 	anyPending, allOpen, allPassing := false, true, true
@@ -850,6 +933,9 @@ func stackDetailSegment(st stack.StackStatus) string {
 	if stk.Size == 0 || stk.Counts[stack.StateUnsubmitted] == stk.Size {
 		return ""
 	}
+	if stk.NextAction == "complete" {
+		return "stack complete"
+	}
 	if stk.Size == 1 && len(st.Commits) == 1 {
 		c := st.Commits[0]
 		if c.PR != nil {
@@ -876,16 +962,14 @@ func stackActionLabel(action string) string {
 		return "waiting on checks"
 	case "restack":
 		return "restack needed"
-	case "finish":
-		return "ready to finish"
+	case "complete":
+		return "stack complete"
 	case "resolve-conflicts":
 		return "resolve conflicts"
 	case "submit":
 		return "submit needed"
 	case "escalate":
 		return "needs attention"
-	case "archive":
-		return "ready to archive"
 	default:
 		return action
 	}
@@ -919,7 +1003,7 @@ func stackHasSubmitWork(st stack.StackStatus) bool {
 // and rebase away. A conflict is restackable only in that cascade shape; an
 // ordinary conflicting PR has no landed prefix, so restack would be a no-op.
 func stackCanRestack(st stack.StackStatus) bool {
-	if st.Stack.NextAction == "restack" || st.Stack.NextAction == "finish" {
+	if st.Stack.NextAction == "restack" || st.Stack.NextAction == "complete" {
 		return true
 	}
 	return st.Stack.NextAction == "resolve-conflicts" &&
@@ -942,8 +1026,8 @@ func stackCanMerge(st stack.StackStatus) bool {
 // stackRestackReason is the palette hint on the "restack" row: how many landed
 // commits sit below the survivors.
 func stackRestackReason(st stack.StackStatus) string {
-	if st.Stack.NextAction == "finish" {
-		return "all PRs landed"
+	if st.Stack.NextAction == "complete" {
+		return "keep worktree"
 	}
 	if n := st.Stack.Counts[stack.StateMerged]; n > 0 {
 		return fmt.Sprintf("%d landed below", n)

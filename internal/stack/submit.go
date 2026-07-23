@@ -34,6 +34,7 @@ type SubmitResult struct {
 // source of truth the executor walks and the dry-run prints. An empty Plan means
 // the remote already matches the local stack.
 type Plan struct {
+	Cleanup   []DropAction     `json:"cleanup,omitempty"`
 	Assigns   []AssignAction   `json:"assigns,omitempty"`
 	Pushes    []PushAction     `json:"pushes,omitempty"`
 	Creates   []CreateAction   `json:"creates,omitempty"`
@@ -94,7 +95,7 @@ type BodyAction struct {
 
 // IsEmpty reports whether the plan has no actions — the fully-converged case.
 func (p Plan) IsEmpty() bool {
-	return len(p.Assigns) == 0 && len(p.Pushes) == 0 && len(p.Creates) == 0 &&
+	return len(p.Cleanup) == 0 && len(p.Assigns) == 0 && len(p.Pushes) == 0 && len(p.Creates) == 0 &&
 		len(p.Retargets) == 0 && len(p.Retitles) == 0 && len(p.Bodies) == 0
 }
 
@@ -271,6 +272,26 @@ func Submit(o SubmitOptions) (SubmitResult, error) {
 	if len(st.Commits) == 0 {
 		res.Nothing = true
 		return res, nil
+	}
+
+	// A user who starts new work above a fully landed prefix has chosen to keep
+	// using this worktree. Treat submit as the intent: reuse the branch first,
+	// then let Restack's convergence call submit again on the cleaned history.
+	// The recursive call terminates because the landed prefix is gone.
+	hasMerged := false
+	for _, c := range st.Commits {
+		if c.State == StateMerged {
+			hasMerged = true
+			break
+		}
+	}
+	if hasMerged && st.Stack.NextAction == "submit" {
+		rr, err := Restack(RestackOptions{Params: o.Params, DryRun: o.DryRun})
+		res.Status = rr.Status
+		res.Plan = rr.Plan
+		res.Plan.Cleanup = rr.Drops
+		res.Executed = append(res.Executed, rr.Executed...)
+		return res, err
 	}
 
 	// 5/6-9 planning. Guards live here, so they also gate a dry-run.

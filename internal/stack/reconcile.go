@@ -28,21 +28,11 @@ func reconcile(worktree, mainBranch string, commits []LocalCommit, remotes map[s
 		Counts:      countStates(out),
 		Orphans:     findOrphans(out, worktree, prs),
 	}
-	stk.NextAction = nextAction(out, stk, mainBranch, anyMergedPR(prs))
-	return stk, out
-}
-
-// anyMergedPR reports whether any of the stack's (already namespace-filtered) PRs
-// is merged. It is the archive signal for an empty stack, where no *commit* is
-// merged (they've all been restacked away) but a landed PR still records that the
-// workflow finished here.
-func anyMergedPR(prs []prRecord) bool {
-	for _, p := range prs {
-		if p.State == "MERGED" {
-			return true
-		}
+	stk.NextAction = nextAction(out, stk, mainBranch)
+	if stk.NextAction == "complete" {
+		stk.Actions = []string{"archive", "reuse"}
 	}
-	return false
+	return stk, out
 }
 
 // resolveCommit classifies a single local commit into its State and attaches the
@@ -232,9 +222,8 @@ func countStates(commits []Commit) map[State]int {
 //     base chain, with no landed-local commit involved
 //  6. fix-ci   — bottom open PR failing (no landed-local commits)
 //  7. wait     — bottom open PR pending, or passing but review outstanding
-//  8. archive  — empty stack with a landed ct/<wt>/ PR
-//  9. clean
-func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) string {
+//  8. clean    — no local stack remains
+func nextAction(commits []Commit, stk Stack, mainBranch string) string {
 	var hasClosed, hasDup, hasMerged, hasSubmit bool
 	for _, c := range commits {
 		switch c.State {
@@ -295,7 +284,10 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 			}
 		}
 		if allLanded {
-			return "finish"
+			return "complete"
+		}
+		if hasSubmit {
+			return "submit"
 		}
 		// No open PR above the landed prefix, but local work remains stranded
 		// above it. Restack drops the prefix and submits the survivors.
@@ -325,10 +317,8 @@ func nextAction(commits []Commit, stk Stack, mainBranch string, landed bool) str
 		}
 	}
 
-	// 8/9. No commits and no open PRs: archive if something landed here, else clean.
-	if len(commits) == 0 && landed {
-		return "archive"
-	}
+	// No local commits means this worktree is reusable. Historical merged PRs
+	// under the same namespace do not make it archival after an explicit reuse.
 	return "clean"
 }
 
