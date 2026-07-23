@@ -693,12 +693,12 @@ func TestBoardOpensFromPicker(t *testing.T) {
 	if len(nav) != 1 || !rows[nav[0]].isNew {
 		t.Fatalf("empty board should hold only the new-agent row, got rows=%d nav=%d", len(rows), len(nav))
 	}
-	// Inside an open board ctrl+n is list-down: it keeps the board open. The
+	// An unrelated control key is swallowed while the board is open. The
 	// primary palette key closes.
 	mm, _ = m.handleKey(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
-		t.Fatal("ctrl+n inside the board should navigate, not close it")
+		t.Fatal("ctrl+n inside the board should be ignored, not close it")
 	}
 	mm, _ = m.handleKey(altKey('a'))
 	m = mm.(Model)
@@ -2940,10 +2940,7 @@ func TestHandleCreateKeyValidation(t *testing.T) {
 	}
 }
 
-// TestListNavDialect: the shared list-nav dialect — ctrl+p (up) / ctrl+n (down)
-// — moves the cursor in the ACTIVE and NEW deck lists (called directly, since at
-// the default binding ctrl+n is intercepted upstream to open the board).
-func TestListNavDialect(t *testing.T) {
+func TestCtrlNPDoNotNavigateDeckLists(t *testing.T) {
 	m := sampleModel()
 	m.focus = focusActive
 	if len(m.active) < 2 {
@@ -2952,13 +2949,13 @@ func TestListNavDialect(t *testing.T) {
 	m.activeCursor = 0
 	mm, _ := m.handleActiveKey(ctrlKey('n')) // down
 	m = mm.(Model)
-	if m.activeCursor != 1 {
-		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
+	if m.activeCursor != 0 {
+		t.Fatalf("ctrl+n should not move the ACTIVE cursor, got %d", m.activeCursor)
 	}
 	mm, _ = m.handleActiveKey(ctrlKey('p')) // up
 	m = mm.(Model)
 	if m.activeCursor != 0 {
-		t.Fatalf("ctrl+p should move the ACTIVE cursor up, got %d", m.activeCursor)
+		t.Fatalf("ctrl+p should not move the ACTIVE cursor, got %d", m.activeCursor)
 	}
 
 	m2 := sampleModel() // focusNew, filter focused
@@ -2968,19 +2965,17 @@ func TestListNavDialect(t *testing.T) {
 	m2.newCursor = 0
 	mm, _ = m2.handleNewKey(ctrlKey('n'))
 	m2 = mm.(Model)
-	if m2.newCursor != 1 {
-		t.Fatalf("ctrl+n should move the NEW cursor down, got %d", m2.newCursor)
+	if m2.newCursor != 0 {
+		t.Fatalf("ctrl+n should not move the NEW cursor, got %d", m2.newCursor)
 	}
 	mm, _ = m2.handleNewKey(ctrlKey('p'))
 	m2 = mm.(Model)
 	if m2.newCursor != 0 {
-		t.Fatalf("ctrl+p should move the NEW cursor up, got %d", m2.newCursor)
+		t.Fatalf("ctrl+p should not move the NEW cursor, got %d", m2.newCursor)
 	}
 }
 
-// TestDeckCtrlNMovesCursor: ctrl+n in the deck is a pure list-down key — it
-// moves the ACTIVE cursor and never opens the agent board.
-func TestDeckCtrlNMovesCursor(t *testing.T) {
+func TestDeckCtrlNDoesNotMoveCursor(t *testing.T) {
 	m := sampleModel()
 	m.focus = focusActive
 	if len(m.active) < 2 {
@@ -2992,14 +2987,12 @@ func TestDeckCtrlNMovesCursor(t *testing.T) {
 	if m.boardOpen {
 		t.Fatal("ctrl+n in the deck must not open the board")
 	}
-	if m.activeCursor != 1 {
-		t.Fatalf("ctrl+n should move the ACTIVE cursor down, got %d", m.activeCursor)
+	if m.activeCursor != 0 {
+		t.Fatalf("ctrl+n should not move the ACTIVE cursor, got %d", m.activeCursor)
 	}
 }
 
-// TestBoardCtrlNNavigates: inside an open board ctrl+n/ctrl+p navigate and do not
-// close it, while ctrl+a and esc still close.
-func TestBoardCtrlNNavigates(t *testing.T) {
+func TestBoardCtrlNPDoNotNavigate(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.ActiveAgent = 0
 	mm, _ := m.openBoard()
@@ -3009,15 +3002,15 @@ func TestBoardCtrlNNavigates(t *testing.T) {
 	mm, _ = m.handleBoard(ctrlKey('n'))
 	m = mm.(Model)
 	if !m.boardOpen {
-		t.Fatal("ctrl+n should not close the board (it navigates instead)")
+		t.Fatal("ctrl+n should not close the board")
 	}
-	if m.boardCursor != start+1 {
-		t.Fatalf("ctrl+n should move the board cursor down, got %d want %d", m.boardCursor, start+1)
+	if m.boardCursor != start {
+		t.Fatalf("ctrl+n should not move the board cursor, got %d want %d", m.boardCursor, start)
 	}
 	mm, _ = m.handleBoard(ctrlKey('p'))
 	m = mm.(Model)
 	if m.boardCursor != start {
-		t.Fatalf("ctrl+p should move the board cursor back up, got %d", m.boardCursor)
+		t.Fatalf("ctrl+p should not move the board cursor, got %d", m.boardCursor)
 	}
 
 	// alt+a (palette) still closes.
@@ -3280,12 +3273,12 @@ func TestDiffScrollClamping(t *testing.T) {
 	}
 	mm, _ = m.handleDiff(ctrlKey('n'))
 	m = mm.(Model)
-	if m.diffView.offset != 1 {
-		t.Fatalf("ctrl+n should scroll down by one, got %d", m.diffView.offset)
+	if m.diffView.offset != 0 {
+		t.Fatalf("ctrl+n should not scroll, got %d", m.diffView.offset)
 	}
 	mm, _ = m.handleDiff(ctrlKey('p'))
 	if got := mm.(Model).diffView.offset; got != 0 {
-		t.Fatalf("ctrl+p should scroll up by one, got %d", got)
+		t.Fatalf("ctrl+p should not scroll, got %d", got)
 	}
 }
 

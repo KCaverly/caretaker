@@ -690,12 +690,12 @@ func TestStackOverlayScroll(t *testing.T) {
 	}
 	mm, _ = m.handleStack(ctrlKey('n'))
 	m = mm.(Model)
-	if m.stackView.offset != 2 {
-		t.Fatalf("ctrl+n should scroll by one, got %d", m.stackView.offset)
+	if m.stackView.offset != 1 {
+		t.Fatalf("ctrl+n should not scroll, got %d", m.stackView.offset)
 	}
 	mm, _ = m.handleStack(ctrlKey('p'))
 	if got := mm.(Model).stackView.offset; got != 1 {
-		t.Fatalf("ctrl+p should scroll up by one, got %d", got)
+		t.Fatalf("ctrl+p should not scroll, got %d", got)
 	}
 }
 
@@ -791,12 +791,12 @@ func TestStackScreenNav(t *testing.T) {
 	m, _ = stackNavModel(t)
 	mm, _ = m.handleStack(ctrlKey('n'))
 	m = mm.(Model)
-	if m.stackView.cursor != 1 {
-		t.Fatalf("ctrl+n should move the cursor to 1, got %d", m.stackView.cursor)
+	if m.stackView.cursor != 0 {
+		t.Fatalf("ctrl+n should not move the cursor, got %d", m.stackView.cursor)
 	}
 	mm, _ = m.handleStack(ctrlKey('p'))
 	if got := mm.(Model).stackView.cursor; got != 0 {
-		t.Fatalf("ctrl+p should move the cursor to 0, got %d", got)
+		t.Fatalf("ctrl+p should not move the cursor, got %d", got)
 	}
 
 	// s submits (submit-able work present): working set, command issued.
