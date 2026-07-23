@@ -39,6 +39,20 @@ type Config struct {
 	Plasma Plasma `toml:"plasma"`
 	// Stack configures stacked-PR workflow behavior.
 	Stack Stack `toml:"stack"`
+	// Display configures terminal rendering choices.
+	Display Display `toml:"display"`
+}
+
+const (
+	IconsNerd  = "nerd"
+	IconsText  = "text"
+	IconsASCII = "ascii"
+)
+
+// Display configures terminal rendering choices.
+type Display struct {
+	// Icons selects persistent navigation and pane symbols: nerd, text, or ascii.
+	Icons string `toml:"icons"`
 }
 
 // Stack configures stacked-PR workflow behavior.
@@ -179,7 +193,8 @@ func Default() Config {
 			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
 			Usage: "alt+u", CommandPalette: "alt+p",
 		},
-		Usage: Usage{Threshold: 50},
+		Usage:   Usage{Threshold: 50},
+		Display: Display{Icons: IconsNerd},
 		Plasma: Plasma{
 			Pattern: "classic", Palette: "aurora", Charset: "dots",
 			Speed: 0.3, Width: 40,
@@ -286,6 +301,11 @@ func (c *Config) validate() error {
 		return err
 	}
 	c.Root = abs
+	switch c.Display.Icons {
+	case IconsNerd, IconsText, IconsASCII:
+	default:
+		return fmt.Errorf("config `display.icons` must be %q, %q, or %q", IconsNerd, IconsText, IconsASCII)
+	}
 	if !c.Agents.Default.Valid() {
 		return fmt.Errorf("config `agents.default` must be %q or %q", agent.Claude, agent.Codex)
 	}

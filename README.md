@@ -122,6 +122,11 @@ width   = 40        # percent of the terminal width; 0 disables the panel
 # confirmation; it is not GitHub's "auto-merge when checks pass" feature.
 [stack]
 auto_merge = false
+
+# Persistent navigation and pane symbols. `nerd` preserves the default icon
+# set; `text` uses labels; `ascii` uses stable single-cell characters.
+[display]
+icons = "nerd" # nerd | text | ascii
 ```
 
 The old top-level `agent = "claude"` setting is still accepted as a Claude command override.

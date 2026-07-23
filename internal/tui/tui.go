@@ -286,7 +286,8 @@ type Model struct {
 
 	// keys are the reserved keystrokes (not forwarded to embedded sessions),
 	// fully defaulted by config.Load before they reach here.
-	keys config.Keys
+	keys     config.Keys
+	iconMode string
 
 	screen     screen
 	current    *workspaceRef
@@ -516,6 +517,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 	return Model{
 		ctrl: ctrl, mgr: mgr, state: state.Load(),
 		keys:           ctrl.Keys(),
+		iconMode:       ctrl.DisplayIcons(),
 		usageThreshold: ctrl.UsageThreshold(),
 		plasma:         plasmaField, plasmaWidthPct: pc.Width,
 		filter: filter, nameInput: name, rootInput: rootInput,
