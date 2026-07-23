@@ -61,6 +61,11 @@ func RenderPlan(st StackStatus, plan Plan) string {
 	for _, a := range plan.Assigns {
 		fmt.Fprintf(&b, "  would assign id   commit %d %s %q\n", a.Position, a.ShortSHA, a.Subject)
 	}
+	for _, r := range plan.Retargets {
+		if !r.AfterPush {
+			fmt.Fprintf(&b, "  would retarget PR #%d  %s -> %s (before pushes)\n", r.Number, r.OldBase, r.NewBase)
+		}
+	}
 	for _, p := range plan.Pushes {
 		verb := "force-update"
 		if p.Create {
@@ -72,7 +77,9 @@ func RenderPlan(st StackStatus, plan Plan) string {
 		fmt.Fprintf(&b, "  would create PR   head %s base %s title %q\n", c.Head, c.Base, c.Title)
 	}
 	for _, r := range plan.Retargets {
-		fmt.Fprintf(&b, "  would retarget PR #%d  %s -> %s\n", r.Number, r.OldBase, r.NewBase)
+		if r.AfterPush {
+			fmt.Fprintf(&b, "  would retarget PR #%d  %s -> %s (after pushes)\n", r.Number, r.OldBase, r.NewBase)
+		}
 	}
 	for _, r := range plan.Retitles {
 		fmt.Fprintf(&b, "  would retitle PR  #%d  %q -> %q\n", r.Number, r.OldTitle, r.NewTitle)
