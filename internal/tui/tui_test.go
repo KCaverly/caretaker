@@ -1634,6 +1634,16 @@ func TestJumpAttentionFocusesWaitingAgent(t *testing.T) {
 	if m2.current == nil || m2.current.key != "r/b" {
 		t.Fatalf("jump should switch to r/b, got %+v", m2.current)
 	}
+	mm, _ = m2.handleKey(altKey('b'))
+	back := mm.(Model)
+	if back.current == nil || back.current.key != "r/a" || back.screen != screenEditor {
+		t.Fatalf("return should restore r/a's editor, got current=%+v screen=%v", back.current, back.screen)
+	}
+	mm, _ = back.handleKey(altKey('b'))
+	toggled := mm.(Model)
+	if toggled.current == nil || toggled.current.key != "r/b" || toggled.screen != screenAgent {
+		t.Fatalf("return should toggle back to the interrupted agent, got current=%+v screen=%v", toggled.current, toggled.screen)
+	}
 }
 
 // TestJumpAttentionWaitingBeatsDone: with one done and one waiting agent, the
@@ -1657,6 +1667,61 @@ func TestJumpAttentionWaitingBeatsDone(t *testing.T) {
 	if m2.screen != screenAgent || m2.current.ws.ActiveAgent != 1 {
 		t.Fatalf("waiting agent (index 1) should win the first jump, got screen=%v active=%d",
 			m2.screen, m2.current.ws.ActiveAgent)
+	}
+	mm, _ = m2.returnToPrevious()
+	back := mm.(Model)
+	if back.screen != screenEditor || back.current.ws.ActiveAgent != 0 {
+		t.Fatalf("return should restore the prior screen and agent, got screen=%v active=%d",
+			back.screen, back.current.ws.ActiveAgent)
+	}
+}
+
+func TestReturnFallsBackToDeckWhenWorktreeDisappears(t *testing.T) {
+	m := modelWithAgents(1)
+	m.returnLocation = &returnLocation{repo: "gone", worktree: "wt", key: "gone/wt", path: "/gone", screen: screenAgent}
+	mm, _ := m.returnToPrevious()
+	if got := mm.(Model).screen; got != screenPicker {
+		t.Fatalf("missing return target should fall back to the deck, got %v", got)
+	}
+}
+
+func TestReturnTracksSessionIdentityAcrossIndexChanges(t *testing.T) {
+	original, target := &session.Session{}, &session.Session{}
+	if got := restoredSessionIndex([]*session.Session{target, original}, target, 1); got != 0 {
+		t.Fatalf("return should follow the original session identity, got index %d", got)
+	}
+	if got := restoredSessionIndex([]*session.Session{original}, target, 4); got != 0 {
+		t.Fatalf("missing session should clamp to the nearest valid index, got %d", got)
+	}
+}
+
+func TestReturnDoesNotLeakThroughHelp(t *testing.T) {
+	m := modelWithAgents(1)
+	m.screen = screenTerminal
+	m.returnLocation = &returnLocation{repo: "r", worktree: "w", key: "r/w", path: "/r/w", screen: screenEditor}
+	m.helpOpen = true
+	mm, _ := m.handleKey(altKey('b'))
+	got := mm.(Model)
+	if got.helpOpen || got.screen != screenTerminal {
+		t.Fatalf("return key should only close help, got help=%v screen=%v", got.helpOpen, got.screen)
+	}
+}
+
+func TestReturnIsDiscoverableWhenAvailable(t *testing.T) {
+	m := modelWithAgents(1)
+	m.returnLocation = m.currentReturnLocation()
+	found := false
+	for _, cmd := range m.paletteCommands() {
+		if cmd.title == "return to previous location" && cmd.hint == m.keys.Back {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("available return action should appear in the command palette with its live key")
+	}
+	if out := m.sessionFooter(); !strings.Contains(out, m.keys.Back) || !strings.Contains(out, "return") {
+		t.Fatalf("session footer should expose the available return action:\n%s", out)
 	}
 }
 

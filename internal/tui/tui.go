@@ -76,6 +76,15 @@ type workspaceRef struct {
 	ws                        *session.Workspace
 }
 
+// returnLocation is the stable work context restored by the global Return
+// action. It deliberately excludes overlays and list cursors.
+type returnLocation struct {
+	repo, worktree, key, path string
+	screen                    screen
+	agent, term               int
+	agentSession, termSession *session.Session
+}
+
 type focus int
 
 const (
@@ -379,6 +388,10 @@ type Model struct {
 	// stored unread markers (done) keyed by agent pid; waiting badges are
 	// derived live from agentStatus and never stored here
 	attention map[int]attnEntry
+
+	// returnLocation is a one-level navigation toggle, captured before an
+	// attention jump or cross-worktree activation.
+	returnLocation *returnLocation
 
 	// removed tombstones pids of agents ct has deleted, mapping each to the
 	// StartedAt it carried at removal (0 if never polled). The Claude status
@@ -1930,10 +1943,20 @@ func (m Model) jumpAttention() (tea.Model, tea.Cmd) {
 	// Land on a bare agent screen: clear any overlay open at the call site so the
 	// jump doesn't leave one stacked over the destination. focusBoardAgent resets
 	// boardOpen itself; the invocation from handleBoard relies on that.
+	origin := m.currentReturnLocation()
 	m.helpOpen = false
 	m.usageOpen = false
 	m.diffOpen = false
-	return m.focusBoardAgent(candidates[target])
+	mm, cmd := m.focusBoardAgent(candidates[target])
+	model := mm.(Model)
+	if origin != nil {
+		destination := model.currentReturnLocation()
+		if destination != nil && (origin.key != destination.key || origin.screen != destination.screen ||
+			origin.agent != destination.agent || origin.term != destination.term) {
+			model.returnLocation = origin
+		}
+	}
+	return model, cmd
 }
 
 // --- command palette ---
@@ -2107,6 +2130,11 @@ func (m Model) paletteCommands() []paletteCmd {
 				return m.returnToDeck()
 			}})
 		}
+	}
+	if m.returnLocation != nil {
+		cmds = append(cmds, paletteCmd{title: "return to previous location", hint: m.keys.Back, run: func(m Model) (tea.Model, tea.Cmd) {
+			return m.returnToPrevious()
+		}})
 	}
 
 	// 4. Agents — the attention jump (only while something is pending, mirroring
@@ -2511,6 +2539,17 @@ func randomAgentTitle() string {
 // starts one fresh claude session; reopening resumes the agent pool.
 func (m Model) activate(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
 	key := repoName + "/" + wtName
+	origin := m.currentReturnLocation()
+	mm, cmd := m.activateWithoutHistory(repoName, wtName, dir)
+	model := mm.(Model)
+	if origin != nil && origin.key != key && model.current != nil && model.current.key == key {
+		model.returnLocation = origin
+	}
+	return model, cmd
+}
+
+func (m Model) activateWithoutHistory(repoName, wtName, dir string) (tea.Model, tea.Cmd) {
+	key := repoName + "/" + wtName
 	w, h := m.sessionSize()
 	wasActive := m.mgr.Has(key)
 	var specs []session.Spec
@@ -2773,6 +2812,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == m.keys.Palette {
 		return m.openBoard()
 	}
+	if msg.String() == m.keys.Back {
+		return m.returnToPrevious()
+	}
 	// The attention-jump chord fires from session screens and from the picker.
 	// It sits below the modal overlays handled above (palette/diff/usage/board),
 	// so those keep their precedence. jumpAttention is a no-op when nothing is
@@ -2811,6 +2853,85 @@ func (m Model) gotoScreen(s screen) (tea.Model, tea.Cmd) {
 		m.clearWorkspaceAttention()
 	}
 	return m, nil
+}
+
+func (m Model) currentReturnLocation() *returnLocation {
+	if m.current == nil {
+		return nil
+	}
+	loc := &returnLocation{
+		repo: m.current.repo, worktree: m.current.worktree, key: m.current.key,
+		path: m.current.path, screen: m.screen,
+	}
+	if m.current.ws != nil {
+		loc.agent = m.current.ws.ActiveAgent
+		loc.term = m.current.ws.ActiveTerm
+		loc.agentSession = m.current.ws.ActiveAgentSession()
+		loc.termSession = m.current.ws.ActiveTermSession()
+	}
+	return loc
+}
+
+// returnToPrevious restores the last captured work context and swaps it with
+// the current one, yielding a predictable one-level toggle.
+func (m Model) returnToPrevious() (tea.Model, tea.Cmd) {
+	if m.returnLocation == nil {
+		return m, nil
+	}
+	target := *m.returnLocation
+	from := m.currentReturnLocation()
+	m.helpOpen, m.boardOpen, m.usageOpen, m.paletteOpen = false, false, false, false
+	m.diffOpen, m.stackOpen = false, false
+
+	if target.screen == screenPicker {
+		m.screen = screenPicker
+		if len(m.active) > 0 {
+			m.focus = focusActive
+		}
+		m.returnLocation = from
+		return m, m.loadCmd()
+	}
+
+	if target.key != m.homeWSKey {
+		if _, ok := m.activeByKey(target.key); !ok {
+			m.screen = screenPicker
+			if len(m.active) > 0 {
+				m.focus = focusActive
+			}
+			m.returnLocation = from
+			return m, m.loadCmd()
+		}
+	}
+	mm, cmd := m.activateWithoutHistory(target.repo, target.worktree, target.path)
+	model := mm.(Model)
+	if model.current == nil || model.current.key != target.key || model.current.ws == nil {
+		model.screen = screenPicker
+		model.returnLocation = from
+		return model, cmd
+	}
+	model.screen = target.screen
+	model.current.ws.ActiveAgent = restoredSessionIndex(model.current.ws.Agents, target.agentSession, target.agent)
+	model.current.ws.ActiveTerm = restoredSessionIndex(model.current.ws.Terms, target.termSession, target.term)
+	if model.screen == screenAgent && len(model.current.ws.Agents) == 0 {
+		model.screen = screenEditor
+	}
+	if model.screen == screenTerminal && len(model.current.ws.Terms) == 0 {
+		model.screen = screenEditor
+	}
+	if model.screen == screenAgent {
+		model.clearWorkspaceAttention()
+	}
+	model.returnLocation = from
+	return model, tea.Batch(cmd, model.saveAgents(target.key))
+}
+
+func restoredSessionIndex(sessions []*session.Session, target *session.Session, fallback int) int {
+	for i, candidate := range sessions {
+		if target != nil && candidate == target {
+			return i
+		}
+	}
+	return clamp(fallback, 0, max(0, len(sessions)-1))
 }
 
 // isReservedActionKey reports whether s is one of ct's own reserved keys that
