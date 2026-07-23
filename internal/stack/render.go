@@ -57,6 +57,19 @@ func RenderRepairPlan(res RepairResult) string {
 		res.Status.Repo, res.Status.Worktree, p.FormerBase, p.FormerBaseSHA, p.PR, p.PR, p.FormerBase, p.NewBase, p.FormerBase)
 }
 
+func RenderReorderPlan(res ReorderResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s/%s  reorder plan%s\n", res.Status.Repo, res.Status.Worktree, map[bool]string{true: " (dry-run)"}[res.DryRun])
+	for _, e := range res.Plan.Entries {
+		marker := " "
+		if e.OldPosition != e.NewPosition {
+			marker = "→"
+		}
+		fmt.Fprintf(&b, "  %s %d -> %d  %s %s\n", marker, e.OldPosition, e.NewPosition, e.ShortSHA, e.Subject)
+	}
+	return b.String()
+}
+
 // RenderPlan returns a human-readable dry-run plan: one line per action, grouped
 // by kind, bottom-first within each group. An empty plan reports that the remote
 // already matches the local stack.
