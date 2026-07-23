@@ -70,10 +70,11 @@ type CreateAction struct {
 // RetargetAction is an existing PR whose base branch will change to keep the
 // chain well-formed.
 type RetargetAction struct {
-	Position int    `json:"position"`
-	Number   int    `json:"number"`
-	OldBase  string `json:"old_base"`
-	NewBase  string `json:"new_base"`
+	Position  int    `json:"position"`
+	Number    int    `json:"number"`
+	OldBase   string `json:"old_base"`
+	NewBase   string `json:"new_base"`
+	AfterPush bool   `json:"after_push,omitempty"`
 }
 
 // RetitleAction is an existing PR whose title will follow a changed commit
@@ -200,8 +201,9 @@ func planSubmit(st StackStatus, prs []prRecord) (Plan, error) {
 		}
 
 		if c.PR.Base != wantBase {
+			afterPush := i > 0 && st.Commits[i-1].RemoteBranch == nil
 			plan.Retargets = append(plan.Retargets, RetargetAction{
-				Position: c.Position, Number: c.PR.Number, OldBase: c.PR.Base, NewBase: wantBase,
+				Position: c.Position, Number: c.PR.Number, OldBase: c.PR.Base, NewBase: wantBase, AfterPush: afterPush,
 			})
 		}
 		if old := titleByNum[c.PR.Number]; old != c.Subject {
@@ -311,7 +313,25 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		return res, err
 	}
 
-	// 7. Push every out-of-sync branch. Computed from fresh git data (not the
+	// 7. Move existing PRs onto their desired, already-existing bases before
+	// rewriting remote branches. Desired bases are planned bottom-first, which
+	// breaks any old ordering cycle before establishing a new upper edge. A base
+	// supplied by a brand-new predecessor is explicitly deferred until its push.
+	plan2, err := planSubmit(st2, prs2)
+	if err != nil {
+		return res, err
+	}
+	for _, rt := range plan2.Retargets {
+		if rt.AfterPush {
+			continue
+		}
+		if err := retargetAndVerify(dir, st2.Worktree, rt); err != nil {
+			return res, err
+		}
+		res.Executed = append(res.Executed, fmt.Sprintf("retargeted PR #%d -> %s", rt.Number, rt.NewBase))
+	}
+
+	// 8. Push every out-of-sync branch. Computed from fresh git data (not the
 	// plan) because force-with-lease needs the exact remote tip.
 	commits2, err := localCommits(dir, st2.MainBranch)
 	if err != nil {
@@ -332,11 +352,8 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		res.Executed = append(res.Executed, fmt.Sprintf("%s branch %s", verb, pc.Branch))
 	}
 
-	// 8. Create missing PRs, retarget wrong bases, retitle changed subjects.
-	plan2, err := planSubmit(st2, prs2)
-	if err != nil {
-		return res, err
-	}
+	// 9. Create missing PRs, apply bases that depended on newly-pushed branches,
+	// and retitle changed subjects.
 	for _, cr := range plan2.Creates {
 		body, err := prCreateBody(dir, st2, cr.Position)
 		if err != nil {
@@ -348,8 +365,11 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		res.Executed = append(res.Executed, fmt.Sprintf("created PR head %s base %s", cr.Head, cr.Base))
 	}
 	for _, rt := range plan2.Retargets {
-		if err := ghEditBase(dir, rt.Number, rt.NewBase); err != nil {
-			return res, fmt.Errorf("retargeting PR #%d: %w", rt.Number, err)
+		if !rt.AfterPush {
+			continue
+		}
+		if err := retargetAndVerify(dir, st2.Worktree, rt); err != nil {
+			return res, err
 		}
 		res.Executed = append(res.Executed, fmt.Sprintf("retargeted PR #%d -> %s", rt.Number, rt.NewBase))
 	}
@@ -360,11 +380,14 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		res.Executed = append(res.Executed, fmt.Sprintf("retitled PR #%d", rt.Number))
 	}
 
-	// 9. Nav table: re-gather so every PR (including just-created ones) has a
+	// 10. Nav table: re-gather so every PR (including just-created ones) has a
 	// number, then splice the region into each body and edit only what changed.
 	st3, prs3, err := gatherStatus(p)
 	if err != nil {
 		return res, err
+	}
+	if !st3.Stack.BaseChainOK {
+		return res, fmt.Errorf("final PR base chain is not converged; rerun stack submit after inspecting GitHub")
 	}
 	bodyByNum := map[int]string{}
 	for _, r := range prs3 {
@@ -393,6 +416,20 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 	stFinal.Fetched = true
 	res.Status = stFinal
 	return res, nil
+}
+
+func retargetAndVerify(dir, worktree string, rt RetargetAction) error {
+	if err := ghEditBase(dir, rt.Number, rt.NewBase); err != nil {
+		return fmt.Errorf("retargeting PR #%d: %w", rt.Number, err)
+	}
+	prs, gh := gatherGitHub(dir, worktree)
+	if !gh.Available {
+		return fmt.Errorf("verifying retarget of PR #%d: %s", rt.Number, strings.Join(gh.Warnings, "; "))
+	}
+	if !prOpenOnBase(prs, rt.Number, rt.NewBase) {
+		return fmt.Errorf("PR #%d was not open on %s after retargeting", rt.Number, rt.NewBase)
+	}
+	return nil
 }
 
 // pushCmd is a single branch push the executor will run: force-with-lease when

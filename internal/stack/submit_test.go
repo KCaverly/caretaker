@@ -149,6 +149,9 @@ func TestPlanSubmitRewriteForcesUpperPush(t *testing.T) {
 	if forced.Create {
 		t.Errorf("rewritten open branch should force-update, not create: %+v", forced)
 	}
+	if len(plan.Retargets) != 1 || !plan.Retargets[0].AfterPush {
+		t.Fatalf("top PR should defer its base until the new predecessor branch is pushed: %+v", plan.Retargets)
+	}
 }
 
 func TestPlanSubmitRetargetRetitleBody(t *testing.T) {
@@ -175,6 +178,9 @@ func TestPlanSubmitRetargetRetitleBody(t *testing.T) {
 	if len(plan.Retargets) != 1 || plan.Retargets[0].Number != 2 ||
 		plan.Retargets[0].NewBase != br("aaaaaaaa") || plan.Retargets[0].OldBase != main {
 		t.Errorf("retargets = %+v", plan.Retargets)
+	}
+	if plan.Retargets[0].AfterPush {
+		t.Error("existing predecessor branch should allow the retarget before pushes")
 	}
 	if len(plan.Retitles) != 1 || plan.Retitles[0].Number != 2 ||
 		plan.Retitles[0].NewTitle != "new subject" || plan.Retitles[0].OldTitle != "old subject" {
