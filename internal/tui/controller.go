@@ -528,8 +528,27 @@ func (c *Controller) transcriptExists(id string) bool {
 		}
 		dir = filepath.Join(home, ".claude", "projects")
 	}
-	matches, _ := filepath.Glob(filepath.Join(dir, "*", id+".jsonl"))
-	return len(matches) > 0
+	// A hand-rolled scan rather than filepath.Glob("*/id.jsonl"): Glob reads the
+	// projects dir, then Lstats id.jsonl in every project subdir AND sorts the
+	// result — it never stops at the first hit. Here we stat each subdir's
+	// candidate and return on the first match, so a resumable agent (the common
+	// case) usually settles in a handful of stats instead of a full scan. This
+	// runs once per persisted agent on the activation path, so the short-circuit
+	// shaves real latency off opening a workspace.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	name := id + ".jsonl"
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, e.Name(), name)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // ResumeAgentSpec returns the spec for a Claude agent session that resumes the

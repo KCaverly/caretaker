@@ -125,6 +125,53 @@ func BenchmarkEnsureProjectTrusted(b *testing.B) {
 	}
 }
 
+// BenchmarkTranscriptExists measures the resume-eligibility check ct runs for
+// every persisted Claude agent when activating a workspace — the cost paid on
+// the UI goroutine, per restored agent, before the editor appears. It scans
+// ~/.claude/projects looking for the agent's <id>.jsonl transcript. The
+// "present"/"missing" split matters: a missing transcript (a conversation whose
+// on-disk record was pruned) forces a scan of every project directory, the
+// worst case, while a present one can stop at the first hit.
+func BenchmarkTranscriptExists(b *testing.B) {
+	dir := b.TempDir()
+	// A realistic projects root: many per-repo project dirs, each holding a
+	// handful of conversation transcripts.
+	const nProjects, nPerProject = 20, 7
+	var presentID string
+	for i := 0; i < nProjects; i++ {
+		pd := filepath.Join(dir, fmt.Sprintf("-Users-bench-code-project-%02d", i))
+		if err := os.MkdirAll(pd, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < nPerProject; j++ {
+			id := fmt.Sprintf("%08d-bbbb-cccc-dddd-eeeeffff%04d", i, j)
+			if err := os.WriteFile(filepath.Join(pd, id+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+				b.Fatal(err)
+			}
+			presentID = id // last one written lives in the last project dir
+		}
+	}
+	c := &Controller{projectsDir: dir}
+	missingID := "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+	b.Run("present", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !c.transcriptExists(presentID) {
+				b.Fatal("expected present transcript")
+			}
+		}
+	})
+	b.Run("missing", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if c.transcriptExists(missingID) {
+				b.Fatal("expected missing transcript")
+			}
+		}
+	})
+}
+
 // BenchmarkViewPicker measures a full Model.View() on the deck/picker screen —
 // the render path with no hosted session, exercising box() frames, the repo
 // finder, and the grouped ACTIVE list (activeRow per worktree). It is the
