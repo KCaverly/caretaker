@@ -1024,7 +1024,7 @@ func (m Model) renderDiff(h int) string {
 		out = append(out, "") // pad so the footer sits at the bottom edge
 	}
 	footer := "  " + strings.Join([]string{
-		keyhint("j/k", "scroll"), keyhint("J/K", "file"),
+		keyhint("↑↓ / j k / ^n ^p", "scroll"), keyhint("J/K", "file"),
 		keyhint("u", "scope"), keyhint("x", "remove"), keyhint("esc", "back"),
 	}, helpStyle.Render(" · "))
 	out = append(out, ansi.Truncate(footer, m.width, ""))
@@ -1651,7 +1651,7 @@ func (m Model) renderHelp(h int) string {
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
 		row("v", "view diff (deck)"),
-		row("s", "stack screen (j/k move · s submit · R restack · v diff · o open PR)"),
+		row("s", "stack screen (↑↓ / j k / ^n ^p move · s submit · R restack · v diff · o open PR)"),
 		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
