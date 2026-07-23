@@ -52,6 +52,88 @@ func barLine(t *testing.T, m Model) string {
 	return strings.Split(renderToTerminal(t, m.renderBar(), m.width, barHeight), "\n")[0]
 }
 
+func assertFrameFits(t *testing.T, m Model) {
+	t.Helper()
+	content := m.View().Content
+	lines := strings.Split(content, "\n")
+	if len(lines) > m.height {
+		t.Errorf("frame height = %d, viewport = %d", len(lines), m.height)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > m.width {
+			t.Errorf("line %d width = %d, viewport = %d: %q", i, got, m.width, ansi.Strip(line))
+		}
+	}
+}
+
+func TestResponsiveSurfaceMatrix(t *testing.T) {
+	surfaces := []struct {
+		name  string
+		apply func(*Model)
+	}{
+		{"deck", func(m *Model) {}},
+		{"agent board", func(m *Model) { m.boardOpen = true }},
+		{"agent form", func(m *Model) { m.boardOpen, m.formOpen = true, true }},
+		{"command palette", func(m *Model) { m.paletteOpen = true }},
+		{"usage", func(m *Model) { m.usageOpen = true }},
+		{"confirmation", func(m *Model) {
+			m.mode = modeConfirmStop
+			m.confirm = confirmState{title: "STOP WORKSPACE", context: []string{"repo / worktree"},
+				options: []confirmOption{{label: "cancel", key: "esc"}, {label: "stop anyway", key: "y", danger: true}}}
+		}},
+		{"help", func(m *Model) { m.helpOpen = true }},
+		{"setup", func(m *Model) { m.screen = screenSetup; m.configPath = "/a/very/long/config/path/config.toml" }},
+		{"diff", func(m *Model) { m.diffOpen = true; m.diffView.loading = true }},
+		{"stack", func(m *Model) {
+			m.stackOpen = true
+			m.stackView = stackView{repoName: "repo", wtName: "worktree", working: true}
+		}},
+	}
+	sizes := []struct{ w, h int }{{24, 16}, {32, 18}, {48, 20}, {80, 24}}
+	for _, size := range sizes {
+		for _, surface := range surfaces {
+			t.Run(fmt.Sprintf("%s/%dx%d", surface.name, size.w, size.h), func(t *testing.T) {
+				m := sampleModel()
+				mm, _ := m.Update(tea.WindowSizeMsg{Width: size.w, Height: size.h})
+				m = mm.(Model)
+				surface.apply(&m)
+				assertFrameFits(t, m)
+			})
+		}
+	}
+}
+
+func TestBelowViableSizeShowsOnlyResizeInstruction(t *testing.T) {
+	for _, size := range []struct{ w, h int }{{minViableWidth - 1, minViableHeight}, {minViableWidth, minViableHeight - 1}} {
+		m := sampleModel()
+		mm, _ := m.Update(tea.WindowSizeMsg{Width: size.w, Height: size.h})
+		m = mm.(Model)
+		if got := m.View().Content; got != "ct — please enlarge the terminal" {
+			t.Errorf("%dx%d rendered %q", size.w, size.h, got)
+		}
+	}
+}
+
+func TestNarrowBarPreservesActiveDestinationAndContext(t *testing.T) {
+	m := sampleModel()
+	m.current = &workspaceRef{repo: "caretaker", worktree: "polish", key: "caretaker/polish", ws: &session.Workspace{}}
+	m.screen = screenTerminal
+	mm, _ := m.Update(tea.WindowSizeMsg{Width: minViableWidth, Height: minViableHeight})
+	m = mm.(Model)
+	bar := m.renderBar()
+	if !strings.Contains(bar, iconTerm) || !strings.Contains(bar, "caretaker / polish") {
+		t.Errorf("narrow bar lost active destination or context:\n%s", bar)
+	}
+	if strings.Contains(bar, iconDeck) || strings.Contains(bar, iconEditor) || strings.Contains(bar, iconAgent) {
+		t.Errorf("inactive destinations should yield on a narrow bar:\n%s", bar)
+	}
+	for i, line := range strings.Split(bar, "\n") {
+		if width := lipgloss.Width(line); width > m.width {
+			t.Errorf("bar line %d width = %d, viewport = %d", i, width, m.width)
+		}
+	}
+}
+
 func TestBarShowsAgentPoolPosition(t *testing.T) {
 	m := modelWithAgents(3)
 	m.current.ws.Agents[1].Title = "refactor-auth"
@@ -462,7 +544,7 @@ func TestCodexOnlyExposesCodexUsage(t *testing.T) {
 	if out := renderToTerminal(t, m.renderUsage(m.height-barHeight), m.width, m.height-barHeight); !strings.Contains(out, "Codex") || strings.Contains(out, "Claude") {
 		t.Errorf("Codex-only panel should show only Codex usage:\n%s", out)
 	}
-	if help := m.renderHelp(m.height - barHeight); !strings.Contains(help, "usage limits") {
+	if help := renderAllHelp(m); !strings.Contains(help, "usage limits") {
 		t.Errorf("Codex-only help should expose usage:\n%s", help)
 	}
 }

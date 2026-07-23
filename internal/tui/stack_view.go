@@ -615,7 +615,7 @@ func (m Model) renderStack(h int) string {
 // same centered box as the structured view.
 func (m Model) renderStackText(body []string, footer string, h int) string {
 	sv := m.stackView
-	innerW := clamp(m.width-8, 40, 84)
+	innerW := panelInnerWidth(m.width, 84)
 
 	rows := []string{header("stack "+sv.repoName+" / "+sv.wtName, -1), ""}
 
@@ -631,8 +631,7 @@ func (m Model) renderStackText(body []string, footer string, h int) string {
 
 	rows = append(rows, "", "  "+footer)
 
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(rows, innerW, m.width, h)
 }
 
 // renderStackStatus draws the structured stack screen: a titled header, a chain
@@ -641,7 +640,7 @@ func (m Model) renderStackText(body []string, footer string, h int) string {
 // and an action footer whose submit/restack hints appear only when the rollup
 // calls for them. It shares renderStack's centered box container.
 func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
-	innerW := clamp(m.width-8, 40, 84)
+	innerW := panelInnerWidth(m.width, 84)
 	trunc := func(s string) string { return ansi.Truncate(s, innerW, "") }
 
 	var rows []string
@@ -694,8 +693,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 		keyhint("esc", "deck"), keyhint("r", "refresh"))
 	rows = append(rows, trunc("  "+strings.Join(parts, "   ")))
 
-	boxStr := box(rows, innerW, len(rows), true)
-	return centerBlock(boxStr, m.width, h)
+	return renderPanel(rows, innerW, m.width, h)
 }
 
 // stackJustify lays left and right on one row innerW wide with the gap between

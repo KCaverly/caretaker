@@ -288,9 +288,10 @@ type Model struct {
 	// fully defaulted by config.Load before they reach here.
 	keys config.Keys
 
-	screen   screen
-	current  *workspaceRef
-	helpOpen bool
+	screen     screen
+	current    *workspaceRef
+	helpOpen   bool
+	helpOffset int
 
 	// hintSeen records that the user has typed into a session at least once,
 	// which retires the one-line "f1 help" hint shown beneath session bodies.
@@ -2709,7 +2710,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// keystroke into the embedded session drawn beneath the overlay, which must
 	// never happen.
 	if m.helpOpen {
+		if s := msg.String(); s == "down" || s == "j" || s == "ctrl+n" {
+			m.helpOffset++
+			return m, nil
+		} else if s == "up" || s == "k" || s == "ctrl+p" {
+			m.helpOffset = max(0, m.helpOffset-1)
+			return m, nil
+		}
 		m.helpOpen = false
+		m.helpOffset = 0
 		if m.isReservedActionKey(msg.String()) {
 			return m.handleKey(msg)
 		}
@@ -2717,6 +2726,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.String() == m.keys.Help {
 		m.helpOpen = true
+		m.helpOffset = 0
 		return m, nil
 	}
 	// The command palette is modal and reachable from anywhere (including over the

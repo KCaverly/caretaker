@@ -36,6 +36,21 @@ func sampleModel() Model {
 	return m
 }
 
+func renderAllHelp(m Model) string {
+	var pages []string
+	previous := ""
+	for offset := 0; offset < 100; offset++ {
+		m.helpOffset = offset
+		page := m.renderHelp(m.height - barHeight)
+		if page == previous {
+			break
+		}
+		pages = append(pages, page)
+		previous = page
+	}
+	return strings.Join(pages, "\n")
+}
+
 func TestRenderLayout(t *testing.T) {
 	m := sampleModel()
 	out := m.renderDeck(m.height - barHeight)
@@ -303,7 +318,7 @@ func TestActiveDisplayDetailLine(t *testing.T) {
 func TestRenderHelpKeys(t *testing.T) {
 	// The cycle fwd/back and goto rows show; the removed alias rows never do.
 	m := sampleModel()
-	out := m.renderHelp(m.height - barHeight)
+	out := renderAllHelp(m)
 	for _, want := range []string{"alt+]", "alt+[", "alt+1", "alt+h", "alt+v", "cycle view"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help overlay missing %q:\n%s", want, out)
