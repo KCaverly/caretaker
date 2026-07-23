@@ -157,6 +157,7 @@ func TestDefaultKeymap(t *testing.T) {
 		"goto_term":   d.Keys.GotoTerm,
 		"palette":     d.Keys.Palette,
 		"global":      d.Keys.GlobalConfig,
+		"back":        d.Keys.Back,
 		"split_v":     d.Keys.TermSplitV,
 		"split_h":     d.Keys.TermSplitH,
 		"zoom":        d.Keys.TermZoom,
@@ -169,7 +170,7 @@ func TestDefaultKeymap(t *testing.T) {
 	want := map[string]string{
 		"cycle": "alt+]", "cycle_back": "alt+[",
 		"goto_editor": "alt+1", "goto_agent": "alt+2", "goto_term": "alt+3",
-		"palette": "alt+a", "global": "alt+g", "prompt": "alt+y",
+		"palette": "alt+a", "global": "alt+g", "prompt": "alt+y", "back": "alt+b",
 		"split_v": "alt+v", "split_h": "alt+s", "zoom": "alt+z", "close": "alt+x",
 		"focus_left": "alt+h", "focus_down": "alt+j", "focus_up": "alt+k", "focus_right": "alt+l",
 	}
@@ -200,6 +201,7 @@ func TestLoadCommandPaletteOverride(t *testing.T) {
 func TestLoadDecodesNewKeys(t *testing.T) {
 	cfg := loadTOML(t, `[keys]
 cycle_back = "alt+p"
+back = "ctrl+o"
 goto_editor = "alt+e"
 goto_agent = "alt+c"
 goto_term = "alt+t"
@@ -208,6 +210,9 @@ term_focus_right = "ctrl+l"
 `)
 	if cfg.Keys.CycleBack != "alt+p" {
 		t.Errorf("cycle_back = %q", cfg.Keys.CycleBack)
+	}
+	if cfg.Keys.Back != "ctrl+o" {
+		t.Errorf("back = %q", cfg.Keys.Back)
 	}
 	if cfg.Keys.GotoEditor != "alt+e" || cfg.Keys.GotoAgent != "alt+c" || cfg.Keys.GotoTerm != "alt+t" {
 		t.Errorf("goto keys = %q/%q/%q", cfg.Keys.GotoEditor, cfg.Keys.GotoAgent, cfg.Keys.GotoTerm)

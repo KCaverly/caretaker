@@ -1660,6 +1660,7 @@ func (m Model) renderHelp(h int) string {
 		row(m.keys.Cycle+" / "+m.keys.CycleBack, "cycle view (next / prev)"),
 		row(m.keys.GotoEditor+" "+m.keys.GotoAgent+" "+m.keys.GotoTerm, "go to editor / agent / term"),
 		row(m.keys.Picker, "back to the deck"),
+		row(m.keys.Back, "return to previous location"),
 		row(m.keys.GlobalConfig, "open home workspace (~)"),
 		row(m.keys.Palette, "agent board"),
 		row(m.keys.CommandPalette, "command palette (every action)"),
@@ -1875,6 +1876,9 @@ func (m Model) sessionFooter() string {
 		hints = []string{
 			keyhint(m.keys.Cycle, "cycle view"),
 			keyhint(m.keys.Picker, "deck")}
+	}
+	if m.returnLocation != nil {
+		hints = append([]string{keyhint(m.keys.Back, "return")}, hints...)
 	}
 	sep := helpStyle.Render("  ·  ")
 	for n := len(hints); n >= 1; n-- {
