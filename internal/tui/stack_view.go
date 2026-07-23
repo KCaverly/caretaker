@@ -380,6 +380,12 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 	m.stackView.confirmRestack = false
 	m.stackView.confirmReuse = false
 	m.stackView.offset = 0
+	if !msg.dryRun {
+		// A real restack rewrites the stack's SHAs, so every cached patch is
+		// keyed to a commit that no longer exists. Drop them rather than let a
+		// resurrected SHA serve a pre-restack diff.
+		m.stackView.diffCache = nil
+	}
 	switch {
 	case msg.err != nil:
 		m.stackView.status = nil
@@ -479,6 +485,25 @@ func (m *Model) ensureCommitDiff(sha string) tea.Cmd {
 	}
 	sv.diffCache[sha] = stackCommitDiff{loading: true}
 	return m.fetchCommitDiffCmd(sv.key, sv.params.WorktreeDir, sha)
+}
+
+// ensureSplitDiff re-kicks the cursored commit's diff fetch when the split pane
+// is on screen, and is a no-op otherwise. Every status-bearing result — a
+// refresh, submit, restack, or merge — either drops the diff cache outright or
+// moves the commits out from under it (a restack rewrites SHAs), so without this
+// the pane is left looking up a key nothing will ever populate and sits on
+// "loading diff…" until the user happens to move the cursor. Callers run it
+// after the matching apply, once the new status and cursor are in place.
+func (m *Model) ensureSplitDiff() tea.Cmd {
+	sv := m.stackView
+	if !m.stackOpen || !sv.split || sv.status == nil {
+		return nil
+	}
+	n := len(sv.status.Commits)
+	if n == 0 {
+		return nil
+	}
+	return m.ensureCommitDiff(sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA)
 }
 
 // clampCursor keeps a commit-row cursor inside a list of n rows, collapsing to 0

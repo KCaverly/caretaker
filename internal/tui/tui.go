@@ -1087,21 +1087,24 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		buildDiffContent(&m.diffView, msg, m.width)
 		return m, nil
 
+	// Each of these can replace the status behind an open split pane, so they
+	// re-kick the cursored commit's diff fetch rather than leave the pane
+	// waiting on a cache key nothing will fill.
 	case stackStatusMsg:
 		m.applyStackStatus(msg)
-		return m, nil
+		return m, m.ensureSplitDiff()
 
 	case stackSubmitMsg:
 		m.applyStackSubmit(msg)
-		return m, nil
+		return m, m.ensureSplitDiff()
 
 	case stackRestackMsg:
 		m.applyStackRestack(msg)
-		return m, nil
+		return m, m.ensureSplitDiff()
 
 	case stackMergeMsg:
 		m.applyStackMerge(msg)
-		return m, nil
+		return m, m.ensureSplitDiff()
 
 	case stackCommitDiffMsg:
 		m.applyStackCommitDiff(msg)
