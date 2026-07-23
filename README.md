@@ -315,13 +315,13 @@ The deck surfaces stack state passively, without ever running a subprocess on th
 cache is refreshed after each deck load and on `r`, and cleanly shows nothing until data lands or
 when GitHub is unavailable):
 
-- **Deck glyph** — after a worktree row's `↑N ↓M` cluster: a red `⟳` when the stack needs a restack
+- **Deck glyph** — after a worktree row's `↑N ↓M` cluster: a red `↻` when the stack needs a restack
   (commits landed below), a green `✓` when every commit is open with checks passing, a yellow `…`
   when any PR's checks are pending, and a red `!` for conflicts or escalations (closed PR, duplicate
   id, broken base chain). Nothing shows for an unsubmitted stack or when GitHub is unavailable — the row stays
   exactly as it was.
 - **Detail line** — the selected worktree's expanded line gains a stack segment: a single-commit
-  stack reads `PR #42 open · checks ✓`; larger stacks skip the redundant size and state the useful
+  stack reads `PR #42 open · checks passing`; larger stacks skip the redundant size and state the useful
   outcome directly, such as `1 merged · restack needed`, `resolve conflicts`, or `waiting on checks`.
 - **Conflict recovery** — when a PR conflicts after an earlier stack commit lands, the stack screen
   keeps the conflict visible and offers `R` to preview a restack that drops the landed prefix and
