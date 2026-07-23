@@ -209,6 +209,10 @@ func (c *Controller) UsageThreshold() int { return c.cfg.Usage.Threshold }
 // PlasmaConfig returns the deck plasma-panel settings.
 func (c *Controller) PlasmaConfig() config.Plasma { return c.cfg.Plasma }
 
+// StackAutoMerge reports whether an eligible stack merge should bypass ct's
+// confirmation panel. The configuration default is deliberately false.
+func (c *Controller) StackAutoMerge() bool { return c.cfg.Stack.AutoMerge }
+
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 

@@ -479,8 +479,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if !stackCanMerge(*sv.status) {
 				return m, m.flashCmd("PR is not mergeable into main")
 			}
-			m.stackView.working = true
-			return m, m.mergeStackCmd(sv.key, sv.params)
+			return m.requestStackMerge(sv.key, sv.params, *sv.status)
 		}
 	case "v":
 		// Jump to the deck's read-only diff of everything the branch carries.

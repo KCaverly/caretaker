@@ -94,6 +94,7 @@ const (
 	modeConfirmStop // guarding "d" while the target worktree has a busy agent
 	modeConfirmAgentClose
 	modeConfirmAgentRestart
+	modeConfirmMerge
 )
 
 // confirmOption is one selectable row of a destructive-confirm panel: a
@@ -112,13 +113,19 @@ type confirmOption struct {
 // keys; this only holds the panel's content, so it replaces the old
 // status-line sentence entirely. cursor starts on the SAFE option.
 type confirmState struct {
-	title       string          // "REMOVE WORKTREE", "QUIT CT", "STOP WORKSPACE"
-	context     []string        // pre-styled context lines drawn above the options
-	options     []confirmOption // vertical, arrow-selectable
-	cursor      int             // index into options; starts on the safe row
-	agent       *boardRow       // captured board target; immune to live status reordering
-	target      *activeItem     // captured worktree target; immune to deck reordering
-	fingerprint string          // exact porcelain status disclosed before archive
+	title       string            // "REMOVE WORKTREE", "QUIT CT", "STOP WORKSPACE"
+	context     []string          // pre-styled context lines drawn above the options
+	options     []confirmOption   // vertical, arrow-selectable
+	cursor      int               // index into options; starts on the safe row
+	agent       *boardRow         // captured board target; immune to live status reordering
+	target      *activeItem       // captured worktree target; immune to deck reordering
+	fingerprint string            // exact porcelain status disclosed before archive
+	merge       *stackMergeTarget // captured stack target; preserves its originating overlay
+}
+
+type stackMergeTarget struct {
+	key    string
+	params stack.Params
 }
 
 // confirmActive reports whether one of the three destructive-confirm panels is
@@ -126,7 +133,7 @@ type confirmState struct {
 // modal.
 func (m Model) confirmActive() bool {
 	return m.mode == modeConfirmRemove || m.mode == modeConfirmArchive || m.mode == modeConfirmQuit || m.mode == modeConfirmStop ||
-		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart
+		m.mode == modeConfirmAgentClose || m.mode == modeConfirmAgentRestart || m.mode == modeConfirmMerge
 }
 
 // confirmIsNav reports whether key moves the confirm panel's cursor rather than
@@ -336,15 +343,16 @@ type Model struct {
 	// funcs are the pipeline entry points (= stack.Status/Submit/Restack), injected
 	// so tests stub them. stackView backs the read-only overlay; it is the zero
 	// value while closed.
-	stackInfo    map[string]stackEntry
-	stackFetch   func(stack.Params) (stack.StackStatus, error)
-	stackSubmit  func(stack.SubmitOptions) (stack.SubmitResult, error)
-	stackRestack func(stack.RestackOptions) (stack.RestackResult, error)
-	stackReuse   func(stack.ReuseOptions) (stack.ReuseResult, error)
-	stackArchive func(stack.Params) (stack.ArchiveResult, error)
-	stackMerge   func(stack.MergeOptions) (stack.MergeResult, error)
-	stackOpen    bool
-	stackView    stackView
+	stackInfo      map[string]stackEntry
+	stackFetch     func(stack.Params) (stack.StackStatus, error)
+	stackSubmit    func(stack.SubmitOptions) (stack.SubmitResult, error)
+	stackRestack   func(stack.RestackOptions) (stack.RestackResult, error)
+	stackReuse     func(stack.ReuseOptions) (stack.ReuseResult, error)
+	stackArchive   func(stack.Params) (stack.ArchiveResult, error)
+	stackMerge     func(stack.MergeOptions) (stack.MergeResult, error)
+	stackAutoMerge bool
+	stackOpen      bool
+	stackView      stackView
 
 	// Codex exposes its stable conversation history in a transcript overlay.
 	// Caretaker tracks its default Ctrl+T toggle per hosted session so the wheel
@@ -516,6 +524,7 @@ func New(ctrl *Controller, mgr *session.Manager) Model {
 		stackReuse:      stack.Reuse,
 		stackArchive:    stack.ArchiveCleanup,
 		stackMerge:      stack.Merge,
+		stackAutoMerge:  ctrl.StackAutoMerge(),
 	}
 }
 
@@ -2026,7 +2035,10 @@ func (m Model) paletteCommands() []paletteCmd {
 				hint:  fmt.Sprintf("#%d", e.status.MergeHint.Number),
 				run: func(m Model) (tea.Model, tea.Cmd) {
 					m = m.enterStackOverlay(key, repoName, wtName, p)
-					return m, m.mergeStackCmd(key, p)
+					m.stackView.working = false
+					st := e.status
+					m.stackView.status = &st
+					return m.requestStackMerge(key, p, st)
 				},
 			})
 		}
@@ -2590,6 +2602,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// (create/remove/quit/stop), whose keys must reach that prompt.
 	if m.paletteOpen {
 		return m.handlePalette(msg)
+	}
+	if m.mode == modeConfirmMerge {
+		return m.handleConfirmMergeKey(msg)
 	}
 	if msg.String() == m.keys.CommandPalette {
 		if m.confirmActive() || (m.screen == screenPicker && m.mode != modeNormal) {
@@ -3507,6 +3522,75 @@ func (m Model) beginAgentRestartConfirm(r boardRow) Model {
 		agent: &target,
 	}
 	return m
+}
+
+// requestStackMerge either executes immediately for the explicit auto_merge
+// opt-in or opens the shared destructive-action confirmation panel.
+func (m Model) requestStackMerge(key string, p stack.Params, st stack.StackStatus) (tea.Model, tea.Cmd) {
+	if m.stackAutoMerge {
+		m.stackView.working = true
+		return m, m.mergeStackCmd(key, p)
+	}
+	return m.beginMergeConfirm(key, p, st), nil
+}
+
+func (m Model) beginMergeConfirm(key string, p stack.Params, st stack.StackStatus) Model {
+	hint := st.MergeHint
+	if hint == nil {
+		return m
+	}
+	base := st.MainBranch
+	if base == "" {
+		base = "base branch"
+	}
+	context := []string{
+		repoHdrStyle.Render(st.Repo + " / " + st.Worktree),
+		nameStyle.Render(fmt.Sprintf("PR #%d · %s", hint.Number, hint.Subject)),
+		dimStyle.Render("squash merge into " + base),
+	}
+	for _, c := range st.Commits {
+		if c.PR != nil && c.PR.Number == hint.Number {
+			checks := c.PR.Checks.Summary
+			if checks == "" {
+				checks = "unknown"
+			}
+			context = append(context, dimStyle.Render("checks: "+checks+" · mergeable: "+strings.ToLower(c.PR.Mergeable)))
+			break
+		}
+	}
+	target := stackMergeTarget{key: key, params: p}
+	m.mode = modeConfirmMerge
+	m.confirm = confirmState{
+		title:   "MERGE PR",
+		context: context,
+		options: []confirmOption{
+			{label: "cancel", key: "esc"},
+			{label: fmt.Sprintf("merge PR #%d into %s", hint.Number, base), key: "m", danger: true},
+		},
+		merge: &target,
+	}
+	return m
+}
+
+func (m Model) handleConfirmMergeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if confirmIsNav(key) {
+		m.confirm.cursor = m.confirmMove(key)
+		return m, nil
+	}
+	if key == "enter" {
+		key = m.confirmSelectedKey()
+	}
+	if key == "esc" {
+		return m.clearConfirm(), nil
+	}
+	if key != "m" || m.confirm.merge == nil {
+		return m, nil
+	}
+	target := *m.confirm.merge
+	m = m.clearConfirm()
+	m.stackView.working = true
+	return m, m.mergeStackCmd(target.key, target.params)
 }
 
 func agentConfirmContext(r boardRow) []string {

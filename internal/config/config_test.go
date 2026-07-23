@@ -262,6 +262,16 @@ func TestLoadUsageNegativeClamped(t *testing.T) {
 	}
 }
 
+func TestStackAutoMergeDefaultsSafeAndLoadsOptIn(t *testing.T) {
+	if Default().Stack.AutoMerge {
+		t.Fatal("stack.auto_merge must default to false")
+	}
+	cfg := loadTOML(t, "[stack]\nauto_merge = true\n")
+	if !cfg.Stack.AutoMerge {
+		t.Fatal("stack.auto_merge opt-in was not loaded")
+	}
+}
+
 func TestExpandTilde(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
