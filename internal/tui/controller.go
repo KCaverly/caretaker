@@ -213,6 +213,14 @@ func (c *Controller) PlasmaConfig() config.Plasma { return c.cfg.Plasma }
 // confirmation panel. The configuration default is deliberately false.
 func (c *Controller) StackAutoMerge() bool { return c.cfg.Stack.AutoMerge }
 
+// DisplayIcons returns the configured persistent icon vocabulary.
+func (c *Controller) DisplayIcons() string {
+	if c.cfg.Display.Icons == "" {
+		return config.IconsNerd
+	}
+	return c.cfg.Display.Icons
+}
+
 // GlobalConfigDir returns the home directory path for the global config workspace.
 func (c *Controller) GlobalConfigDir() (string, error) { return os.UserHomeDir() }
 

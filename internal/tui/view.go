@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/KCaverly/caretaker/internal/agent"
+	"github.com/KCaverly/caretaker/internal/config"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
@@ -149,6 +150,58 @@ const (
 	minViableWidth  = 24
 	minViableHeight = 16
 )
+
+func (m Model) destinationGlyph(s screen) string {
+	mode := m.iconMode
+	if mode == "" {
+		mode = config.IconsNerd
+	}
+	if mode == config.IconsText {
+		switch s {
+		case screenPicker:
+			return "ct"
+		case screenEditor:
+			return "edit"
+		case screenAgent:
+			return "agent"
+		default:
+			return "term"
+		}
+	}
+	if mode == config.IconsASCII {
+		switch s {
+		case screenPicker:
+			return "C"
+		case screenEditor:
+			return "E"
+		case screenAgent:
+			return "A"
+		default:
+			return "T"
+		}
+	}
+	switch s {
+	case screenPicker:
+		return iconDeck
+	case screenEditor:
+		return iconEditor
+	case screenAgent:
+		return iconAgent
+	default:
+		return iconTerm
+	}
+}
+
+func (m Model) paneGridGlyph() string {
+	switch m.iconMode {
+	case config.IconsText:
+		return "panes"
+	case config.IconsASCII:
+		return "#"
+	default:
+		return iconPanes
+	}
+}
 
 // Tab glyphs (Nerd Font). Kept as named consts so they're easy to swap.
 const (
@@ -369,13 +422,25 @@ func (m Model) paneSegment() (string, bool) {
 		return "", false
 	}
 	pos := clamp(ws.ActiveTerm, 0, len(ws.Terms)-1) + 1
-	return fmt.Sprintf("%s %d/%d %s", iconPanes, pos, len(ws.Terms), m.paneZoomIcon()), true
+	return fmt.Sprintf("%s %d/%d %s", m.paneGridGlyph(), pos, len(ws.Terms), m.paneZoomIcon()), true
 }
 
 // paneZoomIcon is the zoom-toggle glyph reflecting the current pane state:
 // inward arrows while a pane is maximized (click to restore), outward arrows
 // otherwise (click to maximize the active pane).
 func (m Model) paneZoomIcon() string {
+	if m.iconMode == config.IconsText {
+		if m.current != nil && m.current.ws != nil && m.current.ws.TermZoomed {
+			return "restore"
+		}
+		return "zoom"
+	}
+	if m.iconMode == config.IconsASCII {
+		if m.current != nil && m.current.ws != nil && m.current.ws.TermZoomed {
+			return "-"
+		}
+		return "+"
+	}
 	if m.current != nil && m.current.ws != nil && m.current.ws.TermZoomed {
 		return iconZoomOut
 	}
@@ -435,15 +500,15 @@ func (m Model) barZones() []barZone {
 	if m.screen == screenPicker {
 		ctStyle = boldYellow
 	}
-	ct := ctStyle.Render(iconDeck)
+	ct := ctStyle.Render(m.destinationGlyph(screenPicker))
 
-	agent := glyph(iconAgent, boldPurple, m.screen == screenAgent, has)
+	agent := glyph(m.destinationGlyph(screenAgent), boldPurple, m.screen == screenAgent, has)
 
 	zones := []barZone{
 		{screenPicker, ct},
-		{screenEditor, glyph(iconEditor, boldGreen, m.screen == screenEditor, has)},
+		{screenEditor, glyph(m.destinationGlyph(screenEditor), boldGreen, m.screen == screenEditor, has)},
 		{screenAgent, agent},
-		{screenTerminal, glyph(iconTerm, boldAccent, m.screen == screenTerminal, has)},
+		{screenTerminal, glyph(m.destinationGlyph(screenTerminal), boldAccent, m.screen == screenTerminal, has)},
 	}
 	// On narrow terminals, optional inactive destinations yield before the
 	// anchored workspace identity. Every destination remains keyboard-reachable.
@@ -1617,6 +1682,9 @@ func (m Model) renderHelp(h int) string {
 	)
 	rows = append(rows,
 		"",
+		repoHdrStyle.Render("  Navigation"),
+		"  "+m.navigationLegend(),
+		"",
 		repoHdrStyle.Render("  Legend"),
 		"  "+statusLegend(),
 		"  "+markLegend(),
@@ -1640,6 +1708,16 @@ func (m Model) renderHelp(h int) string {
 	visible = append(visible, body[start:end]...)
 	visible = append(visible, "", footer)
 	return renderPanel(visible, innerW, m.width, h)
+}
+
+func (m Model) navigationLegend() string {
+	parts := []string{
+		m.destinationGlyph(screenPicker) + " deck",
+		m.destinationGlyph(screenEditor) + " editor",
+		m.destinationGlyph(screenAgent) + " agent",
+		m.destinationGlyph(screenTerminal) + " terminal",
+	}
+	return helpStyle.Render(strings.Join(parts, " · "))
 }
 
 // statusLegend / markLegend explain the deck's status glyphs, split across two

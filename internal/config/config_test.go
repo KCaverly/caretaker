@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/KCaverly/caretaker/internal/agent"
@@ -57,6 +58,9 @@ func TestDefault(t *testing.T) {
 	}
 	if d.Agents.Claude.Command != "claude" || d.Agents.Codex.Command != "codex" {
 		t.Fatalf("unexpected provider commands: %+v", d.Agents)
+	}
+	if d.Display.Icons != IconsNerd {
+		t.Fatalf("display icons = %q, want %q", d.Display.Icons, IconsNerd)
 	}
 }
 
@@ -269,6 +273,24 @@ func TestStackAutoMergeDefaultsSafeAndLoadsOptIn(t *testing.T) {
 	cfg := loadTOML(t, "[stack]\nauto_merge = true\n")
 	if !cfg.Stack.AutoMerge {
 		t.Fatal("stack.auto_merge opt-in was not loaded")
+	}
+}
+
+func TestDisplayIconModes(t *testing.T) {
+	for _, mode := range []string{IconsNerd, IconsText, IconsASCII} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := loadTOML(t, "[display]\nicons = "+strconv.Quote(mode)+"\n")
+			if cfg.Display.Icons != mode {
+				t.Fatalf("display.icons = %q, want %q", cfg.Display.Icons, mode)
+			}
+		})
+	}
+	c := Default()
+	c.Root = t.TempDir()
+	c.Display.Icons = "emoji"
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "nerd") ||
+		!strings.Contains(err.Error(), "text") || !strings.Contains(err.Error(), "ascii") {
+		t.Fatalf("invalid icon mode error = %v", err)
 	}
 }
 

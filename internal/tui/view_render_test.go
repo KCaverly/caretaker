@@ -222,6 +222,65 @@ func TestBarShowsPanePositionAndZoom(t *testing.T) {
 	}
 }
 
+func TestDisplayIconModesRenderAndHitTest(t *testing.T) {
+	isPrivateUse := func(r rune) bool {
+		return r >= 0xE000 && r <= 0xF8FF || r >= 0xF0000 && r <= 0xFFFFD || r >= 0x100000 && r <= 0x10FFFD
+	}
+	for _, tc := range []struct {
+		mode         string
+		destinations []string
+		pane, zoom   string
+	}{
+		{config.IconsNerd, []string{iconDeck, iconEditor, iconAgent, iconTerm}, iconPanes, iconZoomIn},
+		{config.IconsText, []string{"ct", "edit", "agent", "term"}, "panes", "zoom"},
+		{config.IconsASCII, []string{"C", "E", "A", "T"}, "#", "+"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			m := modelWithAgents(1)
+			m.iconMode = tc.mode
+			m.width = 120
+			m.screen = screenTerminal
+			m.current.ws.Terms = []*session.Session{{}, {}}
+			m.current.ws.TermLayout = &session.PaneNode{Dir: session.SplitV,
+				A: &session.PaneNode{Idx: 0}, B: &session.PaneNode{Idx: 1}}
+			bar := m.renderBar()
+			for _, want := range append(append([]string{}, tc.destinations...), tc.pane, tc.zoom) {
+				if !strings.Contains(bar, want) {
+					t.Errorf("bar missing %q:\n%s", want, bar)
+				}
+			}
+			if tc.mode != config.IconsNerd {
+				for _, r := range bar + renderAllHelp(m) {
+					if isPrivateUse(r) {
+						t.Fatalf("%s mode emitted private-use rune U+%04X", tc.mode, r)
+					}
+				}
+			}
+
+			col := 2
+			for i, z := range m.barZones() {
+				got, ok := m.tabAt(col, 0)
+				if !ok || got != z.s {
+					t.Errorf("destination %d hit = %v/%v, want %v/true", i, got, ok, z.s)
+				}
+				col += lipgloss.Width(z.glyph) + 3
+			}
+			zones := m.barRightZones()
+			iconStart := zones.paneStart + lipgloss.Width(zones.pane) - lipgloss.Width(m.paneZoomIcon())
+			if !m.paneZoomAt(iconStart, 0) {
+				t.Error("zoom fallback should retain its mouse target")
+			}
+
+			m.width = minViableWidth
+			for i, line := range strings.Split(m.renderBar(), "\n") {
+				if got := lipgloss.Width(line); got > m.width {
+					t.Errorf("narrow bar line %d width = %d, viewport = %d", i, got, m.width)
+				}
+			}
+		})
+	}
+}
+
 // leftClickAt is a left mouse-button click at bar coordinates (x, y).
 func leftClickAt(x, y int) tea.MouseClickMsg {
 	return tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft}
