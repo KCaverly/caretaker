@@ -68,6 +68,70 @@ const (
 	paneDiff
 )
 
+// uncommittedKey is the diffCache key for the synthetic uncommitted row. Every
+// other key is a full hex SHA, so a leading NUL cannot collide with one.
+const uncommittedKey = "\x00uncommitted"
+
+// stackUntrackedCap bounds how many untracked files the uncommitted row renders
+// the contents of. Each one costs a git subprocess, and a stack worktree
+// realistically carries a handful; the surplus is still counted in the section
+// rule so a `git init`-shaped explosion is visible rather than silently cut.
+const stackUntrackedCap = 20
+
+// stackRow is one selectable line in the stack list. Rows are the commits
+// bottom-first, then — when the worktree is dirty — a synthetic row for the
+// uncommitted work sitting above the tip. Keeping the cursor on rows rather than
+// on status.Commits is what lets that trailing row behave like any other: it
+// takes the cursor, drives the preview pane, and windows with the rest.
+type stackRow struct {
+	commit *stack.Commit // nil marks the uncommitted row
+}
+
+// uncommitted reports whether r is the synthetic trailing row.
+func (r stackRow) uncommitted() bool { return r.commit == nil }
+
+// diffKey is the row's key into the per-row diff cache.
+func (r stackRow) diffKey() string {
+	if r.uncommitted() {
+		return uncommittedKey
+	}
+	return r.commit.SHA
+}
+
+// stackRows builds the cursor's row list: every commit in the loaded status,
+// then the uncommitted row when the worktree currently has uncommitted work.
+//
+// The dirty flag is read from the deck's live view rather than cached on
+// stackView because it changes underneath the screen — an agent editing files in
+// that worktree flips it — and a stale copy would leave a row selectable after
+// the tree went clean, or hide one that just appeared.
+//
+// Commits are bottom-first (position 1 is closest to main), and the list renders
+// in that order, so uncommitted work belongs last: it sits above the tip.
+func (m Model) stackRows() []stackRow {
+	sv := m.stackView
+	if sv.status == nil {
+		return nil
+	}
+	rows := make([]stackRow, 0, len(sv.status.Commits)+1)
+	for i := range sv.status.Commits {
+		rows = append(rows, stackRow{commit: &sv.status.Commits[i]})
+	}
+	if it, ok := m.activeByKey(sv.key); ok && it.view.Dirty {
+		rows = append(rows, stackRow{})
+	}
+	return rows
+}
+
+// stackRowAt returns the row under the cursor, clamped, and whether there is one.
+func (m Model) stackRowAt(cursor int) (stackRow, bool) {
+	rows := m.stackRows()
+	if len(rows) == 0 {
+		return stackRow{}, false
+	}
+	return rows[clamp(cursor, 0, len(rows)-1)], true
+}
+
 // stackCommitDiff is one commit's per-commit diff in the split pane's cache:
 // loading while the fetch is in flight, err on a failed fetch, else the rendered
 // scope (reusing the diff viewer's scopeContent) and its scroll offset.
@@ -120,6 +184,11 @@ type stackCommitDiffMsg struct {
 	body     string
 	stat     []repo.FileStat
 	err      error
+
+	// Uncommitted-row only: the untracked paths whose contents body carries, and
+	// how many more were left unrendered by stackUntrackedCap.
+	untracked      []string
+	untrackedExtra int
 }
 
 // --- params ---
@@ -248,6 +317,47 @@ func (m Model) fetchCommitDiffCmd(key, dir, sha string) tea.Cmd {
 	}
 }
 
+// fetchUncommittedDiffCmd runs the uncommitted row's fetch off the UI goroutine:
+// the staged+unstaged patch against HEAD and its numstat, plus the contents of
+// the untracked files (which `git diff HEAD` never reports) appended to the same
+// body. Staged and unstaged are deliberately one view — it mirrors what the deck
+// already counts as the worktree's uncommitted work.
+//
+// Untracked rendering is capped; the surplus is reported so the section rule can
+// say how much was left out.
+func (m Model) fetchUncommittedDiffCmd(key, dir string) tea.Cmd {
+	return func() tea.Msg {
+		wt := repo.Worktree{Path: dir}
+		body, err := repo.DiffUncommitted(wt)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
+		}
+		stat, err := repo.NumstatUncommitted(wt)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
+		}
+		untracked, err := repo.UntrackedFiles(wt)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
+		}
+		extra := 0
+		if len(untracked) > stackUntrackedCap {
+			extra = len(untracked) - stackUntrackedCap
+			untracked = untracked[:stackUntrackedCap]
+		}
+		// A per-path read failure is already swallowed inside DiffUntracked, so
+		// the tracked patch still renders even if a new file vanished mid-fetch.
+		newFiles, err := repo.DiffUntracked(dir, untracked)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
+		}
+		return stackCommitDiffMsg{
+			key: key, sha: uncommittedKey, body: body + newFiles, stat: stat,
+			untracked: untracked, untrackedExtra: extra,
+		}
+	}
+}
+
 func (m Model) archivePreflightCmd(it activeItem, p stack.Params) tea.Cmd {
 	return func() tea.Msg {
 		p.Fetch = true
@@ -328,7 +438,7 @@ func (m *Model) applyStackStatus(msg stackStatusMsg) {
 	st := msg.status
 	m.stackView.status = &st
 	m.stackView.body = nil
-	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+	m.clampStackCursor()
 }
 
 // applyStackSubmit refreshes the deck cache from a submit result and, when the
@@ -359,7 +469,7 @@ func (m *Model) applyStackSubmit(msg stackSubmitMsg) {
 	st := msg.res.Status
 	m.stackView.status = &st
 	m.stackView.body = nil
-	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+	m.clampStackCursor()
 }
 
 // applyStackRestack handles both restack phases. The dry-run shows the plan and
@@ -398,7 +508,7 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 		st := msg.res.Status
 		m.stackView.status = &st
 		m.stackView.body = nil
-		m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+		m.clampStackCursor()
 	case msg.dryRun:
 		m.stackView.status = nil
 		if msg.reuse {
@@ -412,7 +522,7 @@ func (m *Model) applyStackRestack(msg stackRestackMsg) {
 		st := msg.res.Status
 		m.stackView.status = &st
 		m.stackView.body = nil
-		m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+		m.clampStackCursor()
 	}
 }
 
@@ -433,7 +543,7 @@ func (m *Model) applyStackMerge(msg stackMergeMsg) {
 	st := msg.res.Status
 	m.stackView.status = &st
 	m.stackView.body = nil
-	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
+	m.clampStackCursor()
 }
 
 // applyStackCommitDiff records one per-commit diff fetch into the split pane's
@@ -452,8 +562,13 @@ func (m *Model) applyStackCommitDiff(msg stackCommitDiffMsg) {
 		m.stackView.diffCache[msg.sha] = stackCommitDiff{err: msg.err}
 		return
 	}
-	title := "commit"
-	if m.stackView.status != nil {
+	title, meta := "commit", ""
+	if msg.sha == uncommittedKey {
+		title = uncommittedLabel
+		if msg.untrackedExtra > 0 {
+			meta = fmt.Sprintf("+%d more untracked", msg.untrackedExtra)
+		}
+	} else if m.stackView.status != nil {
 		for _, c := range m.stackView.status.Commits {
 			if c.SHA == msg.sha {
 				if c.Subject != "" {
@@ -464,8 +579,17 @@ func (m *Model) applyStackCommitDiff(msg stackCommitDiffMsg) {
 		}
 	}
 	var b diffBuilder
-	files, add, del := appendDiffSection(&b, title, "", msg.stat, nil, msg.body, m.width)
-	m.stackView.diffCache[msg.sha] = stackCommitDiff{scope: finishScope(b, files, add, del)}
+	files, add, del := appendDiffSection(&b, title, meta, msg.stat, msg.untracked, msg.body, m.width)
+	scope := finishScope(b, files, add, del)
+	// Carry the scroll position across a re-fetch. Commits are only ever fetched
+	// once so this is inert for them, but the uncommitted row revalidates on every
+	// landing, and snapping back to the top each time would make it unreadable
+	// while an agent is writing to the worktree.
+	prev := m.stackView.diffCache[msg.sha]
+	m.stackView.diffCache[msg.sha] = stackCommitDiff{
+		scope:  scope,
+		offset: clamp(prev.offset, 0, max(0, len(scope.lines)-1)),
+	}
 }
 
 // ensureCommitDiff kicks a per-commit diff fetch for sha when the cache has no
@@ -487,6 +611,37 @@ func (m *Model) ensureCommitDiff(sha string) tea.Cmd {
 	return m.fetchCommitDiffCmd(sv.key, sv.params.WorktreeDir, sha)
 }
 
+// ensureRowDiff kicks the fetch behind whichever row the preview is showing.
+//
+// The two row kinds want opposite caching. A commit's patch is immutable, so a
+// cached entry is reused and nothing is re-issued. Uncommitted work is the
+// opposite: it changes under the screen constantly — that is the point of
+// watching it — so landing on the row always revalidates. To keep that from
+// flashing, the previously fetched patch stays on screen while the new one is in
+// flight; only the very first landing shows "loading…".
+func (m *Model) ensureRowDiff(r stackRow) tea.Cmd {
+	sv := &m.stackView
+	if !r.uncommitted() {
+		return m.ensureCommitDiff(r.diffKey())
+	}
+	if sv.diffCache == nil {
+		sv.diffCache = map[string]stackCommitDiff{}
+	}
+	if _, ok := sv.diffCache[uncommittedKey]; !ok {
+		sv.diffCache[uncommittedKey] = stackCommitDiff{loading: true}
+	}
+	return m.fetchUncommittedDiffCmd(sv.key, sv.params.WorktreeDir)
+}
+
+// ensureCursorDiff kicks the fetch for the row under the cursor.
+func (m *Model) ensureCursorDiff() tea.Cmd {
+	r, ok := m.stackRowAt(m.stackView.cursor)
+	if !ok {
+		return nil
+	}
+	return m.ensureRowDiff(r)
+}
+
 // ensureSplitDiff re-kicks the cursored commit's diff fetch when the split pane
 // is on screen, and is a no-op otherwise. Every status-bearing result — a
 // refresh, submit, restack, or merge — either drops the diff cache outright or
@@ -495,15 +650,18 @@ func (m *Model) ensureCommitDiff(sha string) tea.Cmd {
 // "loading diff…" until the user happens to move the cursor. Callers run it
 // after the matching apply, once the new status and cursor are in place.
 func (m *Model) ensureSplitDiff() tea.Cmd {
-	sv := m.stackView
-	if !m.stackOpen || !sv.split || sv.status == nil {
+	if !m.stackOpen || !m.stackView.split || m.stackView.status == nil {
 		return nil
 	}
-	n := len(sv.status.Commits)
-	if n == 0 {
-		return nil
-	}
-	return m.ensureCommitDiff(sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA)
+	return m.ensureCursorDiff()
+}
+
+// clampStackCursor keeps the cursor inside the current row list after a status
+// swap. It must count rows rather than commits: with a dirty worktree the last
+// selectable row is the uncommitted one, and clamping to the commit count would
+// yank the cursor off it on every passive refresh.
+func (m *Model) clampStackCursor() {
+	m.stackView.cursor = clampCursor(m.stackView.cursor, len(m.stackRows()))
 }
 
 // clampCursor keeps a commit-row cursor inside a list of n rows, collapsing to 0
@@ -549,10 +707,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sv := m.stackView
 	avail := m.stackViewport()
 	maxOff := max(0, len(sv.body)-avail)
-	n := 0
-	if sv.status != nil {
-		n = len(sv.status.Commits)
-	}
+	n := len(m.stackRows())
 	if sv.split && sv.status != nil && !sv.working && !sv.confirmRestack {
 		handled, mm, cmd := m.handleStackSplit(msg, n)
 		if handled {
@@ -582,8 +737,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if sv.status != nil && n > 0 && !sv.working && !sv.confirmRestack {
 			m.stackView.split = true
 			m.stackView.splitFocus = paneStack
-			cmd := m.ensureCommitDiff(sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA)
-			return m, cmd
+			return m, m.ensureCursorDiff()
 		}
 	case "r":
 		if !sv.working {
@@ -653,11 +807,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		// Open the selected commit's PR in the browser.
 		if sv.status != nil && n > 0 {
-			c := sv.status.Commits[clamp(sv.cursor, 0, n-1)]
-			if c.PR != nil && c.PR.URL != "" {
-				return m, openURLCmd(c.PR.URL)
-			}
-			return m, m.flashCmd("no PR for this commit")
+			return m.openRowPR(sv.cursor)
 		}
 	case "j", "down":
 		if sv.status != nil {
@@ -695,12 +845,6 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // here, so the returned model is unchanged.
 func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, tea.Cmd) {
 	sv := m.stackView
-	curSHA := func(c int) string {
-		if sv.status == nil || n == 0 {
-			return ""
-		}
-		return sv.status.Commits[clamp(c, 0, n-1)].SHA
-	}
 	switch msg.String() {
 	case "esc", "q", "d":
 		// esc/q and a second d both step out of split; the overlay stays open.
@@ -726,24 +870,37 @@ func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, te
 	switch msg.String() {
 	case "j", "down":
 		m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
-		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
-		return true, m, cmd
+		return true, m, m.ensureCursorDiff()
 	case "k", "up":
 		m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
-		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
-		return true, m, cmd
+		return true, m, m.ensureCursorDiff()
 	case "g":
 		m.stackView.cursor = 0
-		cmd := m.ensureCommitDiff(curSHA(0))
-		return true, m, cmd
+		return true, m, m.ensureCursorDiff()
 	case "G":
 		m.stackView.cursor = max(0, n-1)
-		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
-		return true, m, cmd
+		return true, m, m.ensureCursorDiff()
 	case "v", "s", "R", "M", "a", "u", "r", "o":
 		return false, m, nil
 	}
 	return true, m, nil
+}
+
+// openRowPR opens the PR of the commit under cursor, flashing instead when the
+// row carries none — an unsubmitted commit, or the uncommitted row, which has no
+// PR by definition and never will until the work is committed and submitted.
+func (m Model) openRowPR(cursor int) (tea.Model, tea.Cmd) {
+	r, ok := m.stackRowAt(cursor)
+	if !ok {
+		return m, nil
+	}
+	if r.uncommitted() {
+		return m, m.flashCmd("uncommitted work has no PR")
+	}
+	if r.commit.PR != nil && r.commit.PR.URL != "" {
+		return m, openURLCmd(r.commit.PR.URL)
+	}
+	return m, m.flashCmd("no PR for this commit")
 }
 
 // handleStackDiffPane routes keys while split mode's diff pane has focus: the
@@ -754,8 +911,8 @@ func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, te
 func (m Model) handleStackDiffPane(msg tea.KeyPressMsg, n int) (tea.Model, tea.Cmd) {
 	sv := m.stackView
 	sha := ""
-	if sv.status != nil && n > 0 {
-		sha = sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA
+	if r, ok := m.stackRowAt(sv.cursor); ok {
+		sha = r.diffKey()
 	}
 	cd := sv.diffCache[sha]
 	avail := max(1, (m.height-barHeight)-3)
@@ -790,27 +947,13 @@ func (m Model) handleStackDiffPane(msg tea.KeyPressMsg, n int) (tea.Model, tea.C
 		setOff(prevFileLine(cd.scope.fileLines, cd.offset))
 	case "n":
 		m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
-		newSHA := ""
-		if n > 0 {
-			newSHA = sv.status.Commits[m.stackView.cursor].SHA
-		}
-		cmd := m.ensureCommitDiff(newSHA)
-		return m, cmd
+		return m, m.ensureCursorDiff()
 	case "p":
 		m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
-		newSHA := ""
-		if n > 0 {
-			newSHA = sv.status.Commits[m.stackView.cursor].SHA
-		}
-		cmd := m.ensureCommitDiff(newSHA)
-		return m, cmd
+		return m, m.ensureCursorDiff()
 	case "o":
 		if sv.status != nil && n > 0 {
-			c := sv.status.Commits[clamp(sv.cursor, 0, n-1)]
-			if c.PR != nil && c.PR.URL != "" {
-				return m, openURLCmd(c.PR.URL)
-			}
-			return m, m.flashCmd("no PR for this commit")
+			return m.openRowPR(sv.cursor)
 		}
 	}
 	return m, nil
@@ -828,14 +971,11 @@ func (m Model) stackDiffWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	sv := m.stackView
-	n := 0
-	if sv.status != nil {
-		n = len(sv.status.Commits)
-	}
-	if n == 0 || m.stackView.diffCache == nil {
+	r, ok := m.stackRowAt(sv.cursor)
+	if !ok || m.stackView.diffCache == nil {
 		return m, nil
 	}
-	sha := sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA
+	sha := r.diffKey()
 	cd, ok := m.stackView.diffCache[sha]
 	if !ok {
 		return m, nil
@@ -967,15 +1107,16 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 
 	// Commit list, windowed to keep the cursor visible. Each row gives the whole
 	// subject the width its facts don't need, with the facts flush right.
-	if len(st.Commits) == 0 {
+	list := m.stackRows()
+	if len(list) == 0 {
 		rows = append(rows, trunc(dimStyle.Render("(no commits ahead of main)")))
 	} else {
 		chrome := 6
 		budget := clamp(m.height-barHeight-chrome, 1, stackMaxBodyRows)
-		listH := min(len(st.Commits), budget)
-		start, end := windowBounds(len(st.Commits), cursor, listH)
+		listH := min(len(list), budget)
+		start, end := windowBounds(len(list), cursor, listH)
 		for i := start; i < end; i++ {
-			rows = append(rows, m.stackCommitRow(st.Commits[i], i == cursor, innerW))
+			rows = append(rows, m.stackListRow(list[i], i == cursor, innerW))
 		}
 	}
 	rows = append(rows, "")
@@ -1015,7 +1156,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 // active pane; a faint rule; a two-column body pairing the narrow commit list
 // (left) with the cursored commit's patch (right); and a focus-dependent footer.
 func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
-	commits := st.Commits
+	commits := m.stackRows()
 	focus := m.stackView.splitFocus
 
 	paneName := func(name string, active bool) string {
@@ -1044,7 +1185,7 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 		start, end := windowBounds(len(commits), cursor, avail)
 		row := 0
 		for i := start; i < end && row < avail; i++ {
-			left[row] = m.stackCommitRowCompact(commits[i], i == cursor, leftW)
+			left[row] = m.stackListRowCompact(commits[i], i == cursor, leftW)
 			row++
 		}
 	}
@@ -1055,14 +1196,21 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 	case len(commits) == 0:
 		right[0] = dimStyle.Render("(no commits ahead of main)")
 	default:
-		cd, have := m.stackView.diffCache[commits[clamp(cursor, 0, len(commits)-1)].SHA]
+		cd, have := m.stackView.diffCache[commits[clamp(cursor, 0, len(commits)-1)].diffKey()]
 		switch {
 		case !have || cd.loading:
 			right[0] = dimStyle.Render("loading diff…")
 		case cd.err != nil:
 			right[0] = errStyle.Render("diff failed: " + cd.err.Error())
 		case cd.scope.files == 0:
-			right[0] = dimStyle.Render("(no changes in this commit)")
+			// The uncommitted row can legitimately empty out under the cursor —
+			// the work gets committed or reverted while the pane is open — and
+			// "no changes in this commit" would read as nonsense there.
+			if commits[clamp(cursor, 0, len(commits)-1)].uncommitted() {
+				right[0] = dimStyle.Render("(nothing uncommitted)")
+			} else {
+				right[0] = dimStyle.Render("(no changes in this commit)")
+			}
 		default:
 			start := clamp(cd.offset, 0, max(0, len(cd.scope.lines)-1))
 			end := min(len(cd.scope.lines), start+avail)
@@ -1126,6 +1274,58 @@ func stackJustify(left, right string, innerW int) string {
 		return left
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// stackGlyphUncommitted marks the synthetic uncommitted row. It matches the
+// marker the deck already uses for a dirty worktree, so the two surfaces agree
+// on what "there is work here that isn't committed" looks like.
+const stackGlyphUncommitted = "✷"
+
+// uncommittedLabel is the subject text of the uncommitted row.
+const uncommittedLabel = "uncommitted"
+
+// uncommittedFacts spells out the uncommitted row's right-hand facts from the
+// deck's already-computed diffstat. Add/Del cover tracked edits only — the
+// diffstat git can count — so a worktree carrying nothing but new files reads
+// "untracked only" rather than a bare "+0 −0".
+func (m Model) uncommittedFacts() string {
+	it, ok := m.activeByKey(m.stackView.key)
+	if !ok {
+		return uncommittedLabel
+	}
+	if it.view.Add+it.view.Del == 0 {
+		return "untracked only"
+	}
+	return fmt.Sprintf("+%d −%d", it.view.Add, it.view.Del)
+}
+
+// stackListRow renders one row of the full-width stack list, dispatching between
+// a commit and the synthetic uncommitted row.
+func (m Model) stackListRow(r stackRow, selected bool, innerW int) string {
+	if !r.uncommitted() {
+		return m.stackCommitRow(*r.commit, selected, innerW)
+	}
+	factsP := m.uncommittedFacts()
+	factsW := lipgloss.Width(factsP)
+	name := ansi.Truncate(uncommittedLabel, max(4, innerW-2-factsW-2), "")
+	gap := max(1, innerW-2-lipgloss.Width(name)-factsW)
+	if selected {
+		return selBar("▸ "+name+strings.Repeat(" ", gap)+factsP, innerW)
+	}
+	return stackWaitStyle.Render(stackGlyphUncommitted) + " " + nameStyle.Render(name) +
+		strings.Repeat(" ", gap) + dimStyle.Render(factsP)
+}
+
+// stackListRowCompact is stackListRow for the split view's narrow left column.
+func (m Model) stackListRowCompact(r stackRow, selected bool, width int) string {
+	if !r.uncommitted() {
+		return m.stackCommitRowCompact(*r.commit, selected, width)
+	}
+	subj := ansi.Truncate(uncommittedLabel, max(1, width-2), "")
+	if selected {
+		return selBar("▸ "+subj, width)
+	}
+	return padLine(stackWaitStyle.Render(stackGlyphUncommitted)+" "+nameStyle.Render(subj), width)
 }
 
 // stackCommitRow lays out one commit line: a state glyph (or the ▸ cursor
