@@ -1850,3 +1850,120 @@ func TestStackFooterSeparatesPreviewFromLeaving(t *testing.T) {
 		}
 	}
 }
+
+// --- narrow-terminal handling ---
+
+// TestStackSplitNeverOverflows sweeps every viable terminal width and asserts no
+// rendered row is wider than the terminal. The split used to compute its two
+// column widths with independent clamps, so each could satisfy its own floor
+// while their sum overran: a 30-column window drew 37-column rows, which wrap and
+// shear the layout. The sweep starts at minViableWidth because View refuses to
+// draw anything narrower.
+func TestStackSplitNeverOverflows(t *testing.T) {
+	for w := minViableWidth; w <= 200; w++ {
+		m, key := stackSplitModel()
+		m.width, m.height = w, 24
+		// Set the flag directly: a resize down from a wide terminal leaves it set
+		// while the renderer must cope, which is the case that used to break.
+		m.stackView.split = true
+		m.applyStackCommitDiff(stackCommitDiffMsg{
+			key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+		for i, line := range strings.Split(m.renderStack(m.height-barHeight), "\n") {
+			if got := ansi.StringWidth(line); got > w {
+				t.Fatalf("width %d: line %d is %d wide:\n%q", w, i, got, ansi.Strip(line))
+			}
+		}
+	}
+}
+
+// TestStackSplitColumnsFillTheWidth checks the columns are derived from one
+// another rather than clamped independently, so they tile the terminal exactly.
+func TestStackSplitColumnsFillTheWidth(t *testing.T) {
+	for w := stackSplitMinWidth; w <= 200; w++ {
+		m, key := stackSplitModel()
+		m.width, m.height = w, 24
+		m = enterSplit(t, m)
+		m.applyStackCommitDiff(stackCommitDiffMsg{
+			key: key, sha: "aaa111", body: strings.Repeat("+padding line\n", 100),
+			stat: splitCommitStat()})
+
+		lines := strings.Split(m.renderStackSplit(*m.stackView.status, 0, 24-barHeight), "\n")
+		// The divider column must land in the same place on every body row.
+		var col = -1
+		for _, l := range lines[2 : len(lines)-1] {
+			stripped := ansi.Strip(l)
+			b := strings.Index(stripped, "│")
+			if b < 0 {
+				continue
+			}
+			// Display columns, not bytes: the glyphs left of the divider (▸, ✓, ○)
+			// are multi-byte, so a byte offset would report phantom drift.
+			idx := ansi.StringWidth(stripped[:b])
+			if col == -1 {
+				col = idx
+			} else if idx != col {
+				t.Fatalf("width %d: divider column drifted from %d to %d", w, col, idx)
+			}
+		}
+		if col == -1 {
+			t.Fatalf("width %d: no divider found", w)
+		}
+	}
+}
+
+// TestStackNarrowFallsBackToTheList checks a terminal too narrow for two columns
+// shows the plain stack list rather than a sheared split, and that the key
+// routing agrees with the renderer about which surface is on screen.
+func TestStackNarrowFallsBackToTheList(t *testing.T) {
+	m, _ := stackSplitModel()
+	m.width, m.height = stackSplitMinWidth-1, 24
+	m.stackView.split = true
+
+	if m.splitShown() {
+		t.Fatal("the preview must not claim to be shown below the minimum width")
+	}
+	out := ansi.Strip(m.renderStack(m.height - barHeight))
+	if strings.Contains(out, "[split]") {
+		t.Errorf("a too-narrow terminal should fall back to the list:\n%s", out)
+	}
+	if !strings.Contains(out, "STACK") {
+		t.Errorf("the fallback should still be the stack list:\n%s", out)
+	}
+
+	// Key routing must follow: tab flips panes only when the panes are drawn.
+	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	if mm.(Model).stackView.splitFocus != paneStack {
+		t.Error("tab should not flip pane focus while the preview is not shown")
+	}
+
+	// Widening brings it back without the user re-pressing d.
+	m.width = stackSplitMinWidth
+	if !m.splitShown() {
+		t.Fatal("widening past the minimum should restore the preview")
+	}
+	if !strings.Contains(ansi.Strip(m.renderStack(m.height-barHeight)), "[split]") {
+		t.Error("the restored preview should render as a split")
+	}
+}
+
+// TestStackDRefusesWhenTooNarrow checks d says why rather than appearing broken.
+func TestStackDRefusesWhenTooNarrow(t *testing.T) {
+	m, _ := stackSplitModel()
+	m.width, m.height = stackSplitMinWidth-1, 24
+
+	mm, cmd := m.handleStack(keyPress('d'))
+	m = mm.(Model)
+	if m.stackView.split {
+		t.Fatal("d should not open a preview the terminal cannot lay out")
+	}
+	if cmd == nil {
+		t.Fatal("d should flash an explanation rather than silently no-op")
+	}
+	// At the threshold it opens as usual.
+	m.width = stackSplitMinWidth
+	mm, cmd = m.handleStack(keyPress('d'))
+	if !mm.(Model).stackView.split || cmd == nil {
+		t.Fatal("d should open the preview at the minimum viable width")
+	}
+}
