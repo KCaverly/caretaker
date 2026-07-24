@@ -1727,3 +1727,38 @@ func TestStackUncommittedEmptyReadsSensibly(t *testing.T) {
 		t.Errorf("the commit-specific empty message leaked onto the uncommitted row:\n%s", pane)
 	}
 }
+
+// TestStackSplitFooterNamesOneExit pins the footer against re-growing a second
+// advertised way to leave the preview. d still works as the toggle that opened
+// it; it is simply not claimed alongside esc. The label matters too — "list"
+// collided with tab's own hint, which really does move focus to the list pane.
+func TestStackSplitFooterNamesOneExit(t *testing.T) {
+	m, _ := stackSplitModel()
+	m.width, m.height = 160, 40
+	m = enterSplit(t, m)
+
+	for _, focus := range []splitPane{paneStack, paneDiff} {
+		m.stackView.splitFocus = focus
+		out := ansi.Strip(m.renderStackSplit(*m.stackView.status, 0, m.height-barHeight))
+		footer := out[strings.LastIndex(out, "\n")+1:]
+
+		if !strings.Contains(footer, "close preview") {
+			t.Errorf("focus %v: footer should name the exit:\n%s", focus, footer)
+		}
+		if strings.Contains(footer, "d close") {
+			t.Errorf("focus %v: d should not be advertised as a second exit:\n%s", focus, footer)
+		}
+		if strings.Contains(footer, "esc list") {
+			t.Errorf("focus %v: esc must not reuse tab's pane label:\n%s", focus, footer)
+		}
+	}
+
+	// The binding itself is untouched: d still toggles the preview shut.
+	mm, _ := m.handleStack(keyPress('d'))
+	if mm.(Model).stackView.split {
+		t.Fatal("d should still close the preview even though the footer no longer says so")
+	}
+	if !mm.(Model).stackOpen {
+		t.Fatal("closing the preview must leave the stack overlay open")
+	}
+}
