@@ -846,8 +846,14 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, tea.Cmd) {
 	sv := m.stackView
 	switch msg.String() {
-	case "esc", "q", "d":
-		// esc/q and a second d both step out of split; the overlay stays open.
+	case "esc", "q":
+		// Leaving is the shared switch's job. esc steps all the way out of the
+		// stack screen rather than unwinding the preview first: one key, one
+		// concept. Returning handled=false hands it down before the focus
+		// dispatch below can swallow it.
+		return false, m, nil
+	case "d":
+		// d owns the preview in both directions — it is the key that opened it.
 		m.stackView.split = false
 		m.stackView.splitFocus = paneStack
 		return true, m, nil
@@ -1047,7 +1053,7 @@ func (m Model) stackViewport() int {
 func (m Model) renderStack(h int) string {
 	sv := m.stackView
 	confirmFooter := keyhint("enter", "run") + "   " + keyhint("esc", "cancel")
-	closeFooter := keyhint("↑↓ / j k", "scroll") + "   " + keyhint("r", "refresh") + "   " + keyhint("esc", "close")
+	closeFooter := keyhint("↑↓ / j k", "scroll") + "   " + keyhint("r", "refresh") + "   " + keyhint("esc", "return")
 	switch {
 	case sv.working:
 		return m.renderStackText([]string{dimStyle.Render("working…")}, closeFooter, h)
@@ -1145,7 +1151,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 		parts = append(parts, keyhint("M", "merge"))
 	}
 	parts = append(parts, keyhint("d", "preview"), keyhint("v", "diff"), keyhint("o", "open PR"),
-		keyhint("esc", "deck"), keyhint("r", "refresh"))
+		keyhint("esc", "return"), keyhint("r", "refresh"))
 	rows = append(rows, trunc("  "+strings.Join(parts, "   ")))
 
 	return renderPanel(rows, innerW, m.width, h)
@@ -1222,26 +1228,25 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 		}
 	}
 
-	// One way out, named once. d still toggles the preview shut — it is the key
-	// that opened it — but advertising both it and esc for the same action left
-	// the footer claiming two exits. esc is the one that generalises: it is the
-	// step-out key everywhere else in the app.
+	// Two keys, two concepts: d owns the preview (it opened it, it closes it),
+	// esc leaves the stack screen entirely. Neither is a second name for the
+	// other, which is what the old "d close · esc list" pairing implied.
 	//
-	// "close preview" rather than "list": tab's hints already name the panes, so
-	// an esc labelled "list" read as a third way to move focus rather than as
-	// the thing that dismantles the split.
+	// esc is deliberately not labelled "list": tab's hints already name the
+	// panes, so an esc sitting beside them under a pane's name read as a third
+	// way to move focus rather than as the way out.
 	var footer string
 	if focus == paneStack {
 		footer = "  " + strings.Join([]string{
 			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
 			keyhint("v", "branch diff"), keyhint("o", "PR"),
-			keyhint("esc", "close preview"),
+			keyhint("d", "close preview"), keyhint("esc", "return"),
 		}, helpStyle.Render(" · "))
 	} else {
 		footer = "  " + strings.Join([]string{
 			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
 			keyhint("n / p", "commit"), keyhint("tab", "list"),
-			keyhint("esc", "close preview"),
+			keyhint("d", "close preview"), keyhint("esc", "return"),
 		}, helpStyle.Render(" · "))
 	}
 

@@ -1312,25 +1312,74 @@ func TestStackSplitScrollWithoutCache(t *testing.T) {
 	}
 }
 
-// TestStackSplitEscIsTwoStep checks esc unwinds one layer at a time: the first
-// closes the preview, the second closes the overlay.
-func TestStackSplitEscIsTwoStep(t *testing.T) {
+// TestStackEscReturnsFromAnywhere checks esc means one thing everywhere on the
+// stack screen: leave, and hand back whatever screen opened it. It no longer
+// unwinds the preview first — d owns that — so the preview being open costs no
+// extra keypress on the way out.
+func TestStackEscReturnsFromAnywhere(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(Model) Model
+	}{
+		{"plain status", func(m Model) Model { return m }},
+		{"preview open, list focused", func(m Model) Model { return enterSplit(t, m) }},
+		{"preview open, diff focused", func(m Model) Model {
+			m = enterSplit(t, m)
+			mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+			return mm.(Model)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := stackSplitModel()
+			// The screen the stack panel was opened over must be handed back
+			// untouched — the overlay never owned it.
+			m.screen = screenAgent
+			m = tc.setup(m)
+
+			mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyEscape})
+			m = mm.(Model)
+			if m.stackOpen {
+				t.Fatal("esc should leave the stack screen in one step")
+			}
+			if m.screen != screenAgent {
+				t.Fatalf("esc should return to the originating screen, got %v", m.screen)
+			}
+		})
+	}
+}
+
+// TestStackPreviewIsDToggle is the other half: d, not esc, opens and closes the
+// preview, and closing it keeps you on the stack screen.
+func TestStackPreviewIsDToggle(t *testing.T) {
 	m, _ := stackSplitModel()
 	m = enterSplit(t, m)
 
-	mm, _ := m.handleStack(tea.KeyPressMsg{Code: tea.KeyEscape})
+	mm, _ := m.handleStack(keyPress('d'))
 	m = mm.(Model)
 	if m.stackView.split {
-		t.Fatal("the first esc should leave split mode")
+		t.Fatal("d should close the preview")
 	}
 	if !m.stackOpen || m.stackView.status == nil {
-		t.Fatal("the first esc must keep the stack overlay and its status")
+		t.Fatal("closing the preview must keep the stack screen and its status")
 	}
-
-	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyEscape})
+	// And it toggles back open from the diff pane too, not just the list. This
+	// re-open reuses the cached patch, so unlike enterSplit it issues no fetch.
+	mm, _ = m.handleStack(keyPress('d'))
 	m = mm.(Model)
-	if m.stackOpen {
-		t.Fatal("the second esc should close the stack overlay")
+	if !m.stackView.split {
+		t.Fatal("d should re-open the preview")
+	}
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = mm.(Model)
+	if m.stackView.splitFocus != paneDiff {
+		t.Fatal("precondition: tab should focus the diff pane")
+	}
+	mm, _ = m.handleStack(keyPress('d'))
+	if mm.(Model).stackView.split {
+		t.Fatal("d should close the preview from the diff pane too")
+	}
+	if !mm.(Model).stackOpen {
+		t.Fatal("closing the preview from the diff pane must keep the screen open")
 	}
 }
 
@@ -1728,37 +1777,37 @@ func TestStackUncommittedEmptyReadsSensibly(t *testing.T) {
 	}
 }
 
-// TestStackSplitFooterNamesOneExit pins the footer against re-growing a second
-// advertised way to leave the preview. d still works as the toggle that opened
-// it; it is simply not claimed alongside esc. The label matters too — "list"
-// collided with tab's own hint, which really does move focus to the list pane.
-func TestStackSplitFooterNamesOneExit(t *testing.T) {
+// TestStackFooterSeparatesPreviewFromLeaving pins the footers against the two
+// keys blurring back together: d is advertised for the preview, esc for
+// leaving, and esc never borrows a pane name from tab's hints.
+func TestStackFooterSeparatesPreviewFromLeaving(t *testing.T) {
 	m, _ := stackSplitModel()
 	m.width, m.height = 160, 40
-	m = enterSplit(t, m)
 
+	// Plain status: d opens the preview, esc returns.
+	status := ansi.Strip(m.renderStackStatus(*m.stackView.status, 0, m.height-barHeight))
+	if !strings.Contains(status, "esc return") {
+		t.Errorf("the status footer should say esc returns:\n%s", status)
+	}
+	if strings.Contains(status, "esc deck") {
+		t.Errorf("esc no longer always lands on the deck, so it must not claim to:\n%s", status)
+	}
+
+	// Preview open, both focuses.
+	m = enterSplit(t, m)
 	for _, focus := range []splitPane{paneStack, paneDiff} {
 		m.stackView.splitFocus = focus
 		out := ansi.Strip(m.renderStackSplit(*m.stackView.status, 0, m.height-barHeight))
 		footer := out[strings.LastIndex(out, "\n")+1:]
 
-		if !strings.Contains(footer, "close preview") {
-			t.Errorf("focus %v: footer should name the exit:\n%s", focus, footer)
+		if !strings.Contains(footer, "d") || !strings.Contains(footer, "close preview") {
+			t.Errorf("focus %v: d should own closing the preview:\n%s", focus, footer)
 		}
-		if strings.Contains(footer, "d close") {
-			t.Errorf("focus %v: d should not be advertised as a second exit:\n%s", focus, footer)
+		if !strings.Contains(footer, "esc return") {
+			t.Errorf("focus %v: esc should be named as the way out:\n%s", focus, footer)
 		}
-		if strings.Contains(footer, "esc list") {
-			t.Errorf("focus %v: esc must not reuse tab's pane label:\n%s", focus, footer)
+		if strings.Contains(footer, "esc list") || strings.Contains(footer, "esc close preview") {
+			t.Errorf("focus %v: esc must not be labelled as a preview or pane action:\n%s", focus, footer)
 		}
-	}
-
-	// The binding itself is untouched: d still toggles the preview shut.
-	mm, _ := m.handleStack(keyPress('d'))
-	if mm.(Model).stackView.split {
-		t.Fatal("d should still close the preview even though the footer no longer says so")
-	}
-	if !mm.(Model).stackOpen {
-		t.Fatal("closing the preview must leave the stack overlay open")
 	}
 }
