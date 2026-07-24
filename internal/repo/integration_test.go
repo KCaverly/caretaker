@@ -422,3 +422,70 @@ func TestDiffCommitRootFallback(t *testing.T) {
 		t.Errorf("root stat = %+v, want greet.txt +3 −0", fs)
 	}
 }
+
+// TestUntrackedFilesLeavesPathsLiteral is the regression guard for path quoting.
+// Plain `git status --porcelain` wraps any path that isn't simple ASCII in
+// double quotes and escapes non-ASCII bytes octally, so a file called
+// `spaced name.txt` comes back as `"spaced name.txt"` and an accented one as
+// `"unicod\303\251.txt"`. Both forms are useless: the viewer would print the
+// quotes, and nothing can open the escaped path. -z suppresses quoting, and this
+// test pins that by round-tripping through the filesystem — the paths returned
+// have to be openable.
+func TestUntrackedFilesLeavesPathsLiteral(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.email", "t@t.t"},
+		{"config", "user.name", "t"},
+	} {
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	// A committed file so the repo has a HEAD, then untracked files whose names
+	// git would otherwise quote.
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Git(dir, "add", "."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Git(dir, "commit", "-m", "root"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"plain.txt", "spaced name.txt", "unicodé.txt"}
+	for _, name := range want {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("new\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := UntrackedFiles(Worktree{Path: dir})
+	if err != nil {
+		t.Fatalf("UntrackedFiles: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d untracked paths, got %d: %q", len(want), len(got), got)
+	}
+	for _, name := range want {
+		found := false
+		for _, g := range got {
+			if g == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("untracked path %q missing or mangled; got %q", name, got)
+		}
+	}
+	// The real proof: every returned path must resolve on disk as-is.
+	for _, g := range got {
+		if _, err := os.Stat(filepath.Join(dir, g)); err != nil {
+			t.Errorf("returned path %q is not openable: %v", g, err)
+		}
+	}
+}
