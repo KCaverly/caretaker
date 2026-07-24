@@ -1651,7 +1651,7 @@ func (m Model) renderHelp(h int) string {
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
 		row("v", "view diff (deck)"),
-		row("s", "stack screen (↑↓ / j k move · s submit · R restack · v diff · o open PR)"),
+		row("s", "stack screen (↑↓ / j k move · d preview · s submit · R restack · o open PR)"),
 		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),

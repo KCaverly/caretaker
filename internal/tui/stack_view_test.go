@@ -815,14 +815,6 @@ func TestStackScreenNav(t *testing.T) {
 		t.Fatalf("R should restack: working=%v cmd=%v", m.stackView.working, cmd != nil)
 	}
 
-	// v jumps to the deck's diff viewer.
-	m, _ = stackNavModel(t)
-	mm, _ = m.handleStack(tea.KeyPressMsg{Code: 'v', Text: "v"})
-	m = mm.(Model)
-	if m.stackOpen || !m.diffOpen || m.screen != screenPicker {
-		t.Fatalf("v should open the diff: stackOpen=%v diffOpen=%v screen=%v", m.stackOpen, m.diffOpen, m.screen)
-	}
-
 	// enter is inert on a plain status: every row is the same worktree, so there
 	// is nothing per-row to open; the screen stays put.
 	m, _ = stackNavModel(t)
@@ -1128,8 +1120,8 @@ func TestStackSplitFocusFlip(t *testing.T) {
 	m = enterSplit(t, m)
 
 	listOut := m.renderStack(m.height - barHeight)
-	if !strings.Contains(ansi.Strip(listOut), "branch diff") {
-		t.Errorf("the list pane's footer should offer the whole-branch diff:\n%s", ansi.Strip(listOut))
+	if !strings.Contains(ansi.Strip(listOut), "PR") {
+		t.Errorf("the list pane's footer should offer the list-only actions:\n%s", ansi.Strip(listOut))
 	}
 
 	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -1142,8 +1134,8 @@ func TestStackSplitFocusFlip(t *testing.T) {
 	if !strings.Contains(stripped, "scroll") || !strings.Contains(stripped, "n / p") {
 		t.Errorf("the diff pane's footer should offer scroll and commit stepping:\n%s", stripped)
 	}
-	if strings.Contains(stripped, "branch diff") {
-		t.Errorf("the diff pane's footer should drop the list-only hints:\n%s", stripped)
+	if strings.Contains(stripped, "commit\u00a0") || strings.Contains(stripped, "] / [ file") == false {
+		t.Errorf("the diff pane's footer should carry its own hints:\n%s", stripped)
 	}
 	// The header's active-pane label is styled, so the raw frames must differ
 	// even where the stripped text overlaps.
@@ -1384,8 +1376,7 @@ func TestStackPreviewIsDToggle(t *testing.T) {
 }
 
 // TestStackSplitActionsStillReachTheStack checks split mode does not shadow the
-// whole-stack actions: o still opens the cursored commit's PR and v still hands
-// off to the deck's whole-branch diff viewer.
+// whole-stack actions: o still opens the cursored commit's PR from either pane.
 func TestStackSplitActionsStillReachTheStack(t *testing.T) {
 	// o from the list pane.
 	m, _ := stackSplitModel()
@@ -1398,18 +1389,66 @@ func TestStackSplitActionsStillReachTheStack(t *testing.T) {
 	if _, cmd := mm.(Model).handleStack(keyPress('o')); cmd == nil {
 		t.Error("o with the diff pane focused should still open the PR")
 	}
+}
 
-	// v hands off to the whole-branch diff viewer, closing the stack overlay.
-	m, _ = stackSplitModel()
-	m = enterSplit(t, m)
-	mm, _ = m.handleStack(keyPress('v'))
-	m = mm.(Model)
-	if m.stackOpen || !m.diffOpen || m.screen != screenPicker {
-		t.Fatalf("v should still open the branch diff: stackOpen=%v diffOpen=%v screen=%v",
-			m.stackOpen, m.diffOpen, m.screen)
+// TestStackVIsGone pins the removal. v used to tear the stack screen down and
+// teleport to the deck's whole-branch diff, losing the cursor on the way; the
+// preview covers reading a diff now, and the uncommitted row covers the one
+// thing the preview could not reach. v must be inert here — and in particular
+// must not still be leaking through split mode's fall-through list.
+func TestStackVIsGone(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(Model) Model
+	}{
+		{"plain status", func(m Model) Model { return m }},
+		{"preview open", func(m Model) Model { return enterSplit(t, m) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := stackSplitModel()
+			m.screen = screenAgent
+			m = tc.setup(m)
+			wantSplit := m.stackView.split
+
+			mm, cmd := m.handleStack(keyPress('v'))
+			m = mm.(Model)
+			if cmd != nil {
+				t.Error("v should issue no command on the stack screen")
+			}
+			if !m.stackOpen {
+				t.Error("v should not close the stack screen")
+			}
+			if m.diffOpen {
+				t.Error("v should no longer hand off to the deck's diff viewer")
+			}
+			if m.screen != screenAgent {
+				t.Errorf("v should not move the user to another screen, got %v", m.screen)
+			}
+			if m.stackView.split != wantSplit {
+				t.Error("v should not disturb the preview")
+			}
+		})
 	}
-	if m.stackView.split {
-		t.Error("handing off to the diff viewer should clear the split state")
+}
+
+// TestStackFootersDropTheBranchDiff guards the hint alongside the binding, in
+// both the plain list and the preview.
+func TestStackFootersDropTheBranchDiff(t *testing.T) {
+	m, _ := stackSplitModel()
+	m.width, m.height = 160, 40
+
+	status := ansi.Strip(m.renderStackStatus(*m.stackView.status, 0, m.height-barHeight))
+	if strings.Contains(status, "v diff") {
+		t.Errorf("the status footer should no longer offer v:\n%s", status)
+	}
+
+	m = enterSplit(t, m)
+	for _, focus := range []splitPane{paneStack, paneDiff} {
+		m.stackView.splitFocus = focus
+		out := ansi.Strip(m.renderStackSplit(*m.stackView.status, 0, m.height-barHeight))
+		if strings.Contains(out, "branch diff") {
+			t.Errorf("focus %v: the preview footer should no longer offer v:\n%s", focus, out)
+		}
 	}
 }
 
