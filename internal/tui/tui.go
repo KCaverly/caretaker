@@ -4252,9 +4252,9 @@ func (m Model) diffBodyHeight() int {
 }
 
 // handleDiff routes key events while the diff viewer is open: esc/q close it,
-// the movement keys scroll (clamped to the content), J/K jump between file
-// headers, u toggles the scope, and x closes the diff and drops into the remove
-// flow for the same worktree. Everything else is swallowed.
+// the movement keys scroll (clamped to the content), ] and [ (or J/K) jump
+// between file headers, u toggles the scope, and x closes the diff and drops
+// into the remove flow for the same worktree. Everything else is swallowed.
 func (m Model) handleDiff(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sc := m.diffView.active()
 	avail := m.diffBodyHeight()
@@ -4275,9 +4275,11 @@ func (m Model) handleDiff(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.diffView.offset = 0
 	case "G":
 		m.diffView.offset = maxOff
-	case "J", "]":
+	case "]", "J":
+		// Both spellings work in both viewers; ] / [ is what each advertises,
+		// since J/K sits one shift away from the j/k that scroll.
 		m.diffView.offset = nextFileLine(sc.fileLines, m.diffView.offset, maxOff)
-	case "K", "[":
+	case "[", "K":
 		m.diffView.offset = prevFileLine(sc.fileLines, m.diffView.offset)
 	case "u":
 		m.diffView.scopeUncommitted = !m.diffView.scopeUncommitted

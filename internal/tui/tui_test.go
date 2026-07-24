@@ -3460,3 +3460,62 @@ func TestDiffSwallowsUnknownKeys(t *testing.T) {
 		t.Error("esc should close the diff")
 	}
 }
+
+// TestDiffViewersAgreeOnFileJumps pins the two diff surfaces to one story about
+// file jumping. Both have always accepted ] / [ and J / K, but each footer
+// advertised only one spelling and they disagreed about which, so the same
+// action looked like two different features depending on which surface you
+// reached it from.
+func TestDiffViewersAgreeOnFileJumps(t *testing.T) {
+	fileBody := func(name string) string {
+		var b strings.Builder
+		b.WriteString("diff --git a/" + name + " b/" + name + "\n@@ -1,1 +1,30 @@\n")
+		for i := 0; i < 30; i++ {
+			b.WriteString("+line\n")
+		}
+		return b.String()
+	}
+	body := fileBody("one.go") + fileBody("two.go")
+	stat := []repo.FileStat{{Path: "one.go", Add: 30}, {Path: "two.go", Add: 30}}
+
+	// Both spellings jump forward, and both jump back.
+	for _, k := range []rune{']', 'J'} {
+		m := openSampleDiff(t, 0, stat, nil, body, "", nil, false)
+		mm, _ := m.handleDiff(tea.KeyPressMsg{Code: k, Text: string(k)})
+		if got := mm.(Model).diffView.offset; got == 0 {
+			t.Errorf("deck viewer: %q should jump to the next file header", k)
+		}
+	}
+	for _, k := range []rune{'[', 'K'} {
+		m := openSampleDiff(t, 0, stat, nil, body, "", nil, false)
+		mm, _ := m.handleDiff(tea.KeyPressMsg{Code: 'G', Text: "G"})
+		m = mm.(Model)
+		landed := m.diffView.offset
+		mm, _ = m.handleDiff(tea.KeyPressMsg{Code: k, Text: string(k)})
+		if got := mm.(Model).diffView.offset; got >= landed {
+			t.Errorf("deck viewer: %q should jump back to an earlier file header", k)
+		}
+	}
+
+	// And the footer names the same spelling the stack preview does, rather than
+	// each surface teaching a different key for one action.
+	m := openSampleDiff(t, 0, stat, nil, body, "", nil, false)
+	deck := ansi.Strip(m.renderDiff(m.height - barHeight))
+	if !strings.Contains(deck, "] / [") {
+		t.Errorf("the deck viewer should advertise ] / [ for file jumps:\n%s", deck)
+	}
+	if strings.Contains(deck, "J/K") {
+		t.Errorf("the deck viewer should not advertise a second, different spelling:\n%s", deck)
+	}
+
+	sm, key := stackSplitModel()
+	sm.width, sm.height = 160, 40
+	sm = enterSplit(t, sm)
+	sm.stackView.splitFocus = paneDiff
+	sm.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+	preview := ansi.Strip(sm.renderStackSplit(*sm.stackView.status, 0, sm.height-barHeight))
+	if !strings.Contains(preview, "] / [") {
+		t.Errorf("the stack preview should advertise the same spelling:\n%s", preview)
+	}
+}
