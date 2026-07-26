@@ -11,6 +11,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/KCaverly/caretaker/internal/diffpager"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/stack"
 )
@@ -53,10 +54,13 @@ type stackView struct {
 
 	// split mode: `d` collapses the list to a narrow left column and opens the
 	// cursored commit's patch in a right pane. splitFocus routes keys to the list
-	// or the diff pane; diffCache holds each commit's fetched/rendered patch keyed
-	// by full SHA (nil until a fetch is kicked; cleared on refresh).
+	// or the diff pane; diffZoom hides the list so the diff fills the width (for a
+	// side-by-side pager, or just more room); diffCache holds each commit's
+	// fetched/rendered patch keyed by full SHA (nil until a fetch is kicked;
+	// cleared on refresh).
 	split      bool
 	splitFocus splitPane
+	diffZoom   bool
 	diffCache  map[string]stackCommitDiff
 }
 
@@ -159,7 +163,22 @@ func (m Model) stackRowAt(cursor int) (stackRow, bool) {
 // to the plain list, and the key routing has to agree with the renderer about
 // that or keys would drive a pane nobody can see.
 func (m Model) splitShown() bool {
-	return m.stackView.split && m.stackView.status != nil && m.width >= stackSplitMinWidth
+	if !m.stackView.split || m.stackView.status == nil {
+		return false
+	}
+	// Zoomed, the preview is a single full-width column, which fits any viable
+	// terminal; only the two-column layout needs room for both columns at once.
+	if m.stackView.diffZoom {
+		return true
+	}
+	return m.width >= stackSplitMinWidth
+}
+
+// stackDiffFocused reports whether keys and the wheel should drive the diff
+// pane: either it holds focus, or the list is zoomed away and the diff is the
+// only pane on screen.
+func (m Model) stackDiffFocused() bool {
+	return m.stackView.diffZoom || m.stackView.splitFocus == paneDiff
 }
 
 // stackCommitDiff is one commit's per-commit diff in the split pane's cache:
@@ -219,6 +238,19 @@ type stackCommitDiffMsg struct {
 	// how many more were left unrendered by stackUntrackedCap.
 	untracked      []string
 	untrackedExtra int
+
+	// chunks is the external formatter's rendering of body, when one is
+	// configured and succeeded; nil means render body with ct's built-in
+	// styling. There is one field because there is one body: the uncommitted
+	// row concatenates the tracked patch and the untracked files' contents
+	// before formatting, so the formatter sees — and chunks describe — exactly
+	// what the viewer renders.
+	chunks []diffpager.Chunk
+
+	// pagerErr is not err. err means there is no diff to show and the pane
+	// prints a red line instead; pagerErr means only that the formatter did not
+	// work out, and the diff still renders with built-in styling.
+	pagerErr error
 }
 
 // --- params ---
@@ -333,17 +365,26 @@ func (m Model) mergeStackCmd(key string, p stack.Params) tea.Cmd {
 // commit's patch and numstat via repo.DiffCommit/NumstatCommit. Any git error
 // short-circuits into the message's err, which the handler stores so the pane
 // shows a red line rather than a stale/blank diff.
+//
+// The configured formatter runs here too, for the same reason the git calls do:
+// it spawns a process per file, and applyStackCommitDiff runs on the UI
+// goroutine. width is captured up front so the closure never reads m.
 func (m Model) fetchCommitDiffCmd(key, dir, sha string) tea.Cmd {
+	opts := m.diffOptions()
+	pager := m.diffPager()
+	width := m.width
 	return func() tea.Msg {
-		body, err := repo.DiffCommit(dir, sha)
+		body, err := repo.DiffCommit(dir, sha, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: sha, err: err}
 		}
-		stat, err := repo.NumstatCommit(dir, sha)
+		stat, err := repo.NumstatCommit(dir, sha, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: sha, err: err}
 		}
-		return stackCommitDiffMsg{key: key, sha: sha, body: body, stat: stat}
+		msg := stackCommitDiffMsg{key: key, sha: sha, body: body, stat: stat}
+		msg.chunks, msg.pagerErr = renderDiffPager(pager, dir, body, width)
+		return msg
 	}
 }
 
@@ -355,18 +396,25 @@ func (m Model) fetchCommitDiffCmd(key, dir, sha string) tea.Cmd {
 //
 // Untracked rendering is capped; the surplus is reported so the section rule can
 // say how much was left out.
+//
+// The configured formatter runs here, after the two bodies are joined, so it
+// sees one patch covering both tracked and new files — the same text the viewer
+// would otherwise style itself.
 func (m Model) fetchUncommittedDiffCmd(key, dir string) tea.Cmd {
+	opts := m.diffOptions()
+	pager := m.diffPager()
+	width := m.width
 	return func() tea.Msg {
 		wt := repo.Worktree{Path: dir}
-		body, err := repo.DiffUncommitted(wt)
+		body, err := repo.DiffUncommitted(wt, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
 		}
-		stat, err := repo.NumstatUncommitted(wt)
+		stat, err := repo.NumstatUncommitted(wt, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
 		}
-		untracked, err := repo.UntrackedFiles(wt)
+		untracked, err := repo.UntrackedFiles(wt, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
 		}
@@ -377,14 +425,16 @@ func (m Model) fetchUncommittedDiffCmd(key, dir string) tea.Cmd {
 		}
 		// A per-path read failure is already swallowed inside DiffUntracked, so
 		// the tracked patch still renders even if a new file vanished mid-fetch.
-		newFiles, err := repo.DiffUntracked(dir, untracked)
+		newFiles, err := repo.DiffUntracked(dir, untracked, opts)
 		if err != nil {
 			return stackCommitDiffMsg{key: key, sha: uncommittedKey, err: err}
 		}
-		return stackCommitDiffMsg{
+		msg := stackCommitDiffMsg{
 			key: key, sha: uncommittedKey, body: body + newFiles, stat: stat,
 			untracked: untracked, untrackedExtra: extra,
 		}
+		msg.chunks, msg.pagerErr = renderDiffPager(pager, dir, msg.body, width)
+		return msg
 	}
 }
 
@@ -609,7 +659,7 @@ func (m *Model) applyStackCommitDiff(msg stackCommitDiffMsg) {
 		}
 	}
 	var b diffBuilder
-	files, add, del := appendDiffSection(&b, title, meta, msg.stat, msg.untracked, msg.body, m.width)
+	files, add, del := appendDiffSection(&b, title, meta, msg.stat, msg.untracked, msg.body, msg.chunks, m.width)
 	scope := finishScope(b, files, add, del)
 	// Carry the scroll position across a re-fetch. Commits are only ever fetched
 	// once so this is inert for them, but the uncommitted row revalidates on every
@@ -772,6 +822,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			m.stackView.split = true
 			m.stackView.splitFocus = paneStack
+			m.stackView.diffZoom = false
 			return m, m.ensureCursorDiff()
 		}
 	case "r":
@@ -855,13 +906,14 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleStackSplit routes keys while split mode is active. handled is true for
-// every key it fully owns (the d toggle-off, tab focus flip, list navigation,
-// and — via handleStackDiffPane — diff scrolling and n/p). It returns handled
-// false for esc/q, which leave the screen entirely, and for a paneStack action
-// key (s/R/M/a/u/r/o), leaving handleStack's shared switch to run the whole-stack
-// action; those keys make no state change here, so the returned model is
-// unchanged.
+// handleStackSplit routes keys while the preview is on screen. handled is true
+// for every key it fully owns (the d toggle-off, z zoom, tab focus flip, list
+// navigation, and — via handleStackDiffPane — diff scrolling and n/p). The diff
+// pane owns keys whenever it holds focus or the list is zoomed away. It returns
+// handled false for esc/q, which leave the screen entirely, and for a paneStack
+// action key (s/R/M/a/u/r/o), leaving handleStack's shared switch to run the
+// whole-stack action; those keys make no state change here, so the returned
+// model is unchanged.
 func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, tea.Cmd) {
 	sv := m.stackView
 	switch msg.String() {
@@ -875,8 +927,19 @@ func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, te
 		// d owns the preview in both directions — it is the key that opened it.
 		m.stackView.split = false
 		m.stackView.splitFocus = paneStack
+		m.stackView.diffZoom = false
+		return true, m, nil
+	case "z":
+		// Zoom the diff: hide the commit list so the patch gets the whole width.
+		// This is what makes a side-by-side pager legible — two code columns need
+		// room the list would otherwise be taking. Toggles back to two columns.
+		m.stackView.diffZoom = !sv.diffZoom
 		return true, m, nil
 	case "tab", "shift+tab":
+		if sv.diffZoom {
+			// Zoomed, the diff is the only pane; there is nothing to flip to.
+			return true, m, nil
+		}
 		if sv.splitFocus == paneStack {
 			m.stackView.splitFocus = paneDiff
 		} else {
@@ -885,7 +948,7 @@ func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, te
 		return true, m, nil
 	}
 
-	if sv.splitFocus == paneDiff {
+	if m.stackDiffFocused() {
 		mm, cmd := m.handleStackDiffPane(msg, n)
 		return true, mm, cmd
 	}
@@ -1176,13 +1239,16 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	return renderPanel(rows, innerW, m.width, h)
 }
 
-// renderStackSplit draws split mode edge-to-edge (full m.width, like renderDiff,
+// renderStackSplit draws the preview edge-to-edge (full m.width, like renderDiff,
 // not the centered panel): a header naming the repo/worktree, base, and the
-// active pane; a faint rule; a two-column body pairing the narrow commit list
-// (left) with the cursored commit's patch (right); and a focus-dependent footer.
+// layout; a faint rule; the body; and a footer. The body is normally two columns
+// — the narrow commit list beside the cursored commit's patch — but when zoomed
+// the list is dropped and the patch spans the whole width.
 func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 	commits := m.stackRows()
+	zoom := m.stackView.diffZoom
 	focus := m.stackView.splitFocus
+	avail := max(1, h-3)
 
 	paneName := func(name string, active bool) string {
 		if active {
@@ -1190,94 +1256,121 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 		}
 		return dimStyle.Render(name)
 	}
-	hdr := headerStyle.Render("STACK") + "  " + repoHdrStyle.Render(st.Repo) +
-		dimStyle.Render("/") + nameStyle.Render(st.Worktree) +
-		dimStyle.Render("   base: "+st.MainBranch) + dimStyle.Render("   [split] ") +
+	layout := dimStyle.Render("   [split] ") +
 		paneName("list", focus == paneStack) + dimStyle.Render(" · ") +
 		paneName("diff", focus == paneDiff)
+	if zoom {
+		layout = dimStyle.Render("   [zoom] ") + helpKeyStyle.Render("diff")
+	}
+	hdr := headerStyle.Render("STACK") + "  " + repoHdrStyle.Render(st.Repo) +
+		dimStyle.Render("/") + nameStyle.Render(st.Worktree) +
+		dimStyle.Render("   base: "+st.MainBranch) + layout
 	rule := diffRuleStyle.Render(strings.Repeat("─", max(1, m.width)))
 
-	avail := max(1, h-3)
-	// The three parts must sum to exactly m.width. Deriving rightW from leftW
-	// rather than clamping both independently is what guarantees that: the old
-	// pair of clamps could each satisfy its own floor and still overrun.
-	maxLeft := max(stackSplitMinLeft, m.width-stackSplitDivider-stackSplitMinRight)
-	leftW := clamp(min(38, m.width/3), stackSplitMinLeft, maxLeft)
-	rightW := max(1, m.width-leftW-stackSplitDivider)
+	var body []string
+	if zoom {
+		// One full-width column: the list is hidden, so the patch — and a
+		// side-by-side pager in particular — gets the whole terminal.
+		body = m.stackDiffColumn(commits, cursor, m.width, avail)
+	} else {
+		// The three parts must sum to exactly m.width. Deriving rightW from leftW
+		// rather than clamping both independently is what guarantees that: the old
+		// pair of clamps could each satisfy its own floor and still overrun.
+		maxLeft := max(stackSplitMinLeft, m.width-stackSplitDivider-stackSplitMinRight)
+		leftW := clamp(min(38, m.width/3), stackSplitMinLeft, maxLeft)
+		rightW := max(1, m.width-leftW-stackSplitDivider)
 
-	// Left column: the windowed commit list, one compact row each.
-	left := make([]string, avail)
-	for i := range left {
-		left[i] = strings.Repeat(" ", leftW)
-	}
-	if len(commits) > 0 {
-		start, end := windowBounds(len(commits), cursor, avail)
-		row := 0
-		for i := start; i < end && row < avail; i++ {
-			left[row] = m.stackListRowCompact(commits[i], i == cursor, leftW)
-			row++
+		left := make([]string, avail)
+		for i := range left {
+			left[i] = strings.Repeat(" ", leftW)
 		}
-	}
-
-	// Right column: the cursored commit's cached patch, windowed by its offset.
-	right := make([]string, avail)
-	switch {
-	case len(commits) == 0:
-		right[0] = dimStyle.Render("(no commits ahead of main)")
-	default:
-		cd, have := m.stackView.diffCache[commits[clamp(cursor, 0, len(commits)-1)].diffKey()]
-		switch {
-		case !have || cd.loading:
-			right[0] = dimStyle.Render("loading diff…")
-		case cd.err != nil:
-			right[0] = errStyle.Render("diff failed: " + cd.err.Error())
-		case cd.scope.files == 0:
-			// The uncommitted row can legitimately empty out under the cursor —
-			// the work gets committed or reverted while the pane is open — and
-			// "no changes in this commit" would read as nonsense there.
-			if commits[clamp(cursor, 0, len(commits)-1)].uncommitted() {
-				right[0] = dimStyle.Render("(nothing uncommitted)")
-			} else {
-				right[0] = dimStyle.Render("(no changes in this commit)")
-			}
-		default:
-			start := clamp(cd.offset, 0, max(0, len(cd.scope.lines)-1))
-			end := min(len(cd.scope.lines), start+avail)
+		if len(commits) > 0 {
+			start, end := windowBounds(len(commits), cursor, avail)
 			row := 0
 			for i := start; i < end && row < avail; i++ {
-				right[row] = ansi.Truncate(cd.scope.lines[i], rightW, "")
+				left[row] = m.stackListRowCompact(commits[i], i == cursor, leftW)
 				row++
 			}
 		}
+		right := m.stackDiffColumn(commits, cursor, rightW, avail)
+		body = joinColumns(left, right, leftW)
 	}
 
-	// Two keys, two concepts: d owns the preview (it opened it, it closes it),
-	// esc leaves the stack screen entirely. Neither is a second name for the
-	// other, which is what the old "d close · esc list" pairing implied.
-	//
-	// esc is deliberately not labelled "list": tab's hints already name the
-	// panes, so an esc sitting beside them under a pane's name read as a third
-	// way to move focus rather than as the way out.
-	var footer string
-	if focus == paneStack {
-		footer = "  " + strings.Join([]string{
-			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
-			keyhint("o", "PR"), keyhint("d", "close preview"),
-			keyhint("esc", "return"),
-		}, helpStyle.Render(" · "))
-	} else {
-		footer = "  " + strings.Join([]string{
-			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
-			keyhint("n / p", "commit"), keyhint("tab", "list"),
-			keyhint("d", "close preview"), keyhint("esc", "return"),
-		}, helpStyle.Render(" · "))
-	}
+	footer := "  " + strings.Join(m.stackSplitFooter(zoom, focus), helpStyle.Render(" · "))
 
 	out := make([]string, 0, avail+3)
 	out = append(out, ansi.Truncate(hdr, m.width, ""), rule)
-	out = append(out, joinColumns(left, right, leftW)...)
+	out = append(out, body...)
 	out = append(out, ansi.Truncate(footer, m.width, ""))
 	return strings.Join(out, "\n")
+}
+
+// stackDiffColumn renders the cursored row's cached patch into avail lines
+// windowed to width: a one-line status while the patch is loading, empty, or
+// errored, otherwise the patch body from its current scroll offset. Shared by
+// the two-column layout (as the right column) and the zoomed layout (full width).
+func (m Model) stackDiffColumn(commits []stackRow, cursor, width, avail int) []string {
+	col := make([]string, avail)
+	if len(commits) == 0 {
+		col[0] = dimStyle.Render("(no commits ahead of main)")
+		return col
+	}
+	row := commits[clamp(cursor, 0, len(commits)-1)]
+	cd, have := m.stackView.diffCache[row.diffKey()]
+	switch {
+	case !have || cd.loading:
+		col[0] = dimStyle.Render("loading diff…")
+	case cd.err != nil:
+		col[0] = errStyle.Render("diff failed: " + cd.err.Error())
+	case cd.scope.files == 0:
+		// The uncommitted row can legitimately empty out under the cursor — the
+		// work gets committed or reverted while the pane is open — and "no changes
+		// in this commit" would read as nonsense there.
+		if row.uncommitted() {
+			col[0] = dimStyle.Render("(nothing uncommitted)")
+		} else {
+			col[0] = dimStyle.Render("(no changes in this commit)")
+		}
+	default:
+		start := clamp(cd.offset, 0, max(0, len(cd.scope.lines)-1))
+		end := min(len(cd.scope.lines), start+avail)
+		r := 0
+		for i := start; i < end && r < avail; i++ {
+			col[r] = ansi.Truncate(cd.scope.lines[i], width, "")
+			r++
+		}
+	}
+	return col
+}
+
+// stackSplitFooter picks the preview footer for the current layout. d always owns
+// the preview and esc always leaves the screen; z toggles the zoom, named for
+// what the next press does (hide vs. show the list). esc is deliberately not
+// labelled "list": tab already hints a pane by that name, so an esc beside it
+// under a pane's name would read as a third way to move focus rather than the way
+// out.
+func (m Model) stackSplitFooter(zoom bool, focus splitPane) []string {
+	switch {
+	case zoom:
+		return []string{
+			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
+			keyhint("n / p", "commit"), keyhint("z", "show list"),
+			keyhint("d", "close preview"), keyhint("esc", "return"),
+		}
+	case focus == paneStack:
+		return []string{
+			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
+			keyhint("o", "PR"), keyhint("z", "zoom"),
+			keyhint("d", "close preview"), keyhint("esc", "return"),
+		}
+	default:
+		return []string{
+			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
+			keyhint("n / p", "commit"), keyhint("tab", "list"),
+			keyhint("z", "zoom"), keyhint("d", "close preview"),
+			keyhint("esc", "return"),
+		}
+	}
 }
 
 // joinColumns zips the left and right split columns row-for-row, padding the
