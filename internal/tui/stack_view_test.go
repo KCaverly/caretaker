@@ -1486,3 +1486,244 @@ func TestStackStatusFooterAdvertisesPreview(t *testing.T) {
 		t.Errorf("the status footer should advertise the d preview:\n%s", out)
 	}
 }
+
+// --- uncommitted row ---
+
+// dirtyStackModel is stackSplitModel with the worktree carrying uncommitted
+// work, which is what makes the synthetic trailing row appear.
+func dirtyStackModel(add, del int) (Model, string) {
+	m, key := stackSplitModel()
+	m.active[0].view.Dirty = true
+	m.active[0].view.Add, m.active[0].view.Del = add, del
+	return m, key
+}
+
+// TestStackRowsAppendUncommitted pins where the row lives and when. Commits are
+// bottom-first, so uncommitted work — which sits above the tip — is last.
+func TestStackRowsAppendUncommitted(t *testing.T) {
+	clean, _ := stackSplitModel()
+	rows := clean.stackRows()
+	if len(rows) != 2 {
+		t.Fatalf("a clean worktree should show only its commits, got %d rows", len(rows))
+	}
+	for i, r := range rows {
+		if r.uncommitted() {
+			t.Fatalf("row %d should be a commit on a clean worktree", i)
+		}
+	}
+
+	dirty, _ := dirtyStackModel(4, 2)
+	rows = dirty.stackRows()
+	if len(rows) != 3 {
+		t.Fatalf("a dirty worktree should append one row, got %d", len(rows))
+	}
+	if !rows[2].uncommitted() {
+		t.Fatal("the uncommitted row must come last — it sits above the tip")
+	}
+	if rows[2].diffKey() != uncommittedKey {
+		t.Fatalf("uncommitted row key = %q, want the sentinel", rows[2].diffKey())
+	}
+	// The sentinel must not be mistakable for a SHA.
+	for _, r := range rows[:2] {
+		if r.diffKey() == uncommittedKey {
+			t.Fatal("a commit key collided with the uncommitted sentinel")
+		}
+	}
+}
+
+// TestStackUncommittedRowIsReachableAndFetches walks the cursor onto the row and
+// checks it drives the preview like any other.
+func TestStackUncommittedRowIsReachableAndFetches(t *testing.T) {
+	m, key := dirtyStackModel(4, 2)
+	m = enterSplit(t, m)
+
+	// G jumps to the last row, which is now the uncommitted one.
+	mm, cmd := m.handleStack(keyPress('G'))
+	m = mm.(Model)
+	if m.stackView.cursor != 2 {
+		t.Fatalf("G should land on the uncommitted row (index 2), got %d", m.stackView.cursor)
+	}
+	if cmd == nil {
+		t.Fatal("landing on the uncommitted row should fetch its diff")
+	}
+	if cd, ok := m.stackView.diffCache[uncommittedKey]; !ok || !cd.loading {
+		t.Fatalf("first landing should mark the row loading, cache = %+v", m.stackView.diffCache)
+	}
+	// The fetch must be the uncommitted one, keyed by the sentinel.
+	msg, ok := cmd().(stackCommitDiffMsg)
+	if !ok {
+		t.Fatalf("expected a stackCommitDiffMsg, got %T", cmd())
+	}
+	if msg.sha != uncommittedKey || msg.key != key {
+		t.Fatalf("fetch should target the uncommitted row, got sha=%q key=%q", msg.sha, msg.key)
+	}
+}
+
+// TestStackUncommittedRowAlwaysRevalidates is the core of the caching split: a
+// commit's patch is immutable and cached forever, but uncommitted work changes
+// under the screen, so every landing must re-issue the fetch.
+func TestStackUncommittedRowAlwaysRevalidates(t *testing.T) {
+	m, key := dirtyStackModel(4, 2)
+	m = enterSplit(t, m)
+
+	// Populate both rows.
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: splitCommitDiff, stat: splitCommitStat()})
+
+	// Re-landing on a cached commit issues nothing.
+	m.stackView.cursor = 1
+	mm, cmd := m.handleStack(keyPress('k')) // onto commit 0, already cached
+	m = mm.(Model)
+	if cmd != nil {
+		t.Fatal("a cached commit patch should not re-fetch — commits are immutable")
+	}
+
+	// Re-landing on the uncommitted row always does.
+	m.stackView.cursor = 1
+	mm, cmd = m.handleStack(keyPress('j'))
+	m = mm.(Model)
+	if m.stackView.cursor != 2 {
+		t.Fatalf("expected to land on the uncommitted row, got cursor %d", m.stackView.cursor)
+	}
+	if cmd == nil {
+		t.Fatal("the uncommitted row must revalidate on every landing")
+	}
+	// And it must not flash: the already-fetched patch stays on screen.
+	if cd := m.stackView.diffCache[uncommittedKey]; cd.loading || cd.scope.files == 0 {
+		t.Fatalf("revalidation should keep the previous patch visible, got %+v", cd)
+	}
+}
+
+// TestStackUncommittedScrollSurvivesRevalidation guards the thing that would
+// make the row unusable while an agent writes to the worktree: re-fetching must
+// not snap the reader back to the top.
+func TestStackUncommittedScrollSurvivesRevalidation(t *testing.T) {
+	m, key := dirtyStackModel(4, 2)
+	m = enterSplit(t, m)
+	long := strings.Repeat("+a line\n", 200)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: long, stat: splitCommitStat()})
+
+	e := m.stackView.diffCache[uncommittedKey]
+	e.offset = 42
+	m.stackView.diffCache[uncommittedKey] = e
+
+	// A fresh fetch of the same row lands.
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: long, stat: splitCommitStat()})
+	if got := m.stackView.diffCache[uncommittedKey].offset; got != 42 {
+		t.Fatalf("scroll offset should survive revalidation, got %d want 42", got)
+	}
+
+	// But it must clamp when the new content is shorter than the old offset.
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: "+one\n", stat: splitCommitStat()})
+	cd := m.stackView.diffCache[uncommittedKey]
+	if cd.offset >= len(cd.scope.lines) {
+		t.Fatalf("offset %d should be clamped into %d lines", cd.offset, len(cd.scope.lines))
+	}
+}
+
+// TestStackUncommittedRowHasNoPR checks o degrades to a flash rather than
+// opening something wrong or panicking on the nil commit.
+func TestStackUncommittedRowHasNoPR(t *testing.T) {
+	m, _ := dirtyStackModel(4, 2)
+	m.stackView.cursor = 2
+	mm, cmd := m.handleStack(keyPress('o'))
+	if cmd == nil {
+		t.Fatal("o on the uncommitted row should flash, not no-op")
+	}
+	_ = mm
+	// The commit rows still open their PR.
+	m.stackView.cursor = 0
+	if _, cmd := m.handleStack(keyPress('o')); cmd == nil {
+		t.Fatal("o on a commit with a PR should still open it")
+	}
+}
+
+// TestStackCursorSurvivesRefreshOnUncommittedRow is the regression guard for
+// clamping against commits instead of rows: a passive refresh while the cursor
+// sits on the uncommitted row must leave it there.
+func TestStackCursorSurvivesRefreshOnUncommittedRow(t *testing.T) {
+	m, key := dirtyStackModel(4, 2)
+	m.stackView.cursor = 2
+	m.applyStackStatus(stackStatusMsg{key: key, status: *m.stackView.status})
+	if m.stackView.cursor != 2 {
+		t.Fatalf("a refresh should leave the cursor on the uncommitted row, got %d", m.stackView.cursor)
+	}
+
+	// When the tree goes clean the row disappears and the cursor must come back
+	// into range rather than dangle past the end.
+	m.active[0].view.Dirty = false
+	m.applyStackStatus(stackStatusMsg{key: key, status: *m.stackView.status})
+	if m.stackView.cursor != 1 {
+		t.Fatalf("losing the row should clamp the cursor to the last commit, got %d", m.stackView.cursor)
+	}
+}
+
+// TestStackUncommittedRendersInListAndPane checks both surfaces actually show
+// it: the list row with its diffstat, and the pane with the patch under an
+// "uncommitted" section rule.
+func TestStackUncommittedRendersInListAndPane(t *testing.T) {
+	m, key := dirtyStackModel(47, 12)
+	m.width, m.height = 160, 40
+
+	// Full-width list.
+	plain := ansi.Strip(m.renderStackStatus(*m.stackView.status, 2, m.height-barHeight))
+	if !strings.Contains(plain, "uncommitted") {
+		t.Fatalf("the stack list should show the uncommitted row:\n%s", plain)
+	}
+	if !strings.Contains(plain, "+47") || !strings.Contains(plain, "−12") {
+		t.Fatalf("the row should carry the diffstat:\n%s", plain)
+	}
+
+	// Split pane, cursored onto the row with a patch cached.
+	m = enterSplit(t, m)
+	m.stackView.cursor = 2
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: splitCommitDiff,
+		stat: splitCommitStat(), untracked: []string{"brand-new.go"}})
+	split := ansi.Strip(m.renderStackSplit(*m.stackView.status, 2, m.height-barHeight))
+	for _, want := range []string{"uncommitted", "new token line", "brand-new.go"} {
+		if !strings.Contains(split, want) {
+			t.Errorf("split pane missing %q:\n%s", want, split)
+		}
+	}
+}
+
+// TestStackUncommittedUntrackedCapReported checks the surplus is surfaced rather
+// than silently dropped.
+func TestStackUncommittedUntrackedCapReported(t *testing.T) {
+	m, key := dirtyStackModel(1, 0)
+	m.width, m.height = 160, 40
+	m = enterSplit(t, m)
+	m.stackView.cursor = 2
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: uncommittedKey, body: splitCommitDiff,
+		stat: splitCommitStat(), untracked: []string{"a.go"}, untrackedExtra: 7})
+
+	pane := ansi.Strip(m.renderStackSplit(*m.stackView.status, 2, m.height-barHeight))
+	if !strings.Contains(pane, "7 more untracked") {
+		t.Errorf("the capped surplus should be named in the section rule:\n%s", pane)
+	}
+}
+
+// TestStackUncommittedEmptyReadsSensibly covers the row emptying out under the
+// cursor — the work gets committed while the pane is open.
+func TestStackUncommittedEmptyReadsSensibly(t *testing.T) {
+	m, key := dirtyStackModel(0, 0)
+	m.width, m.height = 160, 40
+	m = enterSplit(t, m)
+	m.stackView.cursor = 2
+	m.applyStackCommitDiff(stackCommitDiffMsg{key: key, sha: uncommittedKey})
+
+	pane := ansi.Strip(m.renderStackSplit(*m.stackView.status, 2, m.height-barHeight))
+	if !strings.Contains(pane, "nothing uncommitted") {
+		t.Errorf("an empty uncommitted row should say so, not talk about commits:\n%s", pane)
+	}
+	if strings.Contains(pane, "no changes in this commit") {
+		t.Errorf("the commit-specific empty message leaked onto the uncommitted row:\n%s", pane)
+	}
+}
