@@ -50,6 +50,32 @@ type stackView struct {
 	working        bool
 	confirmRestack bool
 	confirmReuse   bool
+
+	// split mode: `d` collapses the list to a narrow left column and opens the
+	// cursored commit's patch in a right pane. splitFocus routes keys to the list
+	// or the diff pane; diffCache holds each commit's fetched/rendered patch keyed
+	// by full SHA (nil until a fetch is kicked; cleared on refresh).
+	split      bool
+	splitFocus splitPane
+	diffCache  map[string]stackCommitDiff
+}
+
+// splitPane selects which half of split mode owns the keyboard.
+type splitPane int
+
+const (
+	paneStack splitPane = iota
+	paneDiff
+)
+
+// stackCommitDiff is one commit's per-commit diff in the split pane's cache:
+// loading while the fetch is in flight, err on a failed fetch, else the rendered
+// scope (reusing the diff viewer's scopeContent) and its scroll offset.
+type stackCommitDiff struct {
+	loading bool
+	err     error
+	scope   scopeContent
+	offset  int
 }
 
 // --- messages ---
@@ -84,6 +110,16 @@ type stackMergeMsg struct {
 	key string
 	res stack.MergeResult
 	err error
+}
+
+// stackCommitDiffMsg carries one per-commit diff fetch back to the UI goroutine.
+// key is the overlay's wsKey (so a fetch that lands after the overlay closed or
+// switched worktrees is dropped) and sha is the commit it renders.
+type stackCommitDiffMsg struct {
+	key, sha string
+	body     string
+	stat     []repo.FileStat
+	err      error
 }
 
 // --- params ---
@@ -194,6 +230,24 @@ func (m Model) mergeStackCmd(key string, p stack.Params) tea.Cmd {
 	}
 }
 
+// fetchCommitDiffCmd runs one per-commit diff fetch off the UI goroutine: the
+// commit's patch and numstat via repo.DiffCommit/NumstatCommit. Any git error
+// short-circuits into the message's err, which the handler stores so the pane
+// shows a red line rather than a stale/blank diff.
+func (m Model) fetchCommitDiffCmd(key, dir, sha string) tea.Cmd {
+	return func() tea.Msg {
+		body, err := repo.DiffCommit(dir, sha)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: sha, err: err}
+		}
+		stat, err := repo.NumstatCommit(dir, sha)
+		if err != nil {
+			return stackCommitDiffMsg{key: key, sha: sha, err: err}
+		}
+		return stackCommitDiffMsg{key: key, sha: sha, body: body, stat: stat}
+	}
+}
+
 func (m Model) archivePreflightCmd(it activeItem, p stack.Params) tea.Cmd {
 	return func() tea.Msg {
 		p.Fetch = true
@@ -263,6 +317,9 @@ func (m *Model) applyStackStatus(msg stackStatusMsg) {
 	m.stackView.confirmRestack = false
 	m.stackView.confirmReuse = false
 	m.stackView.offset = 0
+	// A fresh status invalidates every per-commit diff: SHAs may have changed
+	// under a restack/amend, so stale patches must not linger behind the split.
+	m.stackView.diffCache = nil
 	if msg.err != nil {
 		m.stackView.status = nil
 		m.stackView.body = stackErrorBody("status failed: "+msg.err.Error(), nil)
@@ -373,6 +430,57 @@ func (m *Model) applyStackMerge(msg stackMergeMsg) {
 	m.stackView.cursor = clampCursor(m.stackView.cursor, len(st.Commits))
 }
 
+// applyStackCommitDiff records one per-commit diff fetch into the split pane's
+// cache. A fetch that lands after the overlay closed or switched worktrees is
+// dropped by key. On success it renders the patch into a single-section
+// scopeContent (titled with the commit subject) via the diff viewer's builder,
+// reusing its J/K file-header indexing and +/− colouring.
+func (m *Model) applyStackCommitDiff(msg stackCommitDiffMsg) {
+	if !m.stackOpen || m.stackView.key != msg.key {
+		return
+	}
+	if m.stackView.diffCache == nil {
+		m.stackView.diffCache = map[string]stackCommitDiff{}
+	}
+	if msg.err != nil {
+		m.stackView.diffCache[msg.sha] = stackCommitDiff{err: msg.err}
+		return
+	}
+	title := "commit"
+	if m.stackView.status != nil {
+		for _, c := range m.stackView.status.Commits {
+			if c.SHA == msg.sha {
+				if c.Subject != "" {
+					title = c.Subject
+				}
+				break
+			}
+		}
+	}
+	var b diffBuilder
+	files, add, del := appendDiffSection(&b, title, "", msg.stat, nil, msg.body, m.width)
+	m.stackView.diffCache[msg.sha] = stackCommitDiff{scope: finishScope(b, files, add, del)}
+}
+
+// ensureCommitDiff kicks a per-commit diff fetch for sha when the cache has no
+// entry yet, marking it loading so the render path draws a "loading…" line and a
+// concurrent request won't re-issue. It returns nil when sha is empty or already
+// cached (loaded or loading).
+func (m *Model) ensureCommitDiff(sha string) tea.Cmd {
+	if sha == "" {
+		return nil
+	}
+	sv := &m.stackView
+	if sv.diffCache == nil {
+		sv.diffCache = map[string]stackCommitDiff{}
+	}
+	if _, ok := sv.diffCache[sha]; ok {
+		return nil
+	}
+	sv.diffCache[sha] = stackCommitDiff{loading: true}
+	return m.fetchCommitDiffCmd(sv.key, sv.params.WorktreeDir, sha)
+}
+
 // clampCursor keeps a commit-row cursor inside a list of n rows, collapsing to 0
 // for an empty list.
 func clampCursor(c, n int) int {
@@ -406,10 +514,12 @@ func stackErrorBody(msg string, executed []string) []string {
 // overlay's modal behavior and swallowing every other key so none leaks beneath.
 // esc/q close and r re-fetches in every state. The rest split on the render path:
 // with a structured status the cursor moves (j/k), submit (s), restack (R), diff
-// (v), and open PR (o) act on the stack, and g/G jump the cursor; enter is inert
-// here and only confirms a pending restack; with a text
-// body (an error or the restack dry-run plan) the shared movement keys scroll it and — in the
-// restack-confirm state — enter runs the restack for real.
+// (v), and open PR (o) act on the stack, and g/G jump the cursor; d toggles the
+// split diff-preview pane; enter is inert here and only confirms a pending
+// restack; with a text body (an error or the restack dry-run plan) the shared
+// movement keys scroll it and — in the restack-confirm state — enter runs the
+// restack for real. In split mode handleStackSplit intercepts first so its
+// navigation/focus keys don't double-fire against the shared switch.
 func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sv := m.stackView
 	avail := m.stackViewport()
@@ -417,6 +527,14 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	n := 0
 	if sv.status != nil {
 		n = len(sv.status.Commits)
+	}
+	if sv.split && sv.status != nil && !sv.working && !sv.confirmRestack {
+		handled, mm, cmd := m.handleStackSplit(msg, n)
+		if handled {
+			return mm, cmd
+		}
+		// Fell through (a paneStack action key): act on the whole stack below.
+		m = mm.(Model)
 	}
 	switch msg.String() {
 	case "esc", "q":
@@ -432,6 +550,15 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.stackView.working = true
 			m.stackView.confirmRestack = false
 			return m, m.restackStackCmd(sv.key, sv.params, false, sv.confirmReuse)
+		}
+	case "d":
+		// Toggle the split diff-preview pane. Entering kicks the cursored commit's
+		// diff fetch; the in-split toggle-off is handled by handleStackSplit.
+		if sv.status != nil && n > 0 && !sv.working && !sv.confirmRestack {
+			m.stackView.split = true
+			m.stackView.splitFocus = paneStack
+			cmd := m.ensureCommitDiff(sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA)
+			return m, cmd
 		}
 	case "r":
 		if !sv.working {
@@ -535,6 +662,166 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleStackSplit routes keys while split mode is active. handled is true for
+// every key it fully owns (the d/esc toggle-off, tab focus flip, list navigation,
+// and — via handleStackDiffPane — diff scrolling and n/p). It returns handled
+// false only for a paneStack action key (v/s/R/M/a/u/r/o), leaving handleStack's
+// shared switch to run the whole-stack action; those keys make no state change
+// here, so the returned model is unchanged.
+func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, tea.Cmd) {
+	sv := m.stackView
+	curSHA := func(c int) string {
+		if sv.status == nil || n == 0 {
+			return ""
+		}
+		return sv.status.Commits[clamp(c, 0, n-1)].SHA
+	}
+	switch msg.String() {
+	case "esc", "q", "d":
+		// esc/q and a second d both step out of split; the overlay stays open.
+		m.stackView.split = false
+		m.stackView.splitFocus = paneStack
+		return true, m, nil
+	case "tab", "shift+tab":
+		if sv.splitFocus == paneStack {
+			m.stackView.splitFocus = paneDiff
+		} else {
+			m.stackView.splitFocus = paneStack
+		}
+		return true, m, nil
+	}
+
+	if sv.splitFocus == paneDiff {
+		mm, cmd := m.handleStackDiffPane(msg, n)
+		return true, mm, cmd
+	}
+
+	// paneStack focus: navigation moves the cursor and prefetches the new commit's
+	// diff; action keys fall through to the shared whole-stack switch.
+	switch msg.String() {
+	case "j", "down":
+		m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
+		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
+		return true, m, cmd
+	case "k", "up":
+		m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
+		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
+		return true, m, cmd
+	case "g":
+		m.stackView.cursor = 0
+		cmd := m.ensureCommitDiff(curSHA(0))
+		return true, m, cmd
+	case "G":
+		m.stackView.cursor = max(0, n-1)
+		cmd := m.ensureCommitDiff(curSHA(m.stackView.cursor))
+		return true, m, cmd
+	case "v", "s", "R", "M", "a", "u", "r", "o":
+		return false, m, nil
+	}
+	return true, m, nil
+}
+
+// handleStackDiffPane routes keys while split mode's diff pane has focus: the
+// movement keys scroll the cached diff (clamped to its content), ]/[ jump between
+// file headers, n/p walk to the neighbouring commit (staying in the diff pane and
+// prefetching its diff), and o opens the cursored commit's PR. A missing/loading
+// cache entry makes the scroll ops no-ops. Everything else is swallowed.
+func (m Model) handleStackDiffPane(msg tea.KeyPressMsg, n int) (tea.Model, tea.Cmd) {
+	sv := m.stackView
+	sha := ""
+	if sv.status != nil && n > 0 {
+		sha = sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA
+	}
+	cd := sv.diffCache[sha]
+	avail := max(1, (m.height-barHeight)-3)
+	maxOff := max(0, len(cd.scope.lines)-avail)
+	setOff := func(o int) {
+		if m.stackView.diffCache == nil {
+			return
+		}
+		e, ok := m.stackView.diffCache[sha]
+		if !ok {
+			return
+		}
+		e.offset = clamp(o, 0, maxOff)
+		m.stackView.diffCache[sha] = e
+	}
+	switch msg.String() {
+	case "j", "down":
+		setOff(cd.offset + 1)
+	case "k", "up":
+		setOff(cd.offset - 1)
+	case "ctrl+d":
+		setOff(cd.offset + avail/2)
+	case "ctrl+u":
+		setOff(cd.offset - avail/2)
+	case "g":
+		setOff(0)
+	case "G":
+		setOff(maxOff)
+	case "]", "J":
+		setOff(nextFileLine(cd.scope.fileLines, cd.offset, maxOff))
+	case "[", "K":
+		setOff(prevFileLine(cd.scope.fileLines, cd.offset))
+	case "n":
+		m.stackView.cursor = clamp(sv.cursor+1, 0, max(0, n-1))
+		newSHA := ""
+		if n > 0 {
+			newSHA = sv.status.Commits[m.stackView.cursor].SHA
+		}
+		cmd := m.ensureCommitDiff(newSHA)
+		return m, cmd
+	case "p":
+		m.stackView.cursor = clamp(sv.cursor-1, 0, max(0, n-1))
+		newSHA := ""
+		if n > 0 {
+			newSHA = sv.status.Commits[m.stackView.cursor].SHA
+		}
+		cmd := m.ensureCommitDiff(newSHA)
+		return m, cmd
+	case "o":
+		if sv.status != nil && n > 0 {
+			c := sv.status.Commits[clamp(sv.cursor, 0, n-1)]
+			if c.PR != nil && c.PR.URL != "" {
+				return m, openURLCmd(c.PR.URL)
+			}
+			return m, m.flashCmd("no PR for this commit")
+		}
+	}
+	return m, nil
+}
+
+// stackDiffWheel scrolls split mode's focused diff pane by three lines per wheel
+// notch, clamped to the cursored commit's cached content. A missing cache entry
+// makes it a no-op.
+func (m Model) stackDiffWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	mo := msg.Mouse()
+	delta := 3
+	if mo.Button == tea.MouseWheelUp {
+		delta = -3
+	} else if mo.Button != tea.MouseWheelDown {
+		return m, nil
+	}
+	sv := m.stackView
+	n := 0
+	if sv.status != nil {
+		n = len(sv.status.Commits)
+	}
+	if n == 0 || m.stackView.diffCache == nil {
+		return m, nil
+	}
+	sha := sv.status.Commits[clamp(sv.cursor, 0, n-1)].SHA
+	cd, ok := m.stackView.diffCache[sha]
+	if !ok {
+		return m, nil
+	}
+	avail := max(1, (m.height-barHeight)-3)
+	maxOff := max(0, len(cd.scope.lines)-avail)
+	cd.offset = clamp(cd.offset+delta, 0, maxOff)
+	m.stackView.diffCache[sha] = cd
+	return m, nil
+}
+
 // openURLCmd opens url in the platform browser off the UI goroutine. Success is
 // silent — the browser is the feedback; a launch failure flashes as a sticky
 // error via the shared actionDoneMsg path.
@@ -601,6 +888,8 @@ func (m Model) renderStack(h int) string {
 		return m.renderStackText([]string{dimStyle.Render("working…")}, closeFooter, h)
 	case sv.confirmRestack:
 		return m.renderStackText(sv.body, confirmFooter, h)
+	case sv.split && sv.status != nil:
+		return m.renderStackSplit(*sv.status, sv.cursor, h)
 	case sv.status != nil:
 		return m.renderStackStatus(*sv.status, sv.cursor, h)
 	case len(sv.body) > 0:
@@ -689,11 +978,119 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	if stackCanMerge(st) {
 		parts = append(parts, keyhint("M", "merge"))
 	}
-	parts = append(parts, keyhint("v", "diff"), keyhint("o", "open PR"),
+	parts = append(parts, keyhint("d", "preview"), keyhint("v", "diff"), keyhint("o", "open PR"),
 		keyhint("esc", "deck"), keyhint("r", "refresh"))
 	rows = append(rows, trunc("  "+strings.Join(parts, "   ")))
 
 	return renderPanel(rows, innerW, m.width, h)
+}
+
+// renderStackSplit draws split mode edge-to-edge (full m.width, like renderDiff,
+// not the centered panel): a header naming the repo/worktree, base, and the
+// active pane; a faint rule; a two-column body pairing the narrow commit list
+// (left) with the cursored commit's patch (right); and a focus-dependent footer.
+func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
+	commits := st.Commits
+	focus := m.stackView.splitFocus
+
+	paneName := func(name string, active bool) string {
+		if active {
+			return helpKeyStyle.Render(name)
+		}
+		return dimStyle.Render(name)
+	}
+	hdr := headerStyle.Render("STACK") + "  " + repoHdrStyle.Render(st.Repo) +
+		dimStyle.Render("/") + nameStyle.Render(st.Worktree) +
+		dimStyle.Render("   base: "+st.MainBranch) + dimStyle.Render("   [split] ") +
+		paneName("list", focus == paneStack) + dimStyle.Render(" · ") +
+		paneName("diff", focus == paneDiff)
+	rule := diffRuleStyle.Render(strings.Repeat("─", max(1, m.width)))
+
+	avail := max(1, h-3)
+	leftW := clamp(min(38, m.width/3), 24, max(24, m.width-20))
+	rightW := max(10, m.width-leftW-3)
+
+	// Left column: the windowed commit list, one compact row each.
+	left := make([]string, avail)
+	for i := range left {
+		left[i] = strings.Repeat(" ", leftW)
+	}
+	if len(commits) > 0 {
+		start, end := windowBounds(len(commits), cursor, avail)
+		row := 0
+		for i := start; i < end && row < avail; i++ {
+			left[row] = m.stackCommitRowCompact(commits[i], i == cursor, leftW)
+			row++
+		}
+	}
+
+	// Right column: the cursored commit's cached patch, windowed by its offset.
+	right := make([]string, avail)
+	switch {
+	case len(commits) == 0:
+		right[0] = dimStyle.Render("(no commits ahead of main)")
+	default:
+		cd, have := m.stackView.diffCache[commits[clamp(cursor, 0, len(commits)-1)].SHA]
+		switch {
+		case !have || cd.loading:
+			right[0] = dimStyle.Render("loading diff…")
+		case cd.err != nil:
+			right[0] = errStyle.Render("diff failed: " + cd.err.Error())
+		case cd.scope.files == 0:
+			right[0] = dimStyle.Render("(no changes in this commit)")
+		default:
+			start := clamp(cd.offset, 0, max(0, len(cd.scope.lines)-1))
+			end := min(len(cd.scope.lines), start+avail)
+			row := 0
+			for i := start; i < end && row < avail; i++ {
+				right[row] = ansi.Truncate(cd.scope.lines[i], rightW, "")
+				row++
+			}
+		}
+	}
+
+	var footer string
+	if focus == paneStack {
+		footer = "  " + strings.Join([]string{
+			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
+			keyhint("v", "branch diff"), keyhint("o", "PR"),
+			keyhint("d", "close"), keyhint("esc", "list"),
+		}, helpStyle.Render(" · "))
+	} else {
+		footer = "  " + strings.Join([]string{
+			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
+			keyhint("n / p", "commit"), keyhint("tab", "list"),
+			keyhint("d", "close"), keyhint("esc", "list"),
+		}, helpStyle.Render(" · "))
+	}
+
+	out := make([]string, 0, avail+3)
+	out = append(out, ansi.Truncate(hdr, m.width, ""), rule)
+	out = append(out, joinColumns(left, right, leftW)...)
+	out = append(out, ansi.Truncate(footer, m.width, ""))
+	return strings.Join(out, "\n")
+}
+
+// joinColumns zips the left and right split columns row-for-row, padding the
+// left cell to leftW and separating the two with a dim ` │ ` divider. Missing
+// rows on either side render as blanks so the two columns stay aligned.
+func joinColumns(left, right []string, leftW int) []string {
+	n := len(left)
+	if len(right) > n {
+		n = len(right)
+	}
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		l, r := "", ""
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		out[i] = padLine(l, leftW) + " " + dimStyle.Render("│") + " " + r
+	}
+	return out
 }
 
 // stackJustify lays left and right on one row innerW wide with the gap between
@@ -718,6 +1115,33 @@ func (m Model) stackCommitRow(c stack.Commit, selected bool, innerW int) string 
 		return selBar("▸ "+name+strings.Repeat(" ", gap)+factsP, innerW)
 	}
 	return glyphFor(c) + " " + nameStyle.Render(name) + strings.Repeat(" ", gap) + facts(c)
+}
+
+// stackCommitRowCompact lays out one commit for the split view's narrow left
+// column: a status glyph, a space, the truncated subject, and — when the commit
+// carries a PR — a trailing dim "#<num>". The selected row is a full-width
+// selection bar; the whole row is padded/truncated to width.
+func (m Model) stackCommitRowCompact(c stack.Commit, selected bool, width int) string {
+	num := ""
+	if c.PR != nil {
+		num = fmt.Sprintf("#%d", c.PR.Number)
+	}
+	numW := lipgloss.Width(num)
+	subjW := max(1, width-2-numW-1)
+	subj := ansi.Truncate(c.Subject, subjW, "")
+	if selected {
+		text := "▸ " + subj
+		if num != "" {
+			text += " " + num
+		}
+		return selBar(text, width)
+	}
+	row := glyphFor(c) + " " + nameStyle.Render(subj)
+	if num != "" {
+		gap := max(1, width-2-lipgloss.Width(subj)-numW)
+		row += strings.Repeat(" ", gap) + dimStyle.Render(num)
+	}
+	return padLine(row, width)
 }
 
 const (

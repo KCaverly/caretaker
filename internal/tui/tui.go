@@ -1103,6 +1103,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyStackMerge(msg)
 		return m, nil
 
+	case stackCommitDiffMsg:
+		m.applyStackCommitDiff(msg)
+		return m, nil
+
 	case plasmaTickMsg:
 		if !m.plasmaShown() {
 			m.plasmaTicking = false // dormant; Update re-arms on return
@@ -1377,6 +1381,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// than falling through to the deck lists or a session beneath.
 		if m.diffOpen {
 			return m.diffWheel(msg)
+		}
+		if m.stackOpen && m.stackView.split && m.stackView.splitFocus == paneDiff {
+			return m.stackDiffWheel(msg)
 		}
 		if m.overlayOpen() {
 			return m, nil

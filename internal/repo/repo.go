@@ -360,6 +360,36 @@ func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
 	return parseNumstat(out), nil
 }
 
+// DiffCommit returns the unified diff a single commit introduces, via `git diff
+// --binary sha^ sha` (the commit against its parent). A root commit has no
+// parent, so on the sha^ lookup failing it falls back to `git show --format=
+// --binary sha`, which diffs the root against the empty tree. dir is any path
+// inside the worktree the commit lives in.
+func DiffCommit(dir, sha string) (string, error) {
+	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
+		return Git(dir, "show", "--format=", "--binary", sha)
+	}
+	return Git(dir, "diff", "--binary", sha+"^", sha)
+}
+
+// NumstatCommit returns a single commit's per-file change summary, parsed from
+// `git diff --numstat sha^ sha`, mirroring DiffCommit's root-commit fallback to
+// `git show --numstat --format= sha`.
+func NumstatCommit(dir, sha string) ([]FileStat, error) {
+	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
+		out, err := Git(dir, "show", "--numstat", "--format=", sha)
+		if err != nil {
+			return nil, err
+		}
+		return parseNumstat(out), nil
+	}
+	out, err := Git(dir, "diff", "--numstat", sha+"^", sha)
+	if err != nil {
+		return nil, err
+	}
+	return parseNumstat(out), nil
+}
+
 // parseNumstat parses `git diff --numstat` output: one tab-separated record per
 // line ("added\tdeleted\tpath"). A binary file has "-" for both counts, which we
 // surface as Binary with zero counts. Malformed lines (fewer than three fields)
