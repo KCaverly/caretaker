@@ -489,3 +489,93 @@ func TestUntrackedFilesLeavesPathsLiteral(t *testing.T) {
 		}
 	}
 }
+
+// TestDiffUntracked covers rendering untracked file contents: a text file
+// becomes a whole-file addition under a normal `diff --git` header (which is
+// what the viewer's file-jumping keys index on), a binary file collapses to
+// git's one-line notice instead of dumping its bytes, a path with a space
+// survives, and a path that has vanished since the status call is skipped
+// rather than failing the whole body.
+func TestDiffUntracked(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main"}, {"config", "user.email", "t@t.t"}, {"config", "user.name", "t"},
+	} {
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	write := func(name string, body []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("fresh.go", []byte("package main\n\nfunc main() {}\n"))
+	write("spaced name.txt", []byte("has a space\n"))
+	write("blob.bin", []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x03})
+
+	body, err := DiffUntracked(dir, []string{"fresh.go", "spaced name.txt", "blob.bin", "gone.txt"})
+	if err != nil {
+		t.Fatalf("DiffUntracked: %v", err)
+	}
+
+	for _, want := range []string{
+		"diff --git a/fresh.go b/fresh.go",
+		"new file mode",
+		"+package main",
+		"+func main() {}",
+		"spaced name.txt",
+		"+has a space",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("untracked body missing %q:\n%s", want, body)
+		}
+	}
+	// Binary contents must not be inlined — one notice line is the whole point.
+	if !strings.Contains(body, "blob.bin") {
+		t.Errorf("binary file should still be named:\n%s", body)
+	}
+	if !strings.Contains(body, "Binary files") {
+		t.Errorf("binary file should collapse to a notice, not its bytes:\n%s", body)
+	}
+	// A path listed by status but gone by the time we diff it is skipped, and
+	// must not take the other files' diffs down with it.
+	if strings.Contains(body, "gone.txt") {
+		t.Errorf("a vanished path should be skipped:\n%s", body)
+	}
+
+	// An empty path list is a legitimate, silent no-op (a clean-but-modified tree).
+	if out, err := DiffUntracked(dir, nil); err != nil || out != "" {
+		t.Errorf("no paths should yield an empty body and no error: %q %v", out, err)
+	}
+}
+
+// TestDiffUntrackedFeedsTheStyler pins the contract the TUI depends on: every
+// file in the body opens with a `diff --git` line, which is what the diff
+// builder records for its file-jump index.
+func TestDiffUntrackedFeedsTheStyler(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	if _, err := Git(dir, "init", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body, err := DiffUntracked(dir, []string{"a.txt", "b.txt"})
+	if err != nil {
+		t.Fatalf("DiffUntracked: %v", err)
+	}
+	if n := strings.Count(body, "diff --git"); n != 2 {
+		t.Fatalf("expected one file header per untracked file, got %d:\n%s", n, body)
+	}
+}

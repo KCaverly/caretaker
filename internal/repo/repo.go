@@ -4,6 +4,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -443,6 +444,35 @@ func UntrackedFiles(wt Worktree) ([]string, error) {
 	return parseUntracked(out), nil
 }
 
+// DiffUntracked returns a unified diff of the contents of paths — untracked
+// files, as returned by UntrackedFiles — concatenated into one body the diff
+// styler can consume unchanged. Each file is diffed against os.DevNull with
+// `git diff --no-index`, which renders it as a whole-file addition under a
+// normal `diff --git` header, so file-jumping and +/− colouring work on new
+// files exactly as they do on tracked ones. Binary files collapse to git's
+// one-line "Binary files … differ" rather than dumping their contents.
+//
+// The caller decides how many paths are worth rendering; each one costs a git
+// subprocess, so this walks whatever slice it is given and no more.
+//
+// A path that cannot be read is skipped rather than failing the whole body: an
+// untracked file is by definition not under git's control and can vanish or be
+// unreadable between the status call that listed it and this one, and losing
+// every other file's diff to that race would be a poor trade.
+func DiffUntracked(dir string, paths []string) (string, error) {
+	var b strings.Builder
+	for _, p := range paths {
+		// --no-index makes git compare two filesystem paths; exit 1 is its
+		// "these differ" signal, which is true of every file here.
+		out, err := git(dir, 1, "diff", "--no-index", "--", os.DevNull, p)
+		if err != nil {
+			continue
+		}
+		b.WriteString(out)
+	}
+	return b.String(), nil
+}
+
 // parseUntracked pulls the untracked-file paths ("?? path" records) out of `git
 // status --porcelain -z` output. Records are NUL-fenced rather than newline
 // separated, which is what lets a path contain spaces — or a newline — without
@@ -585,6 +615,14 @@ const gitTimeout = 30 * time.Second
 // reuse the same 30s-timeout, stderr-wrapping runner instead of shelling out
 // their own way.
 func Git(dir string, args ...string) (string, error) {
+	return git(dir, -1, args...)
+}
+
+// git runs a git command in dir, treating okExit as success in addition to 0.
+// Pass -1 to accept only 0. `diff --no-index` needs the escape hatch: it follows
+// diff(1) and reports "the inputs differ" as exit 1, which for a viewer is the
+// ordinary case rather than a failure, and its output is on stdout as usual.
+func git(dir string, okExit int, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -593,6 +631,13 @@ func Git(dir string, args ...string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// Only an ExitError carries a status worth forgiving; a timeout or a
+		// missing binary still fails. ExitCode is -1 when the process was
+		// signalled, which is why okExit uses -1 to mean "forgive nothing".
+		var ee *exec.ExitError
+		if okExit >= 0 && errors.As(err, &ee) && ee.ExitCode() == okExit {
+			return stdout.String(), nil
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
