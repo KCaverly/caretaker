@@ -695,14 +695,14 @@ func stackErrorBody(msg string, executed []string) []string {
 
 // handleStack routes keys while the stack screen is open, mirroring the usage
 // overlay's modal behavior and swallowing every other key so none leaks beneath.
-// esc/q close and r re-fetches in every state. The rest split on the render path:
-// with a structured status the cursor moves (j/k), submit (s), restack (R), diff
-// (v), and open PR (o) act on the stack, and g/G jump the cursor; d toggles the
-// split diff-preview pane; enter is inert here and only confirms a pending
-// restack; with a text body (an error or the restack dry-run plan) the shared
-// movement keys scroll it and — in the restack-confirm state — enter runs the
-// restack for real. In split mode handleStackSplit intercepts first so its
-// navigation/focus keys don't double-fire against the shared switch.
+// esc/q leave and r re-fetches in every state. The rest split on the render path:
+// with a structured status the cursor moves (j/k), submit (s), restack (R) and
+// open PR (o) act on the stack, and g/G jump the cursor; d toggles the diff
+// preview; enter is inert here and only confirms a pending restack; with a text
+// body (an error or the restack dry-run plan) the shared movement keys scroll it
+// and — in the restack-confirm state — enter runs the restack for real. In split
+// mode handleStackSplit intercepts first so its navigation/focus keys don't
+// double-fire against the shared switch.
 func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sv := m.stackView
 	avail := m.stackViewport()
@@ -787,23 +787,6 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.requestStackMerge(sv.key, sv.params, *sv.status)
 		}
-	case "v":
-		// Jump to the deck's read-only diff of everything the branch carries.
-		if sv.status != nil {
-			if it, ok := m.activeByKey(sv.key); ok {
-				m.stackOpen = false
-				m.stackView = stackView{}
-				m.screen = screenPicker
-				m.focus = focusActive
-				for i, a := range m.active {
-					if wsKey(a.repo.Name, a.view.WT.Name) == sv.key {
-						m.activeCursor = i
-						break
-					}
-				}
-				return m.openDiff(it)
-			}
-		}
 	case "o":
 		// Open the selected commit's PR in the browser.
 		if sv.status != nil && n > 0 {
@@ -838,11 +821,12 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleStackSplit routes keys while split mode is active. handled is true for
-// every key it fully owns (the d/esc toggle-off, tab focus flip, list navigation,
+// every key it fully owns (the d toggle-off, tab focus flip, list navigation,
 // and — via handleStackDiffPane — diff scrolling and n/p). It returns handled
-// false only for a paneStack action key (v/s/R/M/a/u/r/o), leaving handleStack's
-// shared switch to run the whole-stack action; those keys make no state change
-// here, so the returned model is unchanged.
+// false for esc/q, which leave the screen entirely, and for a paneStack action
+// key (s/R/M/a/u/r/o), leaving handleStack's shared switch to run the whole-stack
+// action; those keys make no state change here, so the returned model is
+// unchanged.
 func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, tea.Cmd) {
 	sv := m.stackView
 	switch msg.String() {
@@ -886,7 +870,7 @@ func (m Model) handleStackSplit(msg tea.KeyPressMsg, n int) (bool, tea.Model, te
 	case "G":
 		m.stackView.cursor = max(0, n-1)
 		return true, m, m.ensureCursorDiff()
-	case "v", "s", "R", "M", "a", "u", "r", "o":
+	case "s", "R", "M", "a", "u", "r", "o":
 		return false, m, nil
 	}
 	return true, m, nil
@@ -1150,7 +1134,7 @@ func (m Model) renderStackStatus(st stack.StackStatus, cursor, h int) string {
 	if stackCanMerge(st) {
 		parts = append(parts, keyhint("M", "merge"))
 	}
-	parts = append(parts, keyhint("d", "preview"), keyhint("v", "diff"), keyhint("o", "open PR"),
+	parts = append(parts, keyhint("d", "preview"), keyhint("o", "open PR"),
 		keyhint("esc", "return"), keyhint("r", "refresh"))
 	rows = append(rows, trunc("  "+strings.Join(parts, "   ")))
 
@@ -1239,8 +1223,8 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 	if focus == paneStack {
 		footer = "  " + strings.Join([]string{
 			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
-			keyhint("v", "branch diff"), keyhint("o", "PR"),
-			keyhint("d", "close preview"), keyhint("esc", "return"),
+			keyhint("o", "PR"), keyhint("d", "close preview"),
+			keyhint("esc", "return"),
 		}, helpStyle.Render(" · "))
 	} else {
 		footer = "  " + strings.Join([]string{
