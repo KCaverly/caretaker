@@ -426,27 +426,33 @@ func parseNumstat(out string) []FileStat {
 }
 
 // UntrackedFiles returns the worktree's untracked file paths — the "?? " entries
-// of `git status --porcelain`. They carry no diff body (git can't diff a file it
-// isn't tracking); the diff viewer lists them in its index so the branch's new
-// files aren't invisible.
+// of `git status --porcelain`. They carry no diff body of their own (git can't
+// diff a file it isn't tracking), so the diff viewer lists them in its index and
+// DiffUntracked renders their contents.
+//
+// -z is load-bearing, not a micro-optimisation. Without it git quotes any path
+// that isn't plain ASCII — `?? "spaced name.txt"`, and non-ASCII bytes escaped
+// octally as `"unicod\303\251.txt"` — which the viewer would print verbatim and
+// DiffUntracked could not open. -z turns quoting off and NUL-fences the records
+// instead, so paths come back exactly as they sit on disk.
 func UntrackedFiles(wt Worktree) ([]string, error) {
-	out, err := Git(wt.Path, "status", "--porcelain")
+	out, err := Git(wt.Path, "status", "--porcelain", "-z")
 	if err != nil {
 		return nil, err
 	}
 	return parseUntracked(out), nil
 }
 
-// parseUntracked pulls the untracked-file paths ("?? path" lines) out of `git
-// status --porcelain` output, dropping the "?? " prefix. Every other status
-// code (tracked modifications, staged changes) is ignored — those show up in the
-// diff body instead.
+// parseUntracked pulls the untracked-file paths ("?? path" records) out of `git
+// status --porcelain -z` output. Records are NUL-fenced rather than newline
+// separated, which is what lets a path contain spaces — or a newline — without
+// git having to quote it. Every other status code (tracked modifications, staged
+// changes) is ignored; those show up in the diff body instead.
 func parseUntracked(out string) []string {
 	var paths []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, "?? ") {
-			paths = append(paths, strings.TrimPrefix(line, "?? "))
+	for _, rec := range strings.Split(out, "\x00") {
+		if strings.HasPrefix(rec, "?? ") {
+			paths = append(paths, strings.TrimPrefix(rec, "?? "))
 		}
 	}
 	return paths

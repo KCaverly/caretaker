@@ -82,14 +82,20 @@ func TestParseNumstat(t *testing.T) {
 	}
 }
 
+// TestParseUntracked feeds the NUL-fenced shape `--porcelain -z` actually emits.
+// The spaced and non-ASCII paths are the point: under plain --porcelain git would
+// hand back `"path with spaces.md"` and `"unicod\303\251.txt"` — quoted, and in
+// the second case octal-escaped — which is unusable both for display and for
+// opening the file. -z leaves them literal.
 func TestParseUntracked(t *testing.T) {
-	out := " M tracked-modified.go\n" +
-		"?? new-file.txt\n" +
-		"A  staged.go\n" +
-		"?? dir/nested-new.go\n" +
-		"?? path with spaces.md\n"
+	out := " M tracked-modified.go\x00" +
+		"?? new-file.txt\x00" +
+		"A  staged.go\x00" +
+		"?? dir/nested-new.go\x00" +
+		"?? path with spaces.md\x00" +
+		"?? unicodé.txt\x00"
 	got := parseUntracked(out)
-	want := []string{"new-file.txt", "dir/nested-new.go", "path with spaces.md"}
+	want := []string{"new-file.txt", "dir/nested-new.go", "path with spaces.md", "unicodé.txt"}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d untracked paths, got %d: %v", len(want), len(got), got)
 	}
