@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/diffpager"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/stack"
@@ -1965,5 +1966,221 @@ func TestStackDRefusesWhenTooNarrow(t *testing.T) {
 	mm, cmd = m.handleStack(keyPress('d'))
 	if !mm.(Model).stackView.split || cmd == nil {
 		t.Fatal("d should open the preview at the minimum viable width")
+	}
+}
+
+// TestStackSplitDiffUsesPagerChunks checks the stack preview gets the formatter
+// feature from the same seam the full-screen viewer does: chunks supersede the
+// body, render verbatim, and still feed the pane's ]/[ file index.
+func TestStackSplitDiffUsesPagerChunks(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat(),
+		chunks: []diffpager.Chunk{{File: true, Lines: []string{
+			"\x1b[1mFORMATTED core.go\x1b[0m",
+			"\x1b[32m  1 │ new token line\x1b[0m",
+		}}},
+	})
+
+	cd := m.stackView.diffCache["aaa111"]
+	if len(cd.scope.fileLines) != 1 {
+		t.Fatalf("the formatted file should still be indexed for ]/[, got %v", cd.scope.fileLines)
+	}
+	if got := cd.scope.lines[cd.scope.fileLines[0]]; got != "\x1b[1mFORMATTED core.go\x1b[0m" {
+		t.Errorf("file anchor line = %q, want the formatter's header verbatim", got)
+	}
+	out := ansi.Strip(m.renderStack(m.height - barHeight))
+	if !strings.Contains(out, "FORMATTED core.go") {
+		t.Errorf("split render should show the formatter's output:\n%s", out)
+	}
+	if strings.Contains(out, "-old token line") {
+		t.Errorf("chunks must supersede the raw body:\n%s", out)
+	}
+}
+
+// TestStackSplitDiffPagerErrFlashes pins that a formatter failure in the preview
+// is a flash, not the fatal error path: the patch still lands in the cache with
+// built-in styling and the pane keeps showing it.
+func TestStackSplitDiffPagerErrFlashes(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+
+	mm, cmd := m.update(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat(),
+		pagerErr: errors.New("sh: exit 3"),
+	})
+	m = mm.(Model)
+
+	cd := m.stackView.diffCache["aaa111"]
+	if cd.err != nil || cd.loading || cd.scope.files != 1 {
+		t.Fatalf("a pager failure must not fail the fetch, cache entry = %+v", cd)
+	}
+	if cmd == nil {
+		t.Fatal("a pager failure should return the flash-expiry command")
+	}
+	if !strings.Contains(m.status, "diff pager failed") || m.statusLevel != statusInfo {
+		t.Errorf("status = %q (level %v), want the pager-failure flash", m.status, m.statusLevel)
+	}
+	if out := ansi.Strip(m.renderStack(m.height - barHeight)); !strings.Contains(out, "+new token line") {
+		t.Errorf("the patch should still render with built-in styling:\n%s", out)
+	}
+}
+
+// --- zoom (full-width diff) ---
+
+// TestStackZoomTogglesList checks z hides the commit list and gives the diff the
+// whole width, and toggles back. This is the room a side-by-side pager needs.
+func TestStackZoomTogglesList(t *testing.T) {
+	m, key := stackSplitModel()
+	m.width, m.height = 100, 16
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: strings.Repeat("+line\n", 40), stat: splitCommitStat()})
+
+	// Two-column layout shows both the list and the divider.
+	two := ansi.Strip(m.renderStackSplit(*m.stackView.status, 0, m.height-barHeight))
+	if !strings.Contains(two, "core tokens") || !strings.Contains(two, "│") {
+		t.Fatalf("the two-column layout should show the list beside the diff:\n%s", two)
+	}
+	if !strings.Contains(two, "[split]") {
+		t.Errorf("the header should mark the split layout:\n%s", two)
+	}
+
+	mm, _ := m.handleStack(keyPress('z'))
+	m = mm.(Model)
+	if !m.stackView.diffZoom {
+		t.Fatal("z should zoom the diff")
+	}
+	zoom := ansi.Strip(m.renderStackSplit(*m.stackView.status, 0, m.height-barHeight))
+	if strings.Contains(zoom, "│") {
+		t.Errorf("the zoomed layout should drop the commit-list column and divider:\n%s", zoom)
+	}
+	if !strings.Contains(zoom, "[zoom]") {
+		t.Errorf("the header should mark the zoom layout:\n%s", zoom)
+	}
+	// A body line should now be wider than it could be in two columns (rightW at
+	// width 100 is ~59; full width is 100).
+	widest := 0
+	for _, l := range strings.Split(zoom, "\n") {
+		if w := ansi.StringWidth(l); w > widest {
+			widest = w
+		}
+	}
+	if widest <= 70 {
+		t.Errorf("zoomed body should use the full width, widest line was %d", widest)
+	}
+
+	// z again restores the two-column layout.
+	mm, _ = m.handleStack(keyPress('z'))
+	if mm.(Model).stackView.diffZoom {
+		t.Fatal("a second z should un-zoom")
+	}
+}
+
+// TestStackZoomRoutesToDiff checks the diff pane owns the keyboard while zoomed
+// regardless of splitFocus: scrolling and commit-stepping work without a tab.
+func TestStackZoomRoutesToDiff(t *testing.T) {
+	m, key := stackSplitModel()
+	m.width, m.height = 100, 16
+	m = enterSplit(t, m) // opens focused on the list
+	// Only the first commit is cached; stepping to the second must fetch it.
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: strings.Repeat("+line\n", 80), stat: splitCommitStat()})
+
+	mm, _ := m.handleStack(keyPress('z'))
+	m = mm.(Model)
+	if m.stackView.splitFocus != paneStack {
+		t.Fatal("precondition: zoom should not need to change splitFocus")
+	}
+
+	// j scrolls the diff even though focus is nominally on the list.
+	mm, _ = m.handleStack(keyPress('j'))
+	m = mm.(Model)
+	if m.stackView.diffCache["aaa111"].offset == 0 {
+		t.Error("j while zoomed should scroll the diff, not move a hidden cursor")
+	}
+
+	// n steps to the next commit from within the zoomed diff.
+	mm, cmd := m.handleStack(keyPress('n'))
+	m = mm.(Model)
+	if m.stackView.cursor != 1 {
+		t.Errorf("n while zoomed should step to the next commit, cursor=%d", m.stackView.cursor)
+	}
+	if cmd == nil {
+		t.Error("stepping commits should fetch the newly cursored diff")
+	}
+
+	// tab has nothing to flip to and must not change focus.
+	mm, _ = m.handleStack(tea.KeyPressMsg{Code: tea.KeyTab})
+	if mm.(Model).stackView.splitFocus != paneStack {
+		t.Error("tab should be inert while zoomed — there is no second pane")
+	}
+}
+
+// TestStackZoomShowsBelowTwoColumnMinimum checks the zoomed single column is
+// allowed at widths too narrow for two columns (a resize-down after zooming),
+// and still never overruns the terminal.
+func TestStackZoomShowsBelowTwoColumnMinimum(t *testing.T) {
+	m, key := stackSplitModel()
+	m.height = 16
+	m.stackView.split = true
+	m.stackView.diffZoom = true
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: strings.Repeat("+a fairly long diff line here\n", 40),
+		stat: splitCommitStat()})
+
+	for _, w := range []int{minViableWidth, 40, stackSplitMinWidth - 1} {
+		m.width = w
+		if !m.splitShown() {
+			t.Errorf("width %d: a zoomed preview should still be shown", w)
+		}
+		for _, line := range strings.Split(m.renderStack(m.height-barHeight), "\n") {
+			if got := ansi.StringWidth(line); got > w {
+				t.Fatalf("width %d: zoomed line is %d wide:\n%q", w, got, ansi.Strip(line))
+			}
+		}
+	}
+}
+
+// TestStackZoomResetsOnClose checks closing the preview clears the zoom, so the
+// next open starts in the standard two-column layout and the width guard stays
+// coherent.
+func TestStackZoomResetsOnClose(t *testing.T) {
+	m, _ := stackSplitModel()
+	m.width, m.height = 100, 16
+	m = enterSplit(t, m)
+	mm, _ := m.handleStack(keyPress('z'))
+	m = mm.(Model)
+	if !m.stackView.diffZoom {
+		t.Fatal("precondition: should be zoomed")
+	}
+	// d closes the preview.
+	mm, _ = m.handleStack(keyPress('d'))
+	m = mm.(Model)
+	if m.stackView.split || m.stackView.diffZoom {
+		t.Fatalf("closing should clear both split and zoom: split=%v zoom=%v",
+			m.stackView.split, m.stackView.diffZoom)
+	}
+	// Re-opening starts un-zoomed.
+	mm, _ = m.handleStack(keyPress('d'))
+	if mm.(Model).stackView.diffZoom {
+		t.Error("re-opening the preview should start in the two-column layout")
+	}
+}
+
+// TestStackZoomSurvivesRefresh checks a passive status refresh keeps the zoom —
+// you are still reading the same full-width view.
+func TestStackZoomSurvivesRefresh(t *testing.T) {
+	m, key := stackSplitModel()
+	m.width, m.height = 100, 16
+	m = enterSplit(t, m)
+	mm, _ := m.handleStack(keyPress('z'))
+	m = mm.(Model)
+
+	m2, _ := m.Update(stackStatusMsg{key: key, status: *m.stackView.status})
+	if !m2.(Model).stackView.diffZoom {
+		t.Error("a refresh should not knock the preview out of zoom")
 	}
 }

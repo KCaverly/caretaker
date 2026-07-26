@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -345,7 +346,7 @@ func statByPath(stats []FileStat) map[string]FileStat {
 func TestDiffCommitAndNumstatCommit(t *testing.T) {
 	dir, _, tip := commitDiffRepo(t)
 
-	body, err := DiffCommit(dir, tip)
+	body, err := DiffCommit(dir, tip, DiffOptions{})
 	if err != nil {
 		t.Fatalf("DiffCommit: %v", err)
 	}
@@ -366,7 +367,7 @@ func TestDiffCommitAndNumstatCommit(t *testing.T) {
 		t.Errorf("tip patch should only carry this commit's changes:\n%s", body)
 	}
 
-	stats, err := NumstatCommit(dir, tip)
+	stats, err := NumstatCommit(dir, tip, DiffOptions{})
 	if err != nil {
 		t.Fatalf("NumstatCommit: %v", err)
 	}
@@ -388,7 +389,7 @@ func TestDiffCommitAndNumstatCommit(t *testing.T) {
 func TestDiffCommitRootFallback(t *testing.T) {
 	dir, root, _ := commitDiffRepo(t)
 
-	body, err := DiffCommit(dir, root)
+	body, err := DiffCommit(dir, root, DiffOptions{})
 	if err != nil {
 		t.Fatalf("DiffCommit on the root commit: %v", err)
 	}
@@ -411,7 +412,7 @@ func TestDiffCommitRootFallback(t *testing.T) {
 		t.Errorf("root patch should not include the tip commit's file:\n%s", body)
 	}
 
-	stats, err := NumstatCommit(dir, root)
+	stats, err := NumstatCommit(dir, root, DiffOptions{})
 	if err != nil {
 		t.Fatalf("NumstatCommit on the root commit: %v", err)
 	}
@@ -464,7 +465,7 @@ func TestUntrackedFilesLeavesPathsLiteral(t *testing.T) {
 		}
 	}
 
-	got, err := UntrackedFiles(Worktree{Path: dir})
+	got, err := UntrackedFiles(Worktree{Path: dir}, DiffOptions{})
 	if err != nil {
 		t.Fatalf("UntrackedFiles: %v", err)
 	}
@@ -519,7 +520,7 @@ func TestDiffUntracked(t *testing.T) {
 	write("spaced name.txt", []byte("has a space\n"))
 	write("blob.bin", []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x03})
 
-	body, err := DiffUntracked(dir, []string{"fresh.go", "spaced name.txt", "blob.bin", "gone.txt"})
+	body, err := DiffUntracked(dir, []string{"fresh.go", "spaced name.txt", "blob.bin", "gone.txt"}, DiffOptions{})
 	if err != nil {
 		t.Fatalf("DiffUntracked: %v", err)
 	}
@@ -550,7 +551,7 @@ func TestDiffUntracked(t *testing.T) {
 	}
 
 	// An empty path list is a legitimate, silent no-op (a clean-but-modified tree).
-	if out, err := DiffUntracked(dir, nil); err != nil || out != "" {
+	if out, err := DiffUntracked(dir, nil, DiffOptions{}); err != nil || out != "" {
 		t.Errorf("no paths should yield an empty body and no error: %q %v", out, err)
 	}
 }
@@ -571,7 +572,7 @@ func TestDiffUntrackedFeedsTheStyler(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	body, err := DiffUntracked(dir, []string{"a.txt", "b.txt"})
+	body, err := DiffUntracked(dir, []string{"a.txt", "b.txt"}, DiffOptions{})
 	if err != nil {
 		t.Fatalf("DiffUntracked: %v", err)
 	}
@@ -633,10 +634,10 @@ func TestDiffBodiesSurviveHostileConfig(t *testing.T) {
 	write("new.txt", "fresh\n")
 
 	bodies := map[string]func() (string, error){
-		"DiffCommit":      func() (string, error) { return DiffCommit(dir, sha) },
-		"DiffUncommitted": func() (string, error) { return DiffUncommitted(Worktree{Path: dir}) },
-		"DiffAgainstBase": func() (string, error) { return DiffAgainstBase(Worktree{Path: dir}, "main") },
-		"DiffUntracked":   func() (string, error) { return DiffUntracked(dir, []string{"new.txt"}) },
+		"DiffCommit":      func() (string, error) { return DiffCommit(dir, sha, DiffOptions{}) },
+		"DiffUncommitted": func() (string, error) { return DiffUncommitted(Worktree{Path: dir}, DiffOptions{}) },
+		"DiffAgainstBase": func() (string, error) { return DiffAgainstBase(Worktree{Path: dir}, "main", DiffOptions{}) },
+		"DiffUntracked":   func() (string, error) { return DiffUntracked(dir, []string{"new.txt"}, DiffOptions{}) },
 	}
 	for name, fn := range bodies {
 		body, err := fn()
@@ -654,7 +655,7 @@ func TestDiffBodiesSurviveHostileConfig(t *testing.T) {
 
 	// The parser's own contract: a real file header must still be findable by
 	// the same prefix test the diff builder uses.
-	body, err := DiffCommit(dir, sha)
+	body, err := DiffCommit(dir, sha, DiffOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,4 +668,281 @@ func TestDiffBodiesSurviveHostileConfig(t *testing.T) {
 	if !found {
 		t.Errorf("no line passes the `diff --git` prefix test, so file jumps would be dead:\n%s", body)
 	}
+}
+
+// diffOptionsRepo builds a clean single-commit repo with two tracked files —
+// code.go and deps.lock — for the DiffOptions tests to dirty as each needs.
+func diffOptionsRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t.t")
+	run("config", "user.name", "t")
+	write("code.go", "package main\n\nfunc main() {}\n")
+	write("deps.lock", "one\n")
+	run("add", ".")
+	run("commit", "-m", "base")
+	return dir
+}
+
+// TestDiffOptionsArgsReachGit pins that DiffOptions.Args are actually handed to
+// git and can change the result: the same whitespace-only edit is a patch with
+// the zero value and nothing at all with --ignore-all-space. Args land after
+// ct's pinned flags, so a later flag wins.
+func TestDiffOptionsArgsReachGit(t *testing.T) {
+	dir := diffOptionsRepo(t)
+	wt := Worktree{Path: dir}
+
+	// Re-indent the body without changing a single non-space character.
+	if err := os.WriteFile(filepath.Join(dir, "code.go"),
+		[]byte("package main\n\nfunc main()   {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plain, err := DiffUncommitted(wt, DiffOptions{})
+	if err != nil {
+		t.Fatalf("DiffUncommitted zero-value: %v", err)
+	}
+	if !strings.Contains(plain, "diff --git a/code.go b/code.go") {
+		t.Fatalf("zero-value options should still show the whitespace edit:\n%s", plain)
+	}
+
+	ignored, err := DiffUncommitted(wt, DiffOptions{Args: []string{"--ignore-all-space"}})
+	if err != nil {
+		t.Fatalf("DiffUncommitted with args: %v", err)
+	}
+	if strings.TrimSpace(ignored) != "" {
+		t.Errorf("--ignore-all-space should erase a whitespace-only patch, got:\n%s", ignored)
+	}
+
+	// The same flag reaches the numstat call, so the header cannot claim a file
+	// changed while the body shows nothing.
+	stats, err := NumstatUncommitted(wt, DiffOptions{Args: []string{"--ignore-all-space"}})
+	if err != nil {
+		t.Fatalf("NumstatUncommitted with args: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("numstat should agree with the patch and report no files, got %+v", stats)
+	}
+}
+
+// TestDiffOptionsExcludeAgrees is the consistency guard exclusions exist for:
+// an excluded path must vanish from the patch, the numstat, and the untracked
+// listing alike, or the viewer's file index, its +/− totals, and its body would
+// disagree about what is being shown.
+func TestDiffOptionsExcludeAgrees(t *testing.T) {
+	dir := diffOptionsRepo(t)
+	wt := Worktree{Path: dir}
+
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("code.go", "package main\n\nfunc main() { println(1) }\n")
+	write("deps.lock", "one\ntwo\n")
+	write("fresh.txt", "brand new\n")
+	write("fresh.lock", "generated\n")
+
+	opts := DiffOptions{Exclude: []string{"*.lock"}}
+
+	body, err := DiffUncommitted(wt, opts)
+	if err != nil {
+		t.Fatalf("DiffUncommitted: %v", err)
+	}
+	if strings.Contains(body, "deps.lock") {
+		t.Errorf("excluded path leaked into the patch:\n%s", body)
+	}
+	if !strings.Contains(body, "code.go") {
+		t.Errorf("exclusion dropped an unrelated file from the patch:\n%s", body)
+	}
+
+	stats, err := NumstatUncommitted(wt, opts)
+	if err != nil {
+		t.Fatalf("NumstatUncommitted: %v", err)
+	}
+	byPath := statByPath(stats)
+	if _, ok := byPath["deps.lock"]; ok {
+		t.Errorf("excluded path leaked into the numstat: %+v", stats)
+	}
+	if _, ok := byPath["code.go"]; !ok {
+		t.Errorf("exclusion dropped an unrelated file from the numstat: %+v", stats)
+	}
+
+	untracked, err := UntrackedFiles(wt, opts)
+	if err != nil {
+		t.Fatalf("UntrackedFiles: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range untracked {
+		got[p] = true
+	}
+	if got["fresh.lock"] {
+		t.Errorf("excluded path leaked into the untracked list: %v", untracked)
+	}
+	if !got["fresh.txt"] {
+		t.Errorf("exclusion dropped an unrelated untracked file: %v", untracked)
+	}
+
+	// And the zero value keeps every one of them, so the filtering above is the
+	// exclusion doing work rather than the fixture being wrong.
+	plain, err := DiffUncommitted(wt, DiffOptions{})
+	if err != nil {
+		t.Fatalf("DiffUncommitted zero-value: %v", err)
+	}
+	if !strings.Contains(plain, "deps.lock") {
+		t.Errorf("zero-value options should carry every changed file:\n%s", plain)
+	}
+	plainStats, err := NumstatUncommitted(wt, DiffOptions{})
+	if err != nil {
+		t.Fatalf("NumstatUncommitted zero-value: %v", err)
+	}
+	if _, ok := statByPath(plainStats)["deps.lock"]; !ok {
+		t.Errorf("zero-value numstat should carry every changed file: %+v", plainStats)
+	}
+	plainUntracked, err := UntrackedFiles(wt, DiffOptions{})
+	if err != nil {
+		t.Fatalf("UntrackedFiles zero-value: %v", err)
+	}
+	if len(plainUntracked) != 2 {
+		t.Errorf("zero-value untracked listing = %v, want both new files", plainUntracked)
+	}
+}
+
+// TestDiffOptionsExcludeAppliesToCommitHelpers covers the two commit-scoped
+// helpers, including their root-commit `git show` fallbacks, which take a
+// different code path to the same pathspec tail.
+func TestDiffOptionsExcludeAppliesToCommitHelpers(t *testing.T) {
+	dir, root, tip := commitDiffRepo(t)
+	opts := DiffOptions{Exclude: []string{"extra.txt"}}
+
+	body, err := DiffCommit(dir, tip, opts)
+	if err != nil {
+		t.Fatalf("DiffCommit: %v", err)
+	}
+	if strings.Contains(body, "extra.txt") {
+		t.Errorf("excluded path leaked into the commit patch:\n%s", body)
+	}
+	if !strings.Contains(body, "greet.txt") {
+		t.Errorf("exclusion dropped an unrelated file from the commit patch:\n%s", body)
+	}
+	stats, err := NumstatCommit(dir, tip, opts)
+	if err != nil {
+		t.Fatalf("NumstatCommit: %v", err)
+	}
+	if len(stats) != 1 || stats[0].Path != "greet.txt" {
+		t.Errorf("commit numstat = %+v, want greet.txt alone", stats)
+	}
+
+	// The root commit has no parent, so both helpers fall through to `git show`.
+	rootOpts := DiffOptions{Exclude: []string{"greet.txt"}}
+	rootBody, err := DiffCommit(dir, root, rootOpts)
+	if err != nil {
+		t.Fatalf("DiffCommit on the root commit: %v", err)
+	}
+	if strings.Contains(rootBody, "greet.txt") {
+		t.Errorf("exclusion did not reach the root-commit fallback:\n%s", rootBody)
+	}
+	rootStats, err := NumstatCommit(dir, root, rootOpts)
+	if err != nil {
+		t.Fatalf("NumstatCommit on the root commit: %v", err)
+	}
+	if len(rootStats) != 0 {
+		t.Errorf("root-commit numstat = %+v, want nothing after excluding its only file", rootStats)
+	}
+}
+
+// TestDiffOptionsZeroValueMatchesRawGit is the no-regression guard: with the
+// zero value, every helper must produce exactly what the pre-DiffOptions argv
+// produced, which is what the raw git commands below spell out.
+func TestDiffOptionsZeroValueMatchesRawGit(t *testing.T) {
+	dir, _, tip := commitDiffRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "greet.txt"), []byte("alpha\nDELTA\ncharlie\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "brand.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := Worktree{Path: dir}
+
+	// The body helpers return git's output verbatim, so compare byte for byte.
+	bodies := []struct {
+		name string
+		got  func() (string, error)
+		raw  []string
+	}{
+		{"DiffUncommitted", func() (string, error) { return DiffUncommitted(wt, DiffOptions{}) },
+			[]string{"diff", "--no-ext-diff", "--no-color", "HEAD"}},
+		{"DiffCommit", func() (string, error) { return DiffCommit(dir, tip, DiffOptions{}) },
+			[]string{"diff", "--no-ext-diff", "--no-color", tip + "^", tip}},
+		{"DiffUntracked", func() (string, error) { return DiffUntracked(dir, []string{"brand.txt"}, DiffOptions{}) },
+			[]string{"diff", "--no-ext-diff", "--no-color", "--no-index", "--", os.DevNull, "brand.txt"}},
+	}
+	for _, c := range bodies {
+		got, err := c.got()
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		// --no-index exits 1 on a difference, which the helpers forgive; do the
+		// same here rather than treating the expected case as a failure.
+		want, err := git(dir, 1, c.raw...)
+		if err != nil {
+			t.Fatalf("git %v: %v", c.raw, err)
+		}
+		if got != want {
+			t.Errorf("%s with zero-value options diverged from `git %s`:\ngot:\n%s\nwant:\n%s",
+				c.name, strings.Join(c.raw, " "), got, want)
+		}
+	}
+
+	// The numstat and untracked helpers parse their output, so compare against
+	// the parsed form of the same raw commands.
+	rawNumstat, err := Git(dir, "diff", "--numstat", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStats, err := NumstatUncommitted(wt, DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sprintStats(gotStats) != sprintStats(parseNumstat(rawNumstat)) {
+		t.Errorf("NumstatUncommitted zero value = %s, want %s",
+			sprintStats(gotStats), sprintStats(parseNumstat(rawNumstat)))
+	}
+	rawStatus, err := Git(dir, "status", "--porcelain", "-z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUntracked, err := UntrackedFiles(wt, DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(gotUntracked, ",") != strings.Join(parseUntracked(rawStatus), ",") {
+		t.Errorf("UntrackedFiles zero value = %v, want %v", gotUntracked, parseUntracked(rawStatus))
+	}
+}
+
+// sprintStats renders a numstat result as a comparable string.
+func sprintStats(stats []FileStat) string {
+	var parts []string
+	for _, fs := range stats {
+		parts = append(parts, fmt.Sprintf("%s:%d/%d/%t", fs.Path, fs.Add, fs.Del, fs.Binary))
+	}
+	return strings.Join(parts, ",")
 }

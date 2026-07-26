@@ -328,16 +328,89 @@ type FileStat struct {
 //     comes back empty — ] and [ quietly do nothing — and the styler cannot
 //     colour a thing.
 //
+// The two are no longer equally non-negotiable. --no-ext-diff still is: nothing
+// downstream can recover a patch from an external tool's output. --no-color can
+// be deliberately overridden, because DiffOptions.Args land after these flags
+// and a later git flag wins — `--color=always` is the supported way to feed a
+// formatter that wants coloured input. That is safe only because the consumers
+// of a coloured body strip ANSI before matching: diffpager's chunk splitter
+// tests `diff --git` against ANSI-stripped text, so the file-jump index
+// survives. ct's own built-in styler does not, which is why colouring the body
+// is worth doing only alongside a configured pager.
+//
 // Only body-producing calls need them. --numstat is computed internally and is
 // affected by neither, so it is left alone rather than carrying noise.
 var diffBodyFlags = []string{"--no-ext-diff", "--no-color"}
 
+// DiffOptions are the user's configurable git diff knobs, threaded in from
+// config rather than read here so this package stays free of config. repo is
+// the layer that talks to git and nothing else; making it import config would
+// tie every git call — including the ones the deck refresh makes on a hot path
+// — to a settings file it has no business knowing about, and would make these
+// functions untestable without one.
+//
+// Args are extra flags placed after ct's pinned diffBodyFlags and before the
+// revisions, so a user flag wins over a pinned one. They go on the --numstat
+// calls too, not just the patch calls: the numstat feeds the file index and the
+// +/− totals in the viewer's header, and a flag like -w or --histogram that
+// changes the patch but not the counts would leave the header describing a diff
+// the body no longer shows.
+//
+// Exclude are pathspec patterns, each appended as :(exclude)<pattern> after a
+// `--`. They apply to the patch calls, the numstat calls, and the untracked-file
+// listing alike, for the same reason: three views of one diff that disagree
+// about which files are in it is worse than not supporting exclusions at all.
+//
+// The zero value is the "no configuration" case and must produce argv identical
+// to what ct sent before these knobs existed — every existing call site passes
+// through the same helpers, so a regression there would be silent.
+type DiffOptions struct {
+	Args    []string
+	Exclude []string
+}
+
+// excludeArgs renders opts.Exclude as the pathspec tail git wants: a `--`
+// separator followed by one :(exclude)<pattern> magic pathspec per entry. It
+// returns nil for no exclusions so appending it is a no-op, which is what keeps
+// a zero-value DiffOptions byte-identical to the pre-DiffOptions argv.
+func (o DiffOptions) excludeArgs() []string {
+	if len(o.Exclude) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(o.Exclude)+1)
+	out = append(out, "--")
+	for _, p := range o.Exclude {
+		out = append(out, ":(exclude)"+p)
+	}
+	return out
+}
+
 // gitDiffBody runs a patch-producing git subcommand — diff or show, both of
 // which accept diff options — with diffBodyFlags inserted directly after the
-// subcommand, where git expects them.
-func gitDiffBody(dir string, okExit int, sub string, args ...string) (string, error) {
-	full := append([]string{sub}, diffBodyFlags...)
-	return git(dir, okExit, append(full, args...)...)
+// subcommand, where git expects them, then the user's opts.Args (so they can
+// override a pinned flag), then the caller's revisions, then the exclusions as
+// a trailing pathspec.
+func gitDiffBody(dir string, okExit int, opts DiffOptions, sub string, args ...string) (string, error) {
+	full := make([]string, 0, 1+len(diffBodyFlags)+len(opts.Args)+len(args)+len(opts.Exclude)+1)
+	full = append(full, sub)
+	full = append(full, diffBodyFlags...)
+	full = append(full, opts.Args...)
+	full = append(full, args...)
+	full = append(full, opts.excludeArgs()...)
+	return git(dir, okExit, full...)
+}
+
+// gitNumstat runs a --numstat-producing git subcommand with the same option
+// placement gitDiffBody uses, minus diffBodyFlags (numstat output is neither
+// coloured nor routed through diff.external). Sharing the shape with the body
+// call is the point: the two must select the same files.
+func gitNumstat(dir string, opts DiffOptions, sub string, args ...string) (string, error) {
+	full := make([]string, 0, 2+len(opts.Args)+len(args)+len(opts.Exclude)+1)
+	full = append(full, sub, "--numstat")
+	full = append(full, opts.Args...)
+	full = append(full, args...)
+	full = append(full, opts.excludeArgs()...)
+	return Git(dir, full...)
 }
 
 // DiffAgainstBase returns the unified diff of everything the worktree's branch
@@ -346,28 +419,28 @@ func gitDiffBody(dir string, okExit int, sub string, args ...string) (string, er
 // fork don't show up as reverse changes). An empty base — no primary-worktree
 // branch to compare against — yields an empty diff and no error, so the caller
 // simply omits the section.
-func DiffAgainstBase(wt Worktree, base string) (string, error) {
+func DiffAgainstBase(wt Worktree, base string, opts DiffOptions) (string, error) {
 	if base == "" {
 		return "", nil
 	}
-	return gitDiffBody(wt.Path, -1, "diff", base+"...HEAD")
+	return gitDiffBody(wt.Path, -1, opts, "diff", base+"...HEAD")
 }
 
 // DiffUncommitted returns the unified diff of the worktree's uncommitted work —
 // staged and unstaged together — via `git diff HEAD`. Untracked files are not
 // included (git diff never shows them); UntrackedFiles lists those separately.
-func DiffUncommitted(wt Worktree) (string, error) {
-	return gitDiffBody(wt.Path, -1, "diff", "HEAD")
+func DiffUncommitted(wt Worktree, opts DiffOptions) (string, error) {
+	return gitDiffBody(wt.Path, -1, opts, "diff", "HEAD")
 }
 
 // NumstatAgainstBase returns the per-file change summary of everything the
 // branch carries beyond base, parsed from `git diff --numstat <base>...HEAD`. An
 // empty base yields no files and no error, mirroring DiffAgainstBase.
-func NumstatAgainstBase(wt Worktree, base string) ([]FileStat, error) {
+func NumstatAgainstBase(wt Worktree, base string, opts DiffOptions) ([]FileStat, error) {
 	if base == "" {
 		return nil, nil
 	}
-	out, err := Git(wt.Path, "diff", "--numstat", base+"...HEAD")
+	out, err := gitNumstat(wt.Path, opts, "diff", base+"...HEAD")
 	if err != nil {
 		return nil, err
 	}
@@ -377,8 +450,8 @@ func NumstatAgainstBase(wt Worktree, base string) ([]FileStat, error) {
 // NumstatUncommitted returns the per-file change summary of the worktree's
 // uncommitted work (staged+unstaged vs HEAD), parsed from `git diff --numstat
 // HEAD`.
-func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
-	out, err := Git(wt.Path, "diff", "--numstat", "HEAD")
+func NumstatUncommitted(wt Worktree, opts DiffOptions) ([]FileStat, error) {
+	out, err := gitNumstat(wt.Path, opts, "diff", "HEAD")
 	if err != nil {
 		return nil, err
 	}
@@ -397,25 +470,25 @@ func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
 // one — and the base85 alphabet includes +/-, so those lines colour as bogus
 // additions and deletions. Plain diff prints one "Binary files differ" line
 // instead, matching DiffAgainstBase.
-func DiffCommit(dir, sha string) (string, error) {
+func DiffCommit(dir, sha string, opts DiffOptions) (string, error) {
 	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
-		return gitDiffBody(dir, -1, "show", "--format=", sha)
+		return gitDiffBody(dir, -1, opts, "show", "--format=", sha)
 	}
-	return gitDiffBody(dir, -1, "diff", sha+"^", sha)
+	return gitDiffBody(dir, -1, opts, "diff", sha+"^", sha)
 }
 
 // NumstatCommit returns a single commit's per-file change summary, parsed from
 // `git diff --numstat sha^ sha`, mirroring DiffCommit's root-commit fallback to
 // `git show --numstat --format= sha`.
-func NumstatCommit(dir, sha string) ([]FileStat, error) {
+func NumstatCommit(dir, sha string, opts DiffOptions) ([]FileStat, error) {
 	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
-		out, err := Git(dir, "show", "--numstat", "--format=", sha)
+		out, err := gitNumstat(dir, opts, "show", "--format=", sha)
 		if err != nil {
 			return nil, err
 		}
 		return parseNumstat(out), nil
 	}
-	out, err := Git(dir, "diff", "--numstat", sha+"^", sha)
+	out, err := gitNumstat(dir, opts, "diff", sha+"^", sha)
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +533,17 @@ func parseNumstat(out string) []FileStat {
 // octally as `"unicod\303\251.txt"` — which the viewer would print verbatim and
 // DiffUntracked could not open. -z turns quoting off and NUL-fences the records
 // instead, so paths come back exactly as they sit on disk.
-func UntrackedFiles(wt Worktree) ([]string, error) {
-	out, err := Git(wt.Path, "status", "--porcelain", "-z")
+//
+// opts.Exclude is handed to git as a pathspec rather than filtered out of the
+// returned paths in Go: git's own matcher then decides, so an exclusion means
+// exactly the same thing here as it does on the patch and numstat calls —
+// including all of pathspec's magic (globs, :(icase), leading-directory
+// matching) — for free and without a second implementation to keep in step.
+// opts.Args are not passed: `git status` takes no diff options and would reject
+// them.
+func UntrackedFiles(wt Worktree, opts DiffOptions) ([]string, error) {
+	args := append([]string{"status", "--porcelain", "-z"}, opts.excludeArgs()...)
+	out, err := Git(wt.Path, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -483,12 +565,20 @@ func UntrackedFiles(wt Worktree) ([]string, error) {
 // untracked file is by definition not under git's control and can vanish or be
 // unreadable between the status call that listed it and this one, and losing
 // every other file's diff to that race would be a poor trade.
-func DiffUntracked(dir string, paths []string) (string, error) {
+//
+// opts.Args apply (they shape the patch the same way they do everywhere else),
+// but opts.Exclude deliberately does not: paths comes from UntrackedFiles, which
+// already applied the exclusions, and a second `--` pathspec would collide with
+// --no-index's two operands — git reads them positionally, so an extra pathspec
+// tail is either a hard error or silently diffs the wrong pair.
+func DiffUntracked(dir string, paths []string, opts DiffOptions) (string, error) {
 	var b strings.Builder
+	// Only the args travel; see the note above on why the exclusions must not.
+	argsOnly := DiffOptions{Args: opts.Args}
 	for _, p := range paths {
 		// --no-index makes git compare two filesystem paths; exit 1 is its
 		// "these differ" signal, which is true of every file here.
-		out, err := gitDiffBody(dir, 1, "diff", "--no-index", "--", os.DevNull, p)
+		out, err := gitDiffBody(dir, 1, argsOnly, "diff", "--no-index", "--", os.DevNull, p)
 		if err != nil {
 			continue
 		}

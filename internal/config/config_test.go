@@ -316,6 +316,90 @@ func TestExpandTilde(t *testing.T) {
 	}
 }
 
+func TestLoadDiffSection(t *testing.T) {
+	cfg := loadTOML(t, `[diff]
+args = ["--histogram", "--color=always"]
+exclude = ["*.lock", "testdata/snapshots/**"]
+
+[diff.pager]
+command = "delta"
+args = ["--paging=never", "--width={width}"]
+`)
+	if got := cfg.Diff.Args; len(got) != 2 || got[0] != "--histogram" || got[1] != "--color=always" {
+		t.Fatalf("diff.args = %v", got)
+	}
+	if got := cfg.Diff.Exclude; len(got) != 2 || got[0] != "*.lock" || got[1] != "testdata/snapshots/**" {
+		t.Fatalf("diff.exclude = %v", got)
+	}
+	if cfg.Diff.Pager.Command != "delta" {
+		t.Fatalf("diff.pager.command = %q, want delta", cfg.Diff.Pager.Command)
+	}
+	if got := cfg.Diff.Pager.Args; len(got) != 2 || got[0] != "--paging=never" || got[1] != "--width={width}" {
+		t.Fatalf("diff.pager.args = %v", got)
+	}
+}
+
+func TestLoadDiffAbsentLeavesZeroValue(t *testing.T) {
+	cfg := loadTOML(t, "")
+	if len(cfg.Diff.Args) != 0 || len(cfg.Diff.Exclude) != 0 {
+		t.Fatalf("diff = %+v, want zero value", cfg.Diff)
+	}
+	if cfg.Diff.Pager.Command != "" || len(cfg.Diff.Pager.Args) != 0 {
+		t.Fatalf("diff.pager = %+v, want zero value", cfg.Diff.Pager)
+	}
+}
+
+func TestValidateDiff(t *testing.T) {
+	t.Run("pager args need a command", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Diff.Pager.Args = []string{"--paging=never"}
+		err := c.validate()
+		if err == nil || !strings.Contains(err.Error(), "diff.pager.args") || !strings.Contains(err.Error(), "diff.pager.command") {
+			t.Fatalf("err = %v, want mention of diff.pager.args and diff.pager.command", err)
+		}
+	})
+
+	t.Run("empty arg rejected", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Diff.Args = []string{"--histogram", ""}
+		err := c.validate()
+		if err == nil || !strings.Contains(err.Error(), "diff.args") {
+			t.Fatalf("err = %v, want mention of diff.args", err)
+		}
+	})
+
+	t.Run("bare -- rejected", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Diff.Args = []string{"--"}
+		err := c.validate()
+		if err == nil || !strings.Contains(err.Error(), "diff.args") || !strings.Contains(err.Error(), "diff.exclude") {
+			t.Fatalf("err = %v, want mention of diff.args and diff.exclude", err)
+		}
+	})
+
+	t.Run("empty exclude rejected", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Diff.Exclude = []string{""}
+		err := c.validate()
+		if err == nil || !strings.Contains(err.Error(), "diff.exclude") {
+			t.Fatalf("err = %v, want mention of diff.exclude", err)
+		}
+	})
+
+	t.Run("pager command alone is valid", func(t *testing.T) {
+		c := Default()
+		c.Root = t.TempDir()
+		c.Diff.Pager.Command = "delta"
+		if err := c.validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestValidateRequiresRoot(t *testing.T) {
 	c := Default()
 	if err := c.validate(); err == nil {
