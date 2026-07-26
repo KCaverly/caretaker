@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/diffpager"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
@@ -715,5 +718,267 @@ func TestHumanDur(t *testing.T) {
 		if got := humanDur(c.d); got != c.want {
 			t.Errorf("humanDur(%v) = %q, want %q", c.d, got, c.want)
 		}
+	}
+}
+
+// --- diff pager ---
+
+// pagerBody is a two-file patch used by the pager tests. Both files carry a
+// `diff --git` header, which is what the chunk splitter — and the file-jump
+// index — key on.
+const pagerBody = "diff --git a/one.go b/one.go\n" +
+	"@@ -1 +1 @@\n" +
+	"-old one\n" +
+	"+new one\n" +
+	"diff --git a/two.go b/two.go\n" +
+	"@@ -1 +1 @@\n" +
+	"-old two\n" +
+	"+new two\n"
+
+// TestAppendDiffBodyNilChunksKeepsBuiltInStyling pins the fallback path: with no
+// chunks the body is styled exactly as it was before the pager existed, prefix
+// by prefix, with the `diff --git` row recorded for ] and [.
+func TestAppendDiffBodyNilChunksKeepsBuiltInStyling(t *testing.T) {
+	var b diffBuilder
+	appendDiffBody(&b, "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n plain\n", nil)
+
+	want := []string{
+		diffFileStyle.Render("diff --git a/a.go b/a.go"),
+		diffHunkStyle.Render("@@ -1 +1 @@"),
+		diffDelStyle.Render("-old"),
+		diffAddStyle.Render("+new"),
+		" plain",
+	}
+	if len(b.lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(b.lines), len(want), b.lines)
+	}
+	for i := range want {
+		if b.lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, b.lines[i], want[i])
+		}
+	}
+	if len(b.fileLines) != 1 || b.fileLines[0] != 0 {
+		t.Errorf("file index = %v, want the header at line 0", b.fileLines)
+	}
+}
+
+// TestAppendDiffBodyChunksRenderVerbatim checks the formatter's output is passed
+// through untouched — ANSI included, no re-styling — while ct still records a
+// jump anchor at each File chunk's first line and none for the rest.
+func TestAppendDiffBodyChunksRenderVerbatim(t *testing.T) {
+	chunks := []diffpager.Chunk{
+		{Lines: []string{"preamble", "still preamble"}},
+		{File: true, Lines: []string{"\x1b[1mone.go\x1b[0m", "\x1b[32m+new one\x1b[0m"}},
+		{File: true, Lines: []string{"\x1b[1mtwo.go\x1b[0m", "\x1b[31m-old two\x1b[0m"}},
+	}
+	var b diffBuilder
+	// The body is deliberately something the fallback would render very
+	// differently, proving chunks supersede it rather than merging with it.
+	appendDiffBody(&b, "diff --git a/ignored.go b/ignored.go\n+ignored\n", chunks)
+
+	want := []string{
+		"preamble", "still preamble",
+		"\x1b[1mone.go\x1b[0m", "\x1b[32m+new one\x1b[0m",
+		"\x1b[1mtwo.go\x1b[0m", "\x1b[31m-old two\x1b[0m",
+	}
+	if len(b.lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(b.lines), len(want), b.lines)
+	}
+	for i := range want {
+		if b.lines[i] != want[i] {
+			t.Errorf("line %d = %q, want it verbatim: %q", i, b.lines[i], want[i])
+		}
+	}
+	if got := []int{2, 4}; len(b.fileLines) != 2 || b.fileLines[0] != got[0] || b.fileLines[1] != got[1] {
+		t.Errorf("file index = %v, want %v (the File chunks' first lines only)", b.fileLines, got)
+	}
+}
+
+// TestAppendDiffBodyEmptyChunkSurvives covers a formatter that printed nothing
+// for a file: the chunk contributes no lines and, crucially, no anchor pointing
+// at the next file's text.
+func TestAppendDiffBodyEmptyChunkSurvives(t *testing.T) {
+	var b diffBuilder
+	appendDiffBody(&b, "", []diffpager.Chunk{
+		{File: true},
+		{File: true, Lines: []string{"real file", "body"}},
+		{File: false, Lines: nil},
+	})
+
+	if want := []string{"real file", "body"}; len(b.lines) != 2 || b.lines[0] != want[0] {
+		t.Fatalf("lines = %q, want %q", b.lines, want)
+	}
+	if len(b.fileLines) != 1 || b.fileLines[0] != 0 {
+		t.Errorf("file index = %v, want only the non-empty File chunk at line 0", b.fileLines)
+	}
+}
+
+// TestDiffPagerChunksDriveFileJumps is the regression this whole design exists
+// to prevent. A formatter's output does not start lines with `diff --git`, so
+// prefix matching would find no files and ] / [ would silently do nothing. The
+// chunk flags carry the boundaries instead: this drives the real key handler and
+// checks each press lands on a file's first line.
+func TestDiffPagerChunksDriveFileJumps(t *testing.T) {
+	// Three files, each rendered as a header plus filler, none of it matching the
+	// prefixes the built-in styler looks for.
+	var chunks []diffpager.Chunk
+	for _, name := range []string{"one.go", "two.go", "three.go"} {
+		lines := []string{"\x1b[1m── " + name + " ──\x1b[0m"}
+		for i := 0; i < 8; i++ {
+			lines = append(lines, fmt.Sprintf("  %d │ %s body", i, name))
+		}
+		chunks = append(chunks, diffpager.Chunk{Lines: lines, File: true})
+	}
+
+	m := New(&Controller{}, session.NewManager())
+	m.width, m.height = 80, 12
+	m.diffOpen = true
+	m.diffView = diffState{key: "r/w", repoName: "r", wtName: "w"}
+	buildDiffContent(&m.diffView, diffMsg{
+		key:               "r/w",
+		uncommittedStat:   []repo.FileStat{{Path: "one.go", Add: 1}, {Path: "two.go", Add: 1}, {Path: "three.go", Add: 1}},
+		uncommittedBody:   pagerBody,
+		uncommittedChunks: chunks,
+	}, m.width)
+
+	sc := m.diffView.active()
+	if len(sc.fileLines) != 3 {
+		t.Fatalf("file index = %v, want one entry per formatted file", sc.fileLines)
+	}
+	for i, at := range sc.fileLines {
+		want := chunks[i].Lines[0]
+		if sc.lines[at] != want {
+			t.Errorf("file index %d points at %q, want the formatter's header %q", i, sc.lines[at], want)
+		}
+	}
+
+	// Now the keys. ] must walk the anchors in order; [ must walk back.
+	press := func(k string) int {
+		t.Helper()
+		mm, _ := m.handleDiff(tea.KeyPressMsg{Code: rune(k[0])})
+		m = mm.(Model)
+		return m.diffView.offset
+	}
+	for i := range sc.fileLines {
+		if got, want := press("]"), sc.fileLines[i]; got != want {
+			t.Fatalf("] press %d scrolled to %d, want file %d's header at %d", i+1, got, i, want)
+		}
+	}
+	if got, want := press("["), sc.fileLines[1]; got != want {
+		t.Errorf("[ scrolled to %d, want the previous file at %d", got, want)
+	}
+}
+
+// TestDiffOptionsAndPagerComeFromConfig checks the config-to-repo/diffpager
+// translation, including the unconfigured default staying inert.
+func TestDiffOptionsAndPagerComeFromConfig(t *testing.T) {
+	cfg := config.Default()
+	m := New(NewController(cfg), session.NewManager())
+	if opts := m.diffOptions(); len(opts.Args) != 0 || len(opts.Exclude) != 0 {
+		t.Errorf("default config should yield zero-value diff options, got %+v", opts)
+	}
+	if p := m.diffPager(); p.Enabled() {
+		t.Errorf("default config should leave the pager inert, got %+v", p)
+	}
+
+	cfg.Diff.Args = []string{"--histogram"}
+	cfg.Diff.Exclude = []string{"*.lock"}
+	cfg.Diff.Pager.Command = "cat"
+	cfg.Diff.Pager.Args = []string{"-"}
+	m = New(NewController(cfg), session.NewManager())
+	opts := m.diffOptions()
+	if len(opts.Args) != 1 || opts.Args[0] != "--histogram" {
+		t.Errorf("diff args = %v, want the configured flag", opts.Args)
+	}
+	if len(opts.Exclude) != 1 || opts.Exclude[0] != "*.lock" {
+		t.Errorf("diff exclude = %v, want the configured pattern", opts.Exclude)
+	}
+	p := m.diffPager()
+	if !p.Enabled() || p.Command != "cat" || len(p.Args) != 1 || p.Args[0] != "-" {
+		t.Errorf("diff pager = %+v, want the configured command and args", p)
+	}
+}
+
+// TestRenderDiffPagerFallsBackOnFailure runs a real (portable) formatter both
+// ways: a working one produces chunks whose File flags survive, and a failing
+// one produces no chunks and an error the caller can flash — never a partial
+// rendering.
+func TestRenderDiffPagerFallsBackOnFailure(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	dir := t.TempDir()
+
+	ok := diffpager.Pager{Command: "sh", Args: []string{"-c", "sed 's/^/| /'"}}
+	chunks, err := renderDiffPager(ok, dir, pagerBody, 80)
+	if err != nil {
+		t.Fatalf("a working formatter should not error: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want one per file: %+v", len(chunks), chunks)
+	}
+	for i, c := range chunks {
+		if !c.File {
+			t.Errorf("chunk %d should be flagged as a file boundary: %+v", i, c)
+		}
+		if len(c.Lines) == 0 || !strings.HasPrefix(c.Lines[0], "| diff --git") {
+			t.Errorf("chunk %d should carry the formatter's output: %+v", i, c.Lines)
+		}
+	}
+
+	bad := diffpager.Pager{Command: "sh", Args: []string{"-c", "echo boom >&2; exit 3"}}
+	chunks, err = renderDiffPager(bad, dir, pagerBody, 80)
+	if err == nil {
+		t.Fatal("a failing formatter should report an error")
+	}
+	if chunks != nil {
+		t.Errorf("a failing formatter must yield no chunks, got %+v", chunks)
+	}
+
+	// And an unconfigured pager is silently inert, which is the default.
+	if chunks, err := renderDiffPager(diffpager.Pager{}, dir, pagerBody, 80); chunks != nil || err != nil {
+		t.Errorf("an unconfigured pager should be a no-op, got %+v %v", chunks, err)
+	}
+}
+
+// TestDiffMsgPagerErrFlashesButKeepsTheDiff pins the distinction between the two
+// error fields: a formatter failure flashes and leaves the diff on screen with
+// built-in styling, where a git failure would close the overlay.
+func TestDiffMsgPagerErrFlashesButKeepsTheDiff(t *testing.T) {
+	m := New(&Controller{}, session.NewManager())
+	m.width, m.height = 80, 24
+	m.diffOpen = true
+	m.diffView = diffState{key: "r/w", repoName: "r", wtName: "w", loading: true}
+
+	mm, cmd := m.update(diffMsg{
+		key:             "r/w",
+		uncommittedStat: []repo.FileStat{{Path: "one.go", Add: 1, Del: 1}},
+		uncommittedBody: pagerBody,
+		pagerErr:        errors.New("sh: exit 3"),
+	})
+	m = mm.(Model)
+
+	if !m.diffOpen {
+		t.Fatal("a pager failure must not close the diff overlay")
+	}
+	if m.diffView.loading {
+		t.Fatal("the diff should have finished loading")
+	}
+	if cmd == nil {
+		t.Fatal("a pager failure should return the flash-expiry command")
+	}
+	if !strings.Contains(m.status, "diff pager failed") || !strings.Contains(m.status, "built-in styling") {
+		t.Errorf("status = %q, want the pager-failure flash", m.status)
+	}
+	if m.statusLevel != statusInfo {
+		t.Errorf("a pager failure is a flash, not a sticky error (level %v)", m.statusLevel)
+	}
+	// The body still rendered, with ct's own styling, because chunks were nil.
+	out := ansi.Strip(strings.Join(m.diffView.active().lines, "\n"))
+	if !strings.Contains(out, "diff --git a/one.go b/one.go") || !strings.Contains(out, "+new two") {
+		t.Errorf("the diff should still render via the built-in styler:\n%s", out)
+	}
+	if len(m.diffView.active().fileLines) != 2 {
+		t.Errorf("the built-in file index should still be populated: %v", m.diffView.active().fileLines)
 	}
 }
