@@ -1381,6 +1381,79 @@ func TestStackSplitRefreshDropsCachedDiffs(t *testing.T) {
 	}
 }
 
+// TestStackSplitRefreshRekicksCursoredDiff is the other half of dropping the
+// cache: because the drop leaves the open preview looking up a key nothing will
+// fill, the message handler has to re-issue the cursored commit's fetch. Without
+// it the pane sits on "loading diff…" until the user moves the cursor. This goes
+// through Update rather than applyStackStatus directly, since that is where the
+// re-kick lives.
+func TestStackSplitRefreshRekicksCursoredDiff(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+	mm, cmd := m.Update(stackStatusMsg{key: key, status: *m.stackView.status})
+	m = mm.(Model)
+
+	if cd, ok := m.stackView.diffCache["aaa111"]; !ok || !cd.loading {
+		t.Fatalf("a refresh under an open preview should re-mark the cursored diff loading, cache = %+v",
+			m.stackView.diffCache)
+	}
+	if cmd == nil {
+		t.Fatal("a refresh under an open preview should re-issue the cursored commit's fetch")
+	}
+	if dm, ok := cmd().(stackCommitDiffMsg); !ok || dm.sha != "aaa111" || dm.key != key {
+		t.Fatalf("the re-kicked fetch should target the cursored commit, got %#v", cmd())
+	}
+
+	// With the preview closed there is nothing on screen to re-prime, so a
+	// refresh must stay silent rather than fetch a patch nobody is looking at.
+	m2, key2 := stackSplitModel()
+	if _, c := m2.Update(stackStatusMsg{key: key2, status: *m2.stackView.status}); c != nil {
+		t.Fatal("a refresh with the preview closed should not fetch a diff")
+	}
+}
+
+// TestStackSplitRestackRekicksCursoredDiff covers the same recovery for the path
+// that actually invalidates SHAs. A real restack rewrites the stack, so every
+// cached patch is keyed to a commit that no longer exists; the cache is dropped
+// and the preview re-primed against the new commits. The dry-run phase only
+// shows a plan, so it must leave the cache alone.
+func TestStackSplitRestackRekicksCursoredDiff(t *testing.T) {
+	m, key := stackSplitModel()
+	m = enterSplit(t, m)
+	m.applyStackCommitDiff(stackCommitDiffMsg{
+		key: key, sha: "aaa111", body: splitCommitDiff, stat: splitCommitStat()})
+
+	// The dry run leaves the cached patch in place.
+	mm, _ := m.Update(stackRestackMsg{
+		key: key, res: stack.RestackResult{Status: *m.stackView.status}, dryRun: true})
+	if _, ok := mm.(Model).stackView.diffCache["aaa111"]; !ok {
+		t.Fatal("a restack dry run should not drop the per-commit diff cache")
+	}
+
+	// The real run rewrites SHAs: the stale patch goes and the new tip is fetched.
+	after := statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "submit",
+			Counts: map[stack.State]int{stack.StateUnsubmitted: 1}},
+		stack.Commit{Position: 1, SHA: "ccc333", ShortSHA: "ccc333",
+			State: stack.StateUnsubmitted, Subject: "core tokens"})
+	mm, cmd := m.Update(stackRestackMsg{key: key, res: stack.RestackResult{Status: after}})
+	m = mm.(Model)
+
+	if _, stale := m.stackView.diffCache["aaa111"]; stale {
+		t.Fatalf("a real restack should drop patches keyed to rewritten SHAs, cache = %+v",
+			m.stackView.diffCache)
+	}
+	if cmd == nil {
+		t.Fatal("a real restack under an open preview should re-issue the fetch")
+	}
+	if dm, ok := cmd().(stackCommitDiffMsg); !ok || dm.sha != "ccc333" {
+		t.Fatalf("the re-kicked fetch should target the post-restack commit, got %#v", cmd())
+	}
+}
+
 // TestStackEnterStaysInertWithSplit is the regression guard for the key that was
 // deliberately left alone: enter neither opens nor navigates the preview.
 func TestStackEnterStaysInertWithSplit(t *testing.T) {
