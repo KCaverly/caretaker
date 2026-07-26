@@ -1222,18 +1222,26 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 		}
 	}
 
+	// One way out, named once. d still toggles the preview shut — it is the key
+	// that opened it — but advertising both it and esc for the same action left
+	// the footer claiming two exits. esc is the one that generalises: it is the
+	// step-out key everywhere else in the app.
+	//
+	// "close preview" rather than "list": tab's hints already name the panes, so
+	// an esc labelled "list" read as a third way to move focus rather than as
+	// the thing that dismantles the split.
 	var footer string
 	if focus == paneStack {
 		footer = "  " + strings.Join([]string{
 			keyhint("↑↓ / j k", "commit"), keyhint("tab", "diff"),
 			keyhint("v", "branch diff"), keyhint("o", "PR"),
-			keyhint("d", "close"), keyhint("esc", "list"),
+			keyhint("esc", "close preview"),
 		}, helpStyle.Render(" · "))
 	} else {
 		footer = "  " + strings.Join([]string{
 			keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
 			keyhint("n / p", "commit"), keyhint("tab", "list"),
-			keyhint("d", "close"), keyhint("esc", "list"),
+			keyhint("esc", "close preview"),
 		}, helpStyle.Render(" · "))
 	}
 
