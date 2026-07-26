@@ -316,6 +316,30 @@ type FileStat struct {
 	Binary   bool
 }
 
+// diffBodyFlags pin the two git settings the unified-diff parser depends on.
+// Both are user-configurable, both are reasonable things to have set, and both
+// silently break the viewer rather than failing loudly:
+//
+//   - diff.external hands the patch off to an arbitrary program, whose output is
+//     not a patch at all.
+//   - color.ui or color.diff set to "always" prefixes every line with an escape
+//     sequence even when writing to a pipe. The prefix tests that find `diff
+//     --git` headers and +/- rows then stop matching, so the file-jump index
+//     comes back empty — ] and [ quietly do nothing — and the styler cannot
+//     colour a thing.
+//
+// Only body-producing calls need them. --numstat is computed internally and is
+// affected by neither, so it is left alone rather than carrying noise.
+var diffBodyFlags = []string{"--no-ext-diff", "--no-color"}
+
+// gitDiffBody runs a patch-producing git subcommand — diff or show, both of
+// which accept diff options — with diffBodyFlags inserted directly after the
+// subcommand, where git expects them.
+func gitDiffBody(dir string, okExit int, sub string, args ...string) (string, error) {
+	full := append([]string{sub}, diffBodyFlags...)
+	return git(dir, okExit, append(full, args...)...)
+}
+
 // DiffAgainstBase returns the unified diff of everything the worktree's branch
 // carries beyond base, via `git diff <base>...HEAD` (three-dot: the branch tip
 // against its merge-base with base, so unrelated commits base landed since the
@@ -326,14 +350,14 @@ func DiffAgainstBase(wt Worktree, base string) (string, error) {
 	if base == "" {
 		return "", nil
 	}
-	return Git(wt.Path, "diff", base+"...HEAD")
+	return gitDiffBody(wt.Path, -1, "diff", base+"...HEAD")
 }
 
 // DiffUncommitted returns the unified diff of the worktree's uncommitted work —
 // staged and unstaged together — via `git diff HEAD`. Untracked files are not
 // included (git diff never shows them); UntrackedFiles lists those separately.
 func DiffUncommitted(wt Worktree) (string, error) {
-	return Git(wt.Path, "diff", "HEAD")
+	return gitDiffBody(wt.Path, -1, "diff", "HEAD")
 }
 
 // NumstatAgainstBase returns the per-file change summary of everything the
@@ -375,9 +399,9 @@ func NumstatUncommitted(wt Worktree) ([]FileStat, error) {
 // instead, matching DiffAgainstBase.
 func DiffCommit(dir, sha string) (string, error) {
 	if _, err := Git(dir, "rev-parse", "--verify", "--quiet", sha+"^"); err != nil {
-		return Git(dir, "show", "--format=", sha)
+		return gitDiffBody(dir, -1, "show", "--format=", sha)
 	}
-	return Git(dir, "diff", sha+"^", sha)
+	return gitDiffBody(dir, -1, "diff", sha+"^", sha)
 }
 
 // NumstatCommit returns a single commit's per-file change summary, parsed from
@@ -464,7 +488,7 @@ func DiffUntracked(dir string, paths []string) (string, error) {
 	for _, p := range paths {
 		// --no-index makes git compare two filesystem paths; exit 1 is its
 		// "these differ" signal, which is true of every file here.
-		out, err := git(dir, 1, "diff", "--no-index", "--", os.DevNull, p)
+		out, err := gitDiffBody(dir, 1, "diff", "--no-index", "--", os.DevNull, p)
 		if err != nil {
 			continue
 		}

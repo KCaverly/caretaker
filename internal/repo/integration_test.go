@@ -579,3 +579,92 @@ func TestDiffUntrackedFeedsTheStyler(t *testing.T) {
 		t.Fatalf("expected one file header per untracked file, got %d:\n%s", n, body)
 	}
 }
+
+// TestDiffBodiesSurviveHostileConfig pins the presentation flags. Both settings
+// exercised here are ordinary things for a developer to have in ~/.gitconfig,
+// and both used to break the viewer silently rather than loudly: color.ui makes
+// every line start with an escape sequence, so the prefix tests that find file
+// headers and +/- rows stop matching and the file-jump index comes back empty;
+// diff.external replaces the patch with something that is not a patch.
+func TestDiffBodiesSurviveHostileConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t.t")
+	run("config", "user.name", "t")
+	write("f.txt", "alpha\nbravo\n")
+	run("add", ".")
+	run("commit", "-m", "one")
+	write("f.txt", "alpha\nBRAVO\n")
+	run("add", ".")
+	run("commit", "-m", "two")
+	tip, err := Git(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(tip)
+
+	// An external differ that emits something that is definitively not a patch,
+	// and colour forced on even though we are writing to a pipe.
+	ext := filepath.Join(dir, "ext.sh")
+	if err := os.WriteFile(ext, []byte("#!/bin/sh\necho NOT-A-PATCH\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run("config", "diff.external", ext)
+	run("config", "color.ui", "always")
+
+	// Uncommitted work and an untracked file, so every body-producing helper has
+	// something to render under the hostile config.
+	write("f.txt", "alpha\nCHARLIE\n")
+	write("new.txt", "fresh\n")
+
+	bodies := map[string]func() (string, error){
+		"DiffCommit":      func() (string, error) { return DiffCommit(dir, sha) },
+		"DiffUncommitted": func() (string, error) { return DiffUncommitted(Worktree{Path: dir}) },
+		"DiffAgainstBase": func() (string, error) { return DiffAgainstBase(Worktree{Path: dir}, "main") },
+		"DiffUntracked":   func() (string, error) { return DiffUntracked(dir, []string{"new.txt"}) },
+	}
+	for name, fn := range bodies {
+		body, err := fn()
+		if err != nil {
+			t.Errorf("%s under hostile config: %v", name, err)
+			continue
+		}
+		if strings.Contains(body, "NOT-A-PATCH") {
+			t.Errorf("%s used the external differ:\n%s", name, body)
+		}
+		if strings.Contains(body, "\x1b[") {
+			t.Errorf("%s carries ANSI escapes, which defeat the body parser:\n%q", name, body)
+		}
+	}
+
+	// The parser's own contract: a real file header must still be findable by
+	// the same prefix test the diff builder uses.
+	body, err := DiffCommit(dir, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "diff --git") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no line passes the `diff --git` prefix test, so file jumps would be dead:\n%s", body)
+	}
+}
