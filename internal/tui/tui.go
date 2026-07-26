@@ -1385,7 +1385,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.diffOpen {
 			return m.diffWheel(msg)
 		}
-		if m.stackOpen && m.stackView.split && m.stackView.splitFocus == paneDiff {
+		if m.stackOpen && m.splitShown() && m.stackView.splitFocus == paneDiff {
 			return m.stackDiffWheel(msg)
 		}
 		if m.overlayOpen() {

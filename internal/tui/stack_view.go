@@ -72,6 +72,28 @@ const (
 // other key is a full hex SHA, so a leading NUL cannot collide with one.
 const uncommittedKey = "\x00uncommitted"
 
+// stackSplitDivider is the width joinColumns spends on the " │ " between the two
+// columns; the layout budget has to account for it or the rows overrun the
+// terminal.
+const stackSplitDivider = 3
+
+// stackSplitMinLeft and stackSplitMinRight are the narrowest each column may be
+// squeezed to before the preview stops being worth drawing: enough for a
+// truncated commit subject on the left, and enough for a diff line to carry more
+// than its leading `+` on the right.
+const (
+	stackSplitMinLeft  = 24
+	stackSplitMinRight = 33
+)
+
+// stackSplitMinWidth is the narrowest terminal the preview will draw in. Below
+// it the split is not merely cramped: the two columns plus the divider cannot be
+// packed into the width at all, and the old arithmetic silently emitted rows
+// wider than the terminal (a 30-column window drew 37-column rows, which wrap
+// and shear the whole layout). Narrower than this, the screen shows the plain
+// stack list instead.
+const stackSplitMinWidth = stackSplitMinLeft + stackSplitDivider + stackSplitMinRight
+
 // stackUntrackedCap bounds how many untracked files the uncommitted row renders
 // the contents of. Each one costs a git subprocess, and a stack worktree
 // realistically carries a handful; the surplus is still counted in the section
@@ -130,6 +152,14 @@ func (m Model) stackRowAt(cursor int) (stackRow, bool) {
 		return stackRow{}, false
 	}
 	return rows[clamp(cursor, 0, len(rows)-1)], true
+}
+
+// splitShown reports whether the preview is actually on screen. The split flag
+// alone is not enough: a terminal too narrow to lay out two columns falls back
+// to the plain list, and the key routing has to agree with the renderer about
+// that or keys would drive a pane nobody can see.
+func (m Model) splitShown() bool {
+	return m.stackView.split && m.stackView.status != nil && m.width >= stackSplitMinWidth
 }
 
 // stackCommitDiff is one commit's per-commit diff in the split pane's cache:
@@ -650,7 +680,7 @@ func (m *Model) ensureCursorDiff() tea.Cmd {
 // "loading diff…" until the user happens to move the cursor. Callers run it
 // after the matching apply, once the new status and cursor are in place.
 func (m *Model) ensureSplitDiff() tea.Cmd {
-	if !m.stackOpen || !m.stackView.split || m.stackView.status == nil {
+	if !m.stackOpen || !m.splitShown() {
 		return nil
 	}
 	return m.ensureCursorDiff()
@@ -708,7 +738,7 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	avail := m.stackViewport()
 	maxOff := max(0, len(sv.body)-avail)
 	n := len(m.stackRows())
-	if sv.split && sv.status != nil && !sv.working && !sv.confirmRestack {
+	if m.splitShown() && !sv.working && !sv.confirmRestack {
 		handled, mm, cmd := m.handleStackSplit(msg, n)
 		if handled {
 			return mm, cmd
@@ -735,6 +765,11 @@ func (m Model) handleStack(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// Toggle the split diff-preview pane. Entering kicks the cursored commit's
 		// diff fetch; the in-split toggle-off is handled by handleStackSplit.
 		if sv.status != nil && n > 0 && !sv.working && !sv.confirmRestack {
+			// Refuse loudly rather than opening a preview the terminal cannot
+			// lay out — silently doing nothing reads as a broken key.
+			if m.width < stackSplitMinWidth {
+				return m, m.flashCmd("terminal too narrow for the preview")
+			}
 			m.stackView.split = true
 			m.stackView.splitFocus = paneStack
 			return m, m.ensureCursorDiff()
@@ -962,7 +997,7 @@ func (m Model) stackDiffWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 	}
 	sv := m.stackView
 	r, ok := m.stackRowAt(sv.cursor)
-	if !ok || m.stackView.diffCache == nil {
+	if !ok || !m.splitShown() || m.stackView.diffCache == nil {
 		return m, nil
 	}
 	sha := r.diffKey()
@@ -1043,7 +1078,7 @@ func (m Model) renderStack(h int) string {
 		return m.renderStackText([]string{dimStyle.Render("working…")}, closeFooter, h)
 	case sv.confirmRestack:
 		return m.renderStackText(sv.body, confirmFooter, h)
-	case sv.split && sv.status != nil:
+	case m.splitShown():
 		return m.renderStackSplit(*sv.status, sv.cursor, h)
 	case sv.status != nil:
 		return m.renderStackStatus(*sv.status, sv.cursor, h)
@@ -1163,8 +1198,12 @@ func (m Model) renderStackSplit(st stack.StackStatus, cursor, h int) string {
 	rule := diffRuleStyle.Render(strings.Repeat("─", max(1, m.width)))
 
 	avail := max(1, h-3)
-	leftW := clamp(min(38, m.width/3), 24, max(24, m.width-20))
-	rightW := max(10, m.width-leftW-3)
+	// The three parts must sum to exactly m.width. Deriving rightW from leftW
+	// rather than clamping both independently is what guarantees that: the old
+	// pair of clamps could each satisfy its own floor and still overrun.
+	maxLeft := max(stackSplitMinLeft, m.width-stackSplitDivider-stackSplitMinRight)
+	leftW := clamp(min(38, m.width/3), stackSplitMinLeft, maxLeft)
+	rightW := max(1, m.width-leftW-stackSplitDivider)
 
 	// Left column: the windowed commit list, one compact row each.
 	left := make([]string, avail)
