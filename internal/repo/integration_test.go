@@ -282,3 +282,143 @@ func TestRemoveWorktreeKeepsBranch(t *testing.T) {
 		t.Fatalf("expected branch 'feat' to survive removal, tips=%v", tips)
 	}
 }
+
+// commitDiffRepo builds a throwaway git repo with two commits: a root commit
+// adding greet.txt, then a tip commit that rewrites one of its lines and adds a
+// second file. It returns the repo dir plus the root and tip SHAs.
+func commitDiffRepo(t *testing.T) (dir, root, tip string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir = t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := Git(dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head := func() string {
+		t.Helper()
+		out, err := Git(dir, "rev-parse", "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out)
+	}
+
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t.t")
+	run("config", "user.name", "t")
+
+	write("greet.txt", "alpha\nbravo\ncharlie\n")
+	run("add", ".")
+	run("commit", "-m", "root")
+	root = head()
+
+	write("greet.txt", "alpha\nBRAVO\ncharlie\n")
+	write("extra.txt", "new file\n")
+	run("add", ".")
+	run("commit", "-m", "tip")
+	tip = head()
+	return dir, root, tip
+}
+
+// statByPath indexes a numstat result by path so assertions don't depend on
+// git's ordering.
+func statByPath(stats []FileStat) map[string]FileStat {
+	m := make(map[string]FileStat, len(stats))
+	for _, fs := range stats {
+		m[fs.Path] = fs
+	}
+	return m
+}
+
+// TestDiffCommitAndNumstatCommit covers the ordinary case: a commit with a
+// parent diffs against it, showing only what that one commit changed.
+func TestDiffCommitAndNumstatCommit(t *testing.T) {
+	dir, _, tip := commitDiffRepo(t)
+
+	body, err := DiffCommit(dir, tip)
+	if err != nil {
+		t.Fatalf("DiffCommit: %v", err)
+	}
+	for _, want := range []string{
+		"diff --git a/greet.txt b/greet.txt",
+		"-bravo",
+		"+BRAVO",
+		"extra.txt",
+		"+new file",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("tip patch missing %q:\n%s", want, body)
+		}
+	}
+	// The parent's own content is untouched by this commit, so it must not leak
+	// into the patch as an addition.
+	if strings.Contains(body, "+alpha") || strings.Contains(body, "+charlie") {
+		t.Errorf("tip patch should only carry this commit's changes:\n%s", body)
+	}
+
+	stats, err := NumstatCommit(dir, tip)
+	if err != nil {
+		t.Fatalf("NumstatCommit: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 file stats, got %d: %+v", len(stats), stats)
+	}
+	byPath := statByPath(stats)
+	if fs, ok := byPath["greet.txt"]; !ok || fs.Add != 1 || fs.Del != 1 || fs.Binary {
+		t.Errorf("greet.txt stat = %+v, want +1 −1", byPath["greet.txt"])
+	}
+	if fs, ok := byPath["extra.txt"]; !ok || fs.Add != 1 || fs.Del != 0 || fs.Binary {
+		t.Errorf("extra.txt stat = %+v, want +1 −0", byPath["extra.txt"])
+	}
+}
+
+// TestDiffCommitRootFallback covers the defensive path: a root commit has no
+// `sha^`, so both helpers fall back to `git show` and diff it against the empty
+// tree rather than erroring out.
+func TestDiffCommitRootFallback(t *testing.T) {
+	dir, root, _ := commitDiffRepo(t)
+
+	body, err := DiffCommit(dir, root)
+	if err != nil {
+		t.Fatalf("DiffCommit on the root commit: %v", err)
+	}
+	for _, want := range []string{
+		"diff --git a/greet.txt b/greet.txt",
+		"+alpha",
+		"+bravo",
+		"+charlie",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("root patch missing %q:\n%s", want, body)
+		}
+	}
+	// The fallback uses `--format=`, so the commit message must not be in the body.
+	if strings.Contains(body, "root") && !strings.Contains(body, "greet") {
+		t.Errorf("root patch should carry the diff, not the log entry:\n%s", body)
+	}
+	// extra.txt only arrives in the tip commit.
+	if strings.Contains(body, "extra.txt") {
+		t.Errorf("root patch should not include the tip commit's file:\n%s", body)
+	}
+
+	stats, err := NumstatCommit(dir, root)
+	if err != nil {
+		t.Fatalf("NumstatCommit on the root commit: %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 file stat for the root commit, got %d: %+v", len(stats), stats)
+	}
+	if fs := stats[0]; fs.Path != "greet.txt" || fs.Add != 3 || fs.Del != 0 || fs.Binary {
+		t.Errorf("root stat = %+v, want greet.txt +3 −0", fs)
+	}
+}
