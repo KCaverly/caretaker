@@ -1024,7 +1024,7 @@ func (m Model) renderDiff(h int) string {
 		out = append(out, "") // pad so the footer sits at the bottom edge
 	}
 	footer := "  " + strings.Join([]string{
-		keyhint("↑↓ / j k", "scroll"), keyhint("J/K", "file"),
+		keyhint("↑↓ / j k", "scroll"), keyhint("] / [", "file"),
 		keyhint("u", "scope"), keyhint("x", "remove"), keyhint("esc", "back"),
 	}, helpStyle.Render(" · "))
 	out = append(out, ansi.Truncate(footer, m.width, ""))
