@@ -128,6 +128,25 @@ auto_merge = false
 # set; `text` uses labels; `ascii` uses stable single-cell characters.
 [display]
 icons = "nerd" # nerd | text | ascii
+
+# The diff viewer (deck `v` and the stack `d` preview). All optional.
+[diff]
+# Extra flags handed to every diff git runs, before the revision range. A later
+# flag wins over ct's own, so `--color=always` here feeds a pager that wants
+# coloured input. Good ones to try: --histogram, -C, --color-moved=zebra, -W,
+# --ignore-blank-lines.
+args    = ["--histogram", "-C"]
+# Pathspecs dropped from the diff — the body, the file index, and the +/−
+# totals all agree. Lockfiles and snapshots are the usual culprits.
+exclude = ["*.lock", "go.sum"]
+
+# An external formatter each file's patch is piped through, rendered verbatim
+# inside ct's viewer (which keeps scrolling, file jumps, and the scope toggle).
+# Omit the whole subtable to keep ct's built-in styling. The program must not
+# page itself, and `{width}` is replaced with the viewer's column count.
+[diff.pager]
+command = "delta"
+args    = ["--paging=never", "--width={width}"]
 ```
 
 The old top-level `agent = "claude"` setting is still accepted as a Claude command override.
