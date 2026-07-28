@@ -22,6 +22,7 @@ import (
 
 	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/diffpager"
 	"github.com/KCaverly/caretaker/internal/plasma"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
@@ -639,6 +640,18 @@ type diffMsg struct {
 	uncommittedStat []repo.FileStat
 	untracked       []string
 	err             error
+
+	// The external formatter's rendering of each body, when one is configured
+	// and succeeded. Nil means "render the body with ct's built-in styling",
+	// which is both the unconfigured case and the fallback after a failure.
+	committedChunks   []diffpager.Chunk
+	uncommittedChunks []diffpager.Chunk
+
+	// pagerErr is not err. err is fatal — it closes the overlay, because there
+	// is no diff to show. pagerErr only means the formatter did not work out:
+	// the diff still renders with built-in styling, so it is flashed once and
+	// the fetch otherwise succeeds.
+	pagerErr error
 }
 
 // statusTickMsg fires on the status-poll timer; statusMsg carries the result of
@@ -1085,6 +1098,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.diffView.loading = false
 		buildDiffContent(&m.diffView, msg, m.width)
+		// A formatter failure is not fatal: the diff above rendered with the
+		// built-in styling. Say so once, rather than once per file, and leave
+		// the overlay open.
+		if msg.pagerErr != nil {
+			return m, m.flashCmd("diff pager failed: " + msg.pagerErr.Error() + " — using built-in styling")
+		}
 		return m, nil
 
 	// Each of these can replace the status behind an open split pane, so they
@@ -1108,6 +1127,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stackCommitDiffMsg:
 		m.applyStackCommitDiff(msg)
+		// Not msg.err: the diff rendered, just with ct's own styling instead of
+		// the configured formatter's. One flash per fetch, not per file.
+		if msg.pagerErr != nil {
+			return m, m.flashCmd("diff pager failed: " + msg.pagerErr.Error() + " — using built-in styling")
+		}
 		return m, nil
 
 	case plasmaTickMsg:
@@ -1385,7 +1409,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.diffOpen {
 			return m.diffWheel(msg)
 		}
-		if m.stackOpen && m.splitShown() && m.stackView.splitFocus == paneDiff {
+		if m.stackOpen && m.splitShown() && m.stackDiffFocused() {
 			return m.stackDiffWheel(msg)
 		}
 		if m.overlayOpen() {
@@ -4200,43 +4224,108 @@ func (m Model) openDiff(it activeItem) (tea.Model, tea.Cmd) {
 // numstat versus the base (only when the branch has a base to compare against),
 // the uncommitted diff and numstat, and the untracked-file list. Any git error
 // short-circuits into the message's err, which closes the overlay with a flash.
+//
+// The external formatter, when configured, also runs here rather than where the
+// message lands. It spawns a process per file; doing that in Update would block
+// the UI goroutine — the whole deck, not just the diff — for as long as the
+// formatter takes. The rendered chunks travel in the message so the build step
+// stays pure string work.
+//
+// width is captured up front because the closure runs on another goroutine and
+// must not read m.
 func (m Model) fetchDiffCmd(it activeItem) tea.Cmd {
 	wt := it.view.WT
 	base := it.view.BaseBranch
 	key := wsKey(it.repo.Name, it.view.WT.Name)
+	opts := m.diffOptions()
+	pager := m.diffPager()
+	width := m.width
 	return func() tea.Msg {
 		msg := diffMsg{key: key}
 		if base != "" {
-			body, err := repo.DiffAgainstBase(wt, base)
+			body, err := repo.DiffAgainstBase(wt, base, opts)
 			if err != nil {
 				msg.err = err
 				return msg
 			}
-			stat, err := repo.NumstatAgainstBase(wt, base)
+			stat, err := repo.NumstatAgainstBase(wt, base, opts)
 			if err != nil {
 				msg.err = err
 				return msg
 			}
 			msg.committedBody, msg.committedStat = body, stat
 		}
-		body, err := repo.DiffUncommitted(wt)
+		body, err := repo.DiffUncommitted(wt, opts)
 		if err != nil {
 			msg.err = err
 			return msg
 		}
-		stat, err := repo.NumstatUncommitted(wt)
+		stat, err := repo.NumstatUncommitted(wt, opts)
 		if err != nil {
 			msg.err = err
 			return msg
 		}
 		msg.uncommittedBody, msg.uncommittedStat = body, stat
-		untracked, err := repo.UntrackedFiles(wt)
+		untracked, err := repo.UntrackedFiles(wt, opts)
 		if err != nil {
 			msg.err = err
 			return msg
 		}
 		msg.untracked = untracked
+		// Both bodies or neither: the full scope shows them one after the other,
+		// and one section formatted beside one that isn't would read as a
+		// rendering bug. The first failure wins the single flash.
+		committed, cerr := renderDiffPager(pager, wt.Path, msg.committedBody, width)
+		uncommitted, uerr := renderDiffPager(pager, wt.Path, msg.uncommittedBody, width)
+		switch {
+		case cerr != nil:
+			msg.pagerErr = cerr
+		case uerr != nil:
+			msg.pagerErr = uerr
+		default:
+			msg.committedChunks, msg.uncommittedChunks = committed, uncommitted
+		}
 		return msg
+	}
+}
+
+// renderDiffPager formats body through pager, returning nil chunks and no error
+// when no formatter is configured. Every fetch path goes through it so they all
+// treat a formatter failure identically: chunks stay nil, the caller falls back
+// to built-in styling, and the error travels separately from the fatal one.
+func renderDiffPager(pager diffpager.Pager, dir, body string, width int) ([]diffpager.Chunk, error) {
+	if !pager.Enabled() {
+		return nil, nil
+	}
+	return pager.Render(dir, body, width)
+}
+
+// diffOptions translates the user's [diff] config into the git knobs repo
+// takes. The translation lives here rather than in config because config must
+// not import repo — it is loaded by the CLI too, which has no business pulling
+// in the git layer — and repo must not import config (see repo.DiffOptions).
+// tui is the one place that already depends on both.
+func (m Model) diffOptions() repo.DiffOptions {
+	if m.ctrl == nil {
+		return repo.DiffOptions{}
+	}
+	return repo.DiffOptions{
+		Args:    m.ctrl.cfg.Diff.Args,
+		Exclude: m.ctrl.cfg.Diff.Exclude,
+	}
+}
+
+// diffPager translates the user's [diff.pager] config into the formatter the
+// fetch path pipes patch bodies through. A zero value — no command configured —
+// is inert (diffpager.Pager.Enabled reports false), which is the default and
+// leaves ct's built-in styling in charge.
+func (m Model) diffPager() diffpager.Pager {
+	if m.ctrl == nil {
+		return diffpager.Pager{}
+	}
+	return diffpager.Pager{
+		Command: m.ctrl.cfg.Diff.Pager.Command,
+		Args:    m.ctrl.cfg.Diff.Pager.Args,
 	}
 }
 

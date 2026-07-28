@@ -41,6 +41,9 @@ type Config struct {
 	Stack Stack `toml:"stack"`
 	// Display configures terminal rendering choices.
 	Display Display `toml:"display"`
+	// Diff configures the diff viewer's git invocations and optional external
+	// formatter.
+	Diff Diff `toml:"diff"`
 }
 
 const (
@@ -60,6 +63,41 @@ type Stack struct {
 	// AutoMerge bypasses ct's merge confirmation panel. This is distinct from
 	// GitHub auto-merge: an eligible merge runs immediately when requested.
 	AutoMerge bool `toml:"auto_merge"`
+}
+
+// Diff configures the diff viewer's git invocations and optional external
+// formatter.
+type Diff struct {
+	// Args are extra flags inserted directly after ct's own pinned
+	// `--no-ext-diff --no-color` on every patch- and numstat-producing git
+	// call the diff viewers make, so a later flag wins: `--color=always` here
+	// is how a user feeds a formatter that expects coloured input. Other
+	// useful entries: --histogram, -C, --color-moved=zebra, -W,
+	// --ignore-blank-lines.
+	Args []string `toml:"args"`
+	// Exclude are pathspec patterns dropped from every diff. Each entry
+	// becomes a `:(exclude)<pattern>` appended after a `--` on the patch
+	// call, the numstat call, and the untracked-file listing — all three, so
+	// the file index, the +/− totals, and the body never disagree about what
+	// is being shown. Typical use is lockfiles and snapshots.
+	Exclude []string `toml:"exclude"`
+	// Pager is an external formatter the patch body is piped through.
+	Pager DiffPager `toml:"pager"`
+}
+
+// DiffPager names an external program the diff viewer pipes a file's patch
+// through in place of ct's built-in prefix styling.
+type DiffPager struct {
+	// Command is the program to run. Empty (the default) keeps ct's own
+	// built-in styling. When set, each file's patch is piped through Command
+	// and its output rendered verbatim, ANSI preserved, inside ct's viewer —
+	// ct still owns scrolling and keys, so the program must not page itself:
+	// `delta --paging=never`, `diff-so-fancy`, `bat --color=always
+	// --language=diff`.
+	Command string `toml:"command"`
+	// Args are flags passed to Command. A literal {width} is replaced with
+	// the viewer's current column count.
+	Args []string `toml:"args"`
 }
 
 // Agents configures which agent providers can be launched.
@@ -345,6 +383,25 @@ func (c *Config) validate() error {
 			Charset: c.Plasma.Charset,
 		}); err != nil {
 			return err
+		}
+	}
+	if len(c.Diff.Pager.Args) > 0 && c.Diff.Pager.Command == "" {
+		return fmt.Errorf("config `diff.pager.args` needs a `diff.pager.command` to run")
+	}
+	for _, arg := range c.Diff.Args {
+		if arg == "" {
+			return fmt.Errorf("config `diff.args` entries must not be empty")
+		}
+		// ct appends the revision range (e.g. main...HEAD) after these flags.
+		// A bare -- terminates option parsing, so git would read the range as
+		// a path and report a nonexistent file rather than diffing anything.
+		if arg == "--" {
+			return fmt.Errorf("config `diff.args` must not contain `--`; use `diff.exclude` to drop paths instead")
+		}
+	}
+	for _, pattern := range c.Diff.Exclude {
+		if pattern == "" {
+			return fmt.Errorf("config `diff.exclude` entries must not be empty")
 		}
 	}
 	return nil

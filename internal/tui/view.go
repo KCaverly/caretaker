@@ -13,6 +13,7 @@ import (
 
 	"github.com/KCaverly/caretaker/internal/agent"
 	"github.com/KCaverly/caretaker/internal/config"
+	"github.com/KCaverly/caretaker/internal/diffpager"
 	"github.com/KCaverly/caretaker/internal/repo"
 	"github.com/KCaverly/caretaker/internal/session"
 	"github.com/KCaverly/caretaker/internal/usage"
@@ -1056,21 +1057,21 @@ func buildDiffContent(d *diffState, msg diffMsg, width int) {
 	// Uncommitted section, shared by both scopes.
 	var uncB diffBuilder
 	uf, ua, ud := appendDiffSection(&uncB, "uncommitted", "",
-		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, width)
+		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, msg.uncommittedChunks, width)
 	d.uncommitted = finishScope(uncB, uf, ua, ud)
 
 	// Full scope: the vs-base section (when a base was available) then the same
-	// uncommitted section.
+	// uncommitted section — same body, so the same chunks a second time.
 	var fullB diffBuilder
 	files, add, del := 0, 0, 0
 	if d.base != "" {
 		cf, ca, cd := appendDiffSection(&fullB, "vs "+d.base, pluralize(d.ahead, "commit"),
-			msg.committedStat, nil, msg.committedBody, width)
+			msg.committedStat, nil, msg.committedBody, msg.committedChunks, width)
 		files, add, del = cf, ca, cd
 		fullB.add("")
 	}
 	uf2, ua2, ud2 := appendDiffSection(&fullB, "uncommitted", "",
-		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, width)
+		msg.uncommittedStat, msg.untracked, msg.uncommittedBody, msg.uncommittedChunks, width)
 	files, add, del = files+uf2, add+ua2, del+ud2
 	d.full = finishScope(fullB, files, add, del)
 }
@@ -1081,7 +1082,12 @@ func buildDiffContent(d *diffState, msg diffMsg, width int) {
 // summary. Untracked paths are listed in the index as `?? path  new` (they carry
 // no diff body). A section with no files still draws its rule and a dim
 // "(nothing)" so the scope is never blank mid-view.
-func appendDiffSection(b *diffBuilder, title, meta string, stat []repo.FileStat, untracked []string, body string, width int) (files, add, del int) {
+//
+// chunks, when non-nil, is the external formatter's rendering of body and
+// replaces it; see appendDiffBody. Everything above the body — the rule, the
+// index, the counts — is ct's own either way, since those come from the numstat
+// rather than the patch.
+func appendDiffSection(b *diffBuilder, title, meta string, stat []repo.FileStat, untracked []string, body string, chunks []diffpager.Chunk, width int) (files, add, del int) {
 	b.add(diffRule(title, meta, width))
 	for _, fs := range stat {
 		b.add(diffIndexLine(fs))
@@ -1097,14 +1103,38 @@ func appendDiffSection(b *diffBuilder, title, meta string, stat []repo.FileStat,
 		b.add(dimStyle.Render("  (nothing)"))
 	}
 	b.add("")
-	appendDiffBody(b, body)
+	appendDiffBody(b, body, chunks)
 	return files, add, del
 }
 
-// appendDiffBody styles a unified-diff body line by line into b: `diff --git`
-// rows are bold file headers (and recorded for J/K), `@@` rows are hunk headers,
-// `+`/`−` rows are coloured, and context lines pass through plain.
-func appendDiffBody(b *diffBuilder, body string) {
+// appendDiffBody puts a diff body's lines into b.
+//
+// With chunks nil — no formatter configured, or one that failed — it styles the
+// body itself, line by line: `diff --git` rows are bold file headers (and
+// recorded for ] and [), `@@` rows are hunk headers, `+`/`−` rows are coloured,
+// and context lines pass through plain.
+//
+// With chunks non-nil they supersede body entirely and are emitted verbatim,
+// ANSI and all: the formatter owns every visual decision, and re-styling its
+// output would fight it. What ct keeps is the file-jump index — a chunk the
+// splitter saw begin at a `diff --git` header registers its first line as an
+// anchor, which is the whole reason chunks carry the flag instead of arriving as
+// one flat block of text. A chunk with no lines (a formatter that printed
+// nothing for a file) contributes no anchor rather than one pointing at the next
+// file's text.
+func appendDiffBody(b *diffBuilder, body string, chunks []diffpager.Chunk) {
+	if chunks != nil {
+		for _, c := range chunks {
+			for i, line := range c.Lines {
+				if i == 0 && c.File {
+					b.addFile(line)
+					continue
+				}
+				b.add(line)
+			}
+		}
+		return
+	}
 	body = strings.TrimRight(body, "\n")
 	if body == "" {
 		return
@@ -1651,7 +1681,7 @@ func (m Model) renderHelp(h int) string {
 		row("1 2 3", "open recent worktree"),
 		row("d", "stop worktree"),
 		row("v", "view diff (deck)"),
-		row("s", "stack screen (↑↓ / j k move · d preview · s submit · R restack · o open PR)"),
+		row("s", "stack screen (↑↓ / j k move · d preview · z zoom diff · s submit · R restack · o open PR)"),
 		row("x", "remove worktree (b keeps branch)"),
 		row("r", "refresh"),
 		row("ctrl+c", "quit"),
