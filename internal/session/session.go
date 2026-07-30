@@ -74,6 +74,57 @@ type Session struct {
 	// each emu.Write — so it is atomic. See Render for the set/clear ordering.
 	renderCache      string
 	renderCacheDirty atomic.Bool
+
+	// Scrollback view state. scrollOff is how many lines the pane is scrolled
+	// back from the live screen; 0 is the live screen and is the only state in
+	// which the emulator's own render is shown verbatim. renderCacheOff records
+	// which offset renderCache was built for, so a scroll invalidates the cache
+	// the same way a write does.
+	//
+	// anchorLen is the scrollback length observed on the last render while
+	// scrolled. New output pushes lines into scrollback, which would slide the
+	// viewport across the content it is parked on; carrying the growth into
+	// scrollOff holds the view still instead. All four fields are touched only on
+	// the UI goroutine (Render and the scroll methods), like renderCache.
+	scrollOff      int
+	renderCacheOff int
+	anchorLen      int
+}
+
+// ScrollBy moves the pane's view up (negative delta) or down (positive) through
+// its scrollback, clamped to the buffer, and reports whether the offset changed.
+//
+// Alt-screen programs are left alone: nvim, less and the agent TUIs own the
+// viewport, implement their own scrolling, and push nothing into scrollback, so
+// scrolling "behind" them would show unrelated history from before they started.
+func (s *Session) ScrollBy(delta int) bool {
+	if s.emu.IsAltScreen() {
+		return false
+	}
+	return s.setScrollOff(s.scrollOff - delta)
+}
+
+// ScrollToBottom returns the pane to the live screen, reporting whether it had
+// been scrolled. It is what makes typing an escape hatch: input goes to a program
+// whose output the user can then see.
+func (s *Session) ScrollToBottom() bool { return s.setScrollOff(0) }
+
+// ScrollOffset is how many lines back from the live screen the pane is showing.
+func (s *Session) ScrollOffset() int { return s.scrollOff }
+
+// Scrolled reports whether the pane is showing history rather than live output.
+// The UI surfaces this: a parked view of a busy terminal is indistinguishable
+// from a hung one otherwise.
+func (s *Session) Scrolled() bool { return s.scrollOff > 0 }
+
+func (s *Session) setScrollOff(off int) bool {
+	off = min(max(off, 0), s.emu.ScrollbackLen())
+	if off == s.scrollOff {
+		return false
+	}
+	s.scrollOff = off
+	s.anchorLen = s.emu.ScrollbackLen()
+	return true
 }
 
 // Start launches argv in dir on a pty sized w×h and returns a running Session.
@@ -195,8 +246,13 @@ func (s *Session) signal() {
 // Use this to send raw text (e.g. an initial prompt) immediately after spawning.
 func (s *Session) WriteInput(p []byte) (int, error) { return s.pty.Write(p) }
 
-// SendKey forwards a key event to the program.
-func (s *Session) SendKey(k uv.KeyEvent) { s.emu.SendKey(k) }
+// SendKey forwards a key event to the program. Typing also returns a scrolled-back
+// pane to the live screen: input the user cannot see the result of is worse than
+// losing their scroll position.
+func (s *Session) SendKey(k uv.KeyEvent) {
+	s.ScrollToBottom()
+	s.emu.SendKey(k)
+}
 
 // Paste delivers pasted text to the program. The emulator wraps it in the
 // bracketed-paste guards (ESC[200~…ESC[201~) when the child has enabled DEC
@@ -204,7 +260,10 @@ func (s *Session) SendKey(k uv.KeyEvent) { s.emu.SendKey(k) }
 // rather than as line-by-line keystrokes — nvim and claude both enable the
 // mode, and raw bytes would trigger editor auto-indent mangling or a premature
 // submit. When the child has not enabled the mode the text is sent as-is.
-func (s *Session) Paste(text string) { s.emu.Paste(text) }
+func (s *Session) Paste(text string) {
+	s.ScrollToBottom()
+	s.emu.Paste(text)
+}
 
 // SendMouse forwards a mouse event to the program (the emulator only encodes it
 // if the program has requested a mouse mode).
@@ -222,10 +281,68 @@ func (s *Session) SendMouse(m uv.MouseEvent) { s.emu.SendMouse(m) }
 // The CompareAndSwap collapses a burst of writes since the last frame into a
 // single re-serialisation.
 func (s *Session) Render() string {
-	if s.renderCacheDirty.CompareAndSwap(true, false) {
-		s.renderCache = s.emu.Render()
+	dirty := s.renderCacheDirty.CompareAndSwap(true, false)
+	s.holdScrollAnchor()
+	// The offset is part of the cache key: scrolling changes the frame without
+	// the screen having changed, and a write changes the frame at either offset.
+	if dirty || s.renderCacheOff != s.scrollOff {
+		s.renderCacheOff = s.scrollOff
+		if s.scrollOff > 0 {
+			s.renderCache = s.renderScrolledBack(s.scrollOff)
+		} else {
+			s.renderCache = s.emu.Render()
+		}
 	}
 	return s.renderCache
+}
+
+// holdScrollAnchor keeps a scrolled-back view parked on the content it was
+// scrolled to while new output arrives. Each line the program emits is pushed
+// into scrollback, which moves the newest-line boundary the offset is measured
+// from; without compensating, a parked view drifts upward through its own history
+// at the speed of the output. Growth is carried into the offset instead.
+//
+// Once the buffer saturates at its maximum, pushes evict the oldest line and the
+// length stops growing, so the drift becomes undetectable and resumes — an
+// acceptable limit ten thousand lines back.
+func (s *Session) holdScrollAnchor() {
+	if s.scrollOff == 0 {
+		return
+	}
+	n := s.emu.ScrollbackLen()
+	if grew := n - s.anchorLen; grew > 0 {
+		s.scrollOff = min(s.scrollOff+grew, n)
+	}
+	s.anchorLen = n
+}
+
+// renderScrolledBack composites the frame for a scrolled-back view: the last off
+// lines of scrollback, then as much of the live screen's top as still fits. That
+// ordering is what makes scrolling continuous — at off == 1 the frame is the
+// newest scrollback line above all but the last screen row, and it walks upward
+// from there.
+func (s *Session) renderScrolledBack(off int) string {
+	h := s.emu.Height()
+	sb := s.emu.Scrollback()
+	n := sb.Len()
+	if off > n {
+		off = n
+	}
+
+	lines := make([]string, 0, h)
+	// Scrollback is oldest-first, so the visible slice is its tail.
+	for i := n - off; i < n && len(lines) < h; i++ {
+		lines = append(lines, sb.Line(i).Render())
+	}
+	// emu.Render() emits one self-contained line per screen row, so the top of the
+	// screen is a plain prefix of its split.
+	for _, line := range strings.Split(s.emu.Render(), "\n") {
+		if len(lines) >= h {
+			break
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Cursor returns the program's cursor position and visibility.
@@ -241,6 +358,10 @@ func (s *Session) Resize(w, h int) {
 	}
 	s.scrollForShrink(h)
 	s.emu.Resize(w, h)
+	// A resize reflows the buffer, so a parked offset no longer points at the same
+	// content and may exceed the new scrollback length. Snap to the live screen
+	// rather than show an arbitrary window of history.
+	s.setScrollOff(0)
 	s.renderCacheDirty.Store(true) // resize reshapes the buffer; drop the cache
 	_ = pty.Setsize(s.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
 }

@@ -108,6 +108,12 @@ term_focus_left = "alt+h"  # directional pane focus (h/j/k/l)
 term_focus_down = "alt+j"
 term_focus_up   = "alt+k"
 term_focus_right = "alt+l"
+# Walk the focused pane's scrollback a screenful at a time; the mouse wheel
+# scrolls it by three lines. Typing returns the pane to live output, and the bar
+# says so while it is parked. Full-screen programs (nvim, the agent TUIs) keep
+# their own scrolling instead.
+term_scroll_up   = "shift+pgup"
+term_scroll_down = "shift+pgdown"
 
 # Ambient plasma panel on the right of the deck (defaults shown). It only
 # animates while the deck is on screen, and hides itself on terminals too

@@ -314,7 +314,29 @@ func (m Model) barContextLabel() string {
 		binding, _ := snap.BindingWindow()
 		s = usageSeverity(binding.Window.Utilization).Render(seg) + sep + s
 	}
+	// Leftmost, and last to be prepended, so it reads first: a pane parked off the
+	// live output has to say so.
+	if seg, ok := m.termScrollSegment(); ok {
+		s = stackWaitStyle.Render(seg) + sep + s
+	}
 	return s
+}
+
+// termScrollSegment reports the focused terminal pane's scrollback position while
+// it is parked off the live output, and whether it applies.
+//
+// This is not decoration. A scrolled view of a busy terminal is indistinguishable
+// from a hung one — output simply stops appearing — so the state has to be
+// visible, and it has to name the way back out.
+func (m Model) termScrollSegment() (string, bool) {
+	if m.screen != screenTerminal || m.current == nil || m.current.ws == nil {
+		return "", false
+	}
+	s := m.current.ws.ActiveTermSession()
+	if s == nil || !s.Scrolled() {
+		return "", false
+	}
+	return fmt.Sprintf("scrollback -%d (type to resume)", s.ScrollOffset()), true
 }
 
 func (m Model) activeUsageProvider() (agent.Provider, bool) {
@@ -1710,6 +1732,7 @@ func (m Model) renderHelp(h int) string {
 		row(m.keys.TermFocusLeft+" "+m.keys.TermFocusDown+" "+m.keys.TermFocusUp+" "+m.keys.TermFocusRight, "focus left / down / up / right"),
 		row(m.keys.TermZoom, "zoom / restore pane"),
 		row(m.keys.TermClose, "close pane"),
+		row(m.keys.TermScrollUp+" "+m.keys.TermScrollDown, "scroll back / forward (wheel too)"),
 	)
 	rows = append(rows,
 		"",
@@ -1901,6 +1924,7 @@ func (m Model) sessionFooter() string {
 		hints = []string{
 			keyhint(m.keys.TermSplitV+" "+m.keys.TermSplitH, "split"),
 			keyhint(m.keys.TermZoom, "zoom"),
+			keyhint(m.keys.TermScrollUp, "scroll"),
 			keyhint(m.keys.TermClose, "close")}
 	} else {
 		hints = []string{
