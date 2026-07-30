@@ -1373,8 +1373,27 @@ func (m Model) renderCreateForm() []string {
 // windowing centres on the worktree row, not the detail beneath it.
 func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
 	lastRepo := ""
+	// Repos whose pending rows have already been emitted, so a repo with both real
+	// and pending worktrees does not get its setup rows twice.
+	flushed := map[string]bool{}
+	flushPending := func(repoName string) {
+		if flushed[repoName] {
+			return
+		}
+		flushed[repoName] = true
+		for _, c := range m.creatingIn(repoName) {
+			lines = append(lines, m.creatingRow(c, innerW))
+			// -1: a worktree that does not exist yet cannot be navigated to or
+			// activated, so the row is deliberately not selectable.
+			rowItem = append(rowItem, -1)
+		}
+	}
+
 	for i, it := range m.active {
 		if it.repo.Name != lastRepo {
+			// The previous repo's pending rows close out its group before the next
+			// header opens.
+			flushPending(lastRepo)
 			lines = append(lines, repoHdrStyle.Render(it.repo.Name))
 			rowItem = append(rowItem, -1)
 			lastRepo = it.repo.Name
@@ -1390,7 +1409,49 @@ func (m Model) activeDisplay(innerW int) (lines []string, rowItem []int) {
 			}
 		}
 	}
+	flushPending(lastRepo)
+
+	// Repos being set up that have no active worktree yet get their own header:
+	// the first worktree in a repo is exactly the case where there is nothing else
+	// on screen to reassure the user.
+	for _, c := range m.creating {
+		if flushed[c.repo] {
+			continue
+		}
+		flushed[c.repo] = true
+		lines = append(lines, repoHdrStyle.Render(c.repo))
+		rowItem = append(rowItem, -1)
+		for _, p := range m.creatingIn(c.repo) {
+			lines = append(lines, m.creatingRow(p, innerW))
+			rowItem = append(rowItem, -1)
+		}
+	}
 	return
+}
+
+// creatingSpinner are the braille frames the setup row animates through. Motion
+// is the whole point: a static "creating…" is what a hung process looks like.
+var creatingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// creatingRow draws one worktree-setup row: a spinner, the name it will have, and
+// how long it has been running. The elapsed time is what tells a user waiting on a
+// slow clone that ct is still working rather than wedged, so it is shown from the
+// first second rather than after some threshold.
+func (m Model) creatingRow(c creatingItem, innerW int) string {
+	frame := creatingSpinner[0]
+	if m.iconMode == config.IconsASCII || m.iconMode == config.IconsText {
+		frame = "*"
+	} else {
+		elapsed := time.Since(c.since) / creatingTickInterval
+		frame = creatingSpinner[int(elapsed)%len(creatingSpinner)]
+	}
+	label := fmt.Sprintf("  %s %s", frame, c.name)
+	note := fmt.Sprintf("setting up worktree… %ds", int(time.Since(c.since).Seconds()))
+	gap := innerW - lipgloss.Width(label) - lipgloss.Width(note)
+	if gap < 1 {
+		return ansi.Truncate(stackWaitStyle.Render(label), innerW, "")
+	}
+	return stackWaitStyle.Render(label) + strings.Repeat(" ", gap) + dimStyle.Render(note)
 }
 
 // activeWindowStart returns the first display index shown for a window of `rows`
@@ -1409,7 +1470,9 @@ func activeWindowStart(rowItem []int, cursor, rows int) (start, end int) {
 func (m Model) renderActive(innerW, rows int) []string {
 	lines := []string{header("active", len(m.active)), ""}
 
-	if len(m.active) == 0 {
+	// A pending creation counts as content: the empty-state copy invites the user
+	// to create a worktree, which is exactly the thing already underway.
+	if len(m.active) == 0 && len(m.creating) == 0 {
 		if !m.groupsLoaded {
 			return append(lines, dimStyle.Render("scanning…"))
 		}

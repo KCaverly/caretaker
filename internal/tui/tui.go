@@ -450,10 +450,28 @@ type Model struct {
 	plasmaWidthPct int
 	plasmaTicking  bool
 
+	// creating holds the worktrees whose `git worktree add` is still running, so
+	// the deck can show a row for work that has been asked for but does not exist
+	// on disk yet. On a large repository the fetch and checkout take long enough
+	// that a deck with no sign of them reads as ct having ignored the request
+	// (issue #54). creatingTicking mirrors plasmaTicking: the spinner tick
+	// disarms itself when the last creation lands, so no timer runs at rest.
+	creating        []creatingItem
+	creatingTicking bool
+
 	// agentProviders is the normalized provider palette. Legacy/direct configs
 	// remain Claude-only through the controller's normalization.
 	agentProviders       []agent.Provider
 	defaultAgentProvider agent.Provider
+}
+
+// creatingItem is one worktree being set up: enough to draw a row under the right
+// repo header, and the start time so the row can show how long it has been going
+// — which is the difference between "working" and "stuck".
+type creatingItem struct {
+	repo  string
+	name  string
+	since time.Time
 }
 
 // statusLevel classifies the footer status so styling and expiry don't rely
@@ -610,9 +628,14 @@ type loadedMsg struct {
 	seq    uint64 // issue-time load generation; stale results are dropped
 }
 
+// createdMsg reports one finished `git worktree add`. repo and name identify the
+// pending row to retire; they are carried separately from wt because a failure
+// leaves wt zero and the row still has to go.
 type createdMsg struct {
-	wt  repo.Worktree
-	err error
+	repo string
+	name string
+	wt   repo.Worktree
+	err  error
 }
 
 type actionDoneMsg struct{ err error }
@@ -709,6 +732,49 @@ const plasmaTickInterval = 150 * time.Millisecond
 // schedulePlasmaTick arms one plasma frame tick.
 func schedulePlasmaTick() tea.Cmd {
 	return tea.Tick(plasmaTickInterval, func(time.Time) tea.Msg { return plasmaTickMsg{} })
+}
+
+// creatingTickMsg advances the worktree-setup spinner. Like the plasma tick it is
+// only armed while there is something to animate.
+type creatingTickMsg struct{}
+
+// creatingTickInterval paces the spinner. Fast enough to read as motion — the
+// whole point is to distinguish "working" from "hung" — and slow enough that a
+// multi-minute checkout costs a handful of deck redraws per second.
+const creatingTickInterval = 120 * time.Millisecond
+
+func scheduleCreatingTick() tea.Cmd {
+	return tea.Tick(creatingTickInterval, func(time.Time) tea.Msg { return creatingTickMsg{} })
+}
+
+// beginCreating records a worktree as being set up, so the deck shows it
+// immediately rather than only once git has finished.
+func (m *Model) beginCreating(repoName, name string) {
+	m.creating = append(m.creating, creatingItem{repo: repoName, name: name, since: time.Now()})
+}
+
+// endCreating drops a finished (or failed) creation.
+func (m *Model) endCreating(repoName, name string) {
+	out := m.creating[:0]
+	for _, c := range m.creating {
+		if c.repo == repoName && c.name == name {
+			continue
+		}
+		out = append(out, c)
+	}
+	m.creating = out
+}
+
+// creatingIn returns the pending creations for one repo, so the deck can group
+// them under that repo's header alongside its real worktrees.
+func (m Model) creatingIn(repoName string) []creatingItem {
+	var out []creatingItem
+	for _, c := range m.creating {
+		if c.repo == repoName {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // usageTickMsg fires on the usage-poll timer; usageMsg carries the result of
@@ -1025,6 +1091,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			model.plasmaTicking = true
 			cmd = tea.Batch(cmd, schedulePlasmaTick())
 		}
+		// Same one-timer discipline for the worktree-setup spinner: arming here
+		// rather than where a creation starts is what keeps two concurrent
+		// creations from running two ticks and animating at double speed.
+		if !model.creatingTicking && len(model.creating) > 0 {
+			model.creatingTicking = true
+			cmd = tea.Batch(cmd, scheduleCreatingTick())
+		}
 		return model, cmd
 	}
 	return mm, cmd
@@ -1118,7 +1191,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// freshness window (the deck's `r` re-kicks with force).
 		return m, tea.Batch(m.kickStackFetches(false)...)
 
+	case creatingTickMsg:
+		// Re-arm only while something is still being set up, so the timer stops on
+		// its own once the last creation lands.
+		if len(m.creating) == 0 {
+			m.creatingTicking = false
+			return m, nil
+		}
+		m.creatingTicking = true
+		return m, scheduleCreatingTick()
+
 	case createdMsg:
+		m.endCreating(msg.repo, msg.name)
 		if msg.err != nil {
 			m.setError("create error: " + msg.err.Error())
 			return m, m.loadCmd()
@@ -4130,9 +4214,13 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		r := m.pendingRepo
 		focusCmd := m.filter.Focus()
 		flashTick := m.flashCmd("creating " + name + "…")
+		// Register the pending worktree before the command runs: the fetch and
+		// checkout can take minutes on a large repository, and the flash expires
+		// long before they finish, so the deck row is what keeps the work visible.
+		m.beginCreating(r.Name, name)
 		return m, tea.Batch(focusCmd, flashTick, func() tea.Msg {
 			wt, err := m.ctrl.Create(r, name, "")
-			return createdMsg{wt: wt, err: err}
+			return createdMsg{repo: r.Name, name: name, wt: wt, err: err}
 		})
 	}
 	var cmd tea.Cmd
