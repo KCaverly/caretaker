@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -413,5 +414,89 @@ func TestValidateRequiresRoot(t *testing.T) {
 	}
 	if !filepath.IsAbs(c.Root) {
 		t.Fatalf("root not made absolute: %q", c.Root)
+	}
+}
+
+// TestRepoRoots covers issue #55's config surface: several trees, Root first,
+// deduplicated, and unset entries skipped.
+func TestRepoRoots(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want []string
+	}{
+		{"root only", Config{Root: "/a"}, []string{"/a"}},
+		{"roots only", Config{Roots: []string{"/a", "/b"}}, []string{"/a", "/b"}},
+		{"root leads roots", Config{Root: "/a", Roots: []string{"/b"}}, []string{"/a", "/b"}},
+		{"duplicate collapses", Config{Root: "/a", Roots: []string{"/a", "/b"}}, []string{"/a", "/b"}},
+		{"nothing set", Config{}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.RepoRoots(); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("RepoRoots() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadRootsSection loads a config declaring several trees, and checks each
+// one is resolved to an absolute path at startup.
+func TestLoadRootsSection(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	personal := filepath.Join(base, "personal")
+	for _, d := range []string{work, personal} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(base, "config.toml")
+	content := "roots = [" + strconv.Quote(work) + ", " + strconv.Quote(personal) + "]\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CT_CONFIG", path)
+
+	// `roots` alone satisfies the requirement that used to fall on `root`.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with roots and no root: %v", err)
+	}
+	if got := cfg.RepoRoots(); !reflect.DeepEqual(got, []string{work, personal}) {
+		t.Errorf("RepoRoots() = %v, want the two declared trees", got)
+	}
+}
+
+// TestLoadRejectsMissingRoot names the offending entry rather than failing with a
+// repo list quietly missing a whole tree.
+func TestLoadRejectsMissingRoot(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "config.toml")
+	content := "roots = [" + strconv.Quote(base) + ", " + strconv.Quote(filepath.Join(base, "nope")) + "]\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CT_CONFIG", path)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected a missing root to fail validation")
+	}
+	if !strings.Contains(err.Error(), "roots[1]") {
+		t.Errorf("error should name the offending entry, got %v", err)
+	}
+}
+
+// TestLoadWithNoRootAtAll keeps the original requirement in place.
+func TestLoadWithNoRootAtAll(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "config.toml")
+	if err := os.WriteFile(path, []byte("editor = \"vim\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CT_CONFIG", path)
+	if _, err := Load(); err == nil {
+		t.Fatal("a config with neither root nor roots should fail")
 	}
 }

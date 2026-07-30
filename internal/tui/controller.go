@@ -110,7 +110,7 @@ const loadConcurrency = 16
 // status checks run concurrently (bounded by loadConcurrency); result order
 // stays deterministic because each repo writes into its own slot.
 func (c *Controller) Load() ([]Group, error) {
-	repos, err := repo.DiscoverRepos(c.cfg.Root)
+	repos, err := repo.DiscoverReposIn(c.cfg.RepoRoots())
 	if err != nil {
 		return nil, err
 	}

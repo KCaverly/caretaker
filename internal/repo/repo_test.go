@@ -1,6 +1,11 @@
 package repo
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
 
 func TestParseAheadBehind(t *testing.T) {
 	cases := []struct {
@@ -235,5 +240,125 @@ func TestValidateWorktreeName(t *testing.T) {
 				t.Errorf("ValidateWorktreeName(%q) = %v, want nil", tc.in, err)
 			}
 		})
+	}
+}
+
+// mkRepo creates a directory with a .git marker, which is all DiscoverRepos
+// requires to recognise a repository.
+func mkRepo(t *testing.T, parent, name string) string {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestDiscoverReposInMergesRoots covers issue #55: repos have to come from every
+// configured tree, not just one.
+func TestDiscoverReposInMergesRoots(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	personal := filepath.Join(base, "personal")
+	mkRepo(t, work, "alpha")
+	mkRepo(t, personal, "beta")
+	// Not a repo, and a dotdir: neither should be listed.
+	if err := os.MkdirAll(filepath.Join(work, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkRepo(t, work, ".hidden")
+
+	repos, err := DiscoverReposIn([]string{work, personal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, r := range repos {
+		names = append(names, r.Name)
+	}
+	if want := []string{"alpha", "beta"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("names = %v, want %v", names, want)
+	}
+}
+
+// TestDiscoverReposInDisambiguatesNames is the correctness half of multi-root
+// support. Repo.Name is half of the workspace key that identifies sessions and
+// persisted state, so two repos called the same thing in different trees would
+// share both.
+func TestDiscoverReposInDisambiguatesNames(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	personal := filepath.Join(base, "personal")
+	mkRepo(t, work, "api")
+	mkRepo(t, personal, "api")
+	mkRepo(t, work, "solo") // no collision: keeps its bare name
+
+	repos, err := DiscoverReposIn([]string{work, personal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, r := range repos {
+		if _, dup := byName[r.Name]; dup {
+			t.Fatalf("duplicate display name %q: %+v", r.Name, repos)
+		}
+		byName[r.Name] = r.Path
+	}
+	if _, ok := byName["solo"]; !ok {
+		t.Errorf("a non-colliding repo should keep its bare name: %v", byName)
+	}
+	for _, want := range []string{"work/api", "personal/api"} {
+		if _, ok := byName[want]; !ok {
+			t.Errorf("expected a disambiguated %q, got %v", want, byName)
+		}
+	}
+}
+
+// TestDiscoverReposInDeduplicatesAndTolerates covers the two edges: one repo
+// reachable from two roots is listed once, and a root that vanished under a
+// running ct must not hide the roots that are still there.
+func TestDiscoverReposInDeduplicatesAndTolerates(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	mkRepo(t, work, "alpha")
+
+	repos, err := DiscoverReposIn([]string{work, work})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 {
+		t.Errorf("the same root twice should list one repo, got %+v", repos)
+	}
+
+	repos, err = DiscoverReposIn([]string{work, filepath.Join(base, "gone")})
+	if err != nil {
+		t.Fatalf("a missing root must not fail discovery outright: %v", err)
+	}
+	if len(repos) != 1 || repos[0].Name != "alpha" {
+		t.Errorf("surviving root's repos = %+v, want alpha", repos)
+	}
+
+	// With nothing found at all, the error is surfaced rather than swallowed.
+	if _, err := DiscoverReposIn([]string{filepath.Join(base, "gone")}); err == nil {
+		t.Error("expected an error when no root could be read")
+	}
+}
+
+func TestPathTail(t *testing.T) {
+	cases := []struct {
+		path string
+		n    int
+		want string
+	}{
+		{"/home/kc/work/api", 1, "api"},
+		{"/home/kc/work/api", 2, "work/api"},
+		{"/home/kc/work/api", 3, "kc/work/api"},
+		{"/home/kc/work/api", 9, "home/kc/work/api"},
+		{"api", 2, "api"},
+	}
+	for _, tc := range cases {
+		if got := pathTail(tc.path, tc.n); got != tc.want {
+			t.Errorf("pathTail(%q, %d) = %q, want %q", tc.path, tc.n, got, tc.want)
+		}
 	}
 }

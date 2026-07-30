@@ -58,6 +58,105 @@ func DiscoverRepos(root string) ([]Repo, error) {
 	return repos, nil
 }
 
+// DiscoverReposIn returns the git repositories that are immediate children of
+// any of roots, merged and sorted by display name.
+//
+// A repository reachable from two roots (nested or symlinked trees) is listed
+// once, keyed by its absolute path. A root that has gone missing since startup —
+// config validation resolves them all, so this means it disappeared underneath a
+// running ct — is skipped rather than allowed to hide the roots that are still
+// there; its error surfaces only when no root yielded anything.
+func DiscoverReposIn(roots []string) ([]Repo, error) {
+	var repos []Repo
+	var firstErr error
+	seen := map[string]bool{}
+	for _, root := range roots {
+		found, err := DiscoverRepos(root)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, r := range found {
+			if seen[r.Path] {
+				continue
+			}
+			seen[r.Path] = true
+			repos = append(repos, r)
+		}
+	}
+	if len(repos) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	disambiguateNames(repos)
+	sort.Slice(repos, func(i, j int) bool { return repos[i].Name < repos[j].Name })
+	return repos, nil
+}
+
+// maxNameDepth bounds how many trailing path segments a disambiguated name may
+// use before it stops being a name and starts being a path.
+const maxNameDepth = 4
+
+// disambiguateNames makes every repo's display name unique. Two roots can hold
+// repositories with the same directory name (~/work/api and ~/personal/api), and
+// Repo.Name is not only what the deck shows: it is half of the workspace key that
+// identifies sessions and persisted state. Two repos sharing a name would share
+// those, so the name has to distinguish them.
+//
+// Colliding names grow leftward one path segment at a time — "api" becomes
+// "work/api" and "personal/api" — and only colliding ones do, so the ordinary
+// single-root case keeps bare names.
+func disambiguateNames(repos []Repo) {
+	byName := map[string][]int{}
+	for i, r := range repos {
+		byName[r.Name] = append(byName[r.Name], i)
+	}
+	for _, idxs := range byName {
+		if len(idxs) < 2 {
+			continue
+		}
+		depth := 2
+		for ; depth < maxNameDepth; depth++ {
+			if distinctTails(repos, idxs, depth) {
+				break
+			}
+		}
+		for _, i := range idxs {
+			repos[i].Name = pathTail(repos[i].Path, depth)
+		}
+	}
+}
+
+// distinctTails reports whether the given repos' last-n-segment names are all
+// different from each other.
+func distinctTails(repos []Repo, idxs []int, depth int) bool {
+	seen := map[string]bool{}
+	for _, i := range idxs {
+		tail := pathTail(repos[i].Path, depth)
+		if seen[tail] {
+			return false
+		}
+		seen[tail] = true
+	}
+	return true
+}
+
+// pathTail returns the last n segments of path joined with "/", or the whole path
+// when it is shorter. The separator is always "/" so a disambiguated name reads
+// the same on every platform.
+func pathTail(path string, n int) string {
+	segs := strings.Split(filepath.ToSlash(filepath.Clean(path)), "/")
+	// Drop a leading "" from an absolute path so it never contributes a segment.
+	if len(segs) > 0 && segs[0] == "" {
+		segs = segs[1:]
+	}
+	if n >= len(segs) {
+		return strings.Join(segs, "/")
+	}
+	return strings.Join(segs[len(segs)-n:], "/")
+}
+
 // isGitRepo reports whether path contains a .git entry (dir or file).
 func isGitRepo(path string) bool {
 	_, err := os.Stat(filepath.Join(path, ".git"))

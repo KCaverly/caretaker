@@ -50,11 +50,19 @@ telemetry and does not send repository contents, prompts, or session output to a
 
 ## Configuration
 
-`ct` reads `~/.caretaker/config.toml`, or the path in `CT_CONFIG`. Only `root` is required:
+`ct` reads `~/.caretaker/config.toml`, or the path in `CT_CONFIG`. Only a repo root (`root` or `roots`) is required:
 
 ```toml
 # Parent directory containing your repos (each immediate child with a .git).
 root = "~/code"
+
+# Additional trees to discover repos in, for work split across several
+# directories. `root` is simply the first of them, and either key satisfies the
+# requirement — set only `roots` if you have no single primary tree. Every entry
+# must exist at startup. When two trees hold a repo with the same directory name,
+# both are shown with enough of their path to tell them apart ("work/api" and
+# "personal/api"); repos with a unique name keep the bare name.
+roots = ["~/work", "~/personal"]
 
 # Optional program defaults:
 editor = "nvim"
