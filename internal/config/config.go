@@ -14,8 +14,13 @@ import (
 
 // Config holds ct's runtime configuration.
 type Config struct {
-	// Root is the parent directory that contains the user's repos. Required.
+	// Root is the parent directory that contains the user's repos. Required
+	// unless Roots is set; first-run setup writes this one.
 	Root string `toml:"root"`
+	// Roots are additional parent directories to discover repos in, for people
+	// whose work is split across several organised trees (~/work and ~/personal).
+	// Root, when set, is the first of them. Every entry must exist at startup.
+	Roots []string `toml:"roots"`
 	// Editor is the command launched for the nvim session.
 	Editor string `toml:"editor"`
 	// Agent is the legacy command launched for a Claude session. Agents.Claude
@@ -320,6 +325,23 @@ func Save(path, root string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
+// RepoRoots returns every directory to discover repos in, deduplicated and in
+// declaration order: Root first (it is what first-run setup writes, and what
+// SetRoot updates), then Roots. Callers use this rather than Root so support for
+// several trees cannot be lost by a caller that only knows about the one.
+func (c Config) RepoRoots() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, root := range append([]string{c.Root}, c.Roots...) {
+		if root == "" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		out = append(out, root)
+	}
+	return out
+}
+
 // ResolveRoot expands ~ and makes root absolute, returning an error if it
 // doesn't point to an existing directory.
 func ResolveRoot(root string) (string, error) {
@@ -342,14 +364,25 @@ func ResolveRoot(root string) (string, error) {
 }
 
 func (c *Config) validate() error {
-	if c.Root == "" {
+	if c.Root == "" && len(c.Roots) == 0 {
 		return fmt.Errorf("config `root` is required (the directory containing your repos)")
 	}
-	abs, err := ResolveRoot(c.Root)
-	if err != nil {
-		return err
+	// Resolve every root up front so a typo is a startup error naming the entry,
+	// not a repo list that is quietly missing a whole tree.
+	if c.Root != "" {
+		abs, err := ResolveRoot(c.Root)
+		if err != nil {
+			return err
+		}
+		c.Root = abs
 	}
-	c.Root = abs
+	for i, root := range c.Roots {
+		abs, err := ResolveRoot(root)
+		if err != nil {
+			return fmt.Errorf("config `roots[%d]`: %w", i, err)
+		}
+		c.Roots[i] = abs
+	}
 	switch c.Display.Icons {
 	case IconsNerd, IconsText, IconsASCII:
 	default:
