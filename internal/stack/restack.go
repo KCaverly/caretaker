@@ -385,12 +385,14 @@ func Restack(o RestackOptions) (RestackResult, error) {
 	}
 
 	// 7. Only after convergence has been observed may landed branches disappear.
-	// Re-read GitHub before each deletion so a concurrent PR cannot acquire the
-	// branch as its base between submit and cleanup.
+	// Re-read GitHub after the submit so a concurrent PR cannot acquire one of
+	// these branches as its base between submit and cleanup. One read covers the
+	// whole batch — deleting a branch cannot give another branch a dependent, so
+	// re-reading between deletions would only repeat the same answer.
+	if err := ensureBranchesHaveNoOpenDependents(dir, st.Worktree, st.MainBranch, res.BranchDeletes); err != nil {
+		return res, err
+	}
 	for _, b := range res.BranchDeletes {
-		if err := ensureBranchHasNoOpenDependents(dir, st.Worktree, b); err != nil {
-			return res, err
-		}
 		if err := deleteRemoteBranch(dir, b); err != nil {
 			return res, fmt.Errorf("deleting landed remote branch %s: %w", b, err)
 		}
