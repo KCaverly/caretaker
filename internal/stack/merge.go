@@ -29,6 +29,61 @@ type MergeOptions struct{ Params Params }
 type MergeResult struct {
 	Status   StackStatus
 	Executed []string
+
+	// Merged is the PR number this run squash-merged, or 0 when the squash never
+	// ran. It is stamped the moment GitHub accepts the merge, before any cleanup,
+	// so a caller holding an error can tell "the merge did not happen" apart from
+	// "the merge happened and the tidy-up after it did not". The two want opposite
+	// things from the user — the first invites a retry, the second must not.
+	Merged int
+}
+
+// mergeabilityPending reports whether the one thing standing between this stack
+// and a merge is GitHub not having finished computing the bottom open PR's
+// mergeability. GitHub answers UNKNOWN (or nothing at all) while that calculation
+// is in flight, and an UNKNOWN bottom PR reconciles to "wait" even though the
+// base, base chain, checks and review are all already clear.
+//
+// Telling that apart from a real refusal is what keeps a cascade merge — issued
+// moments after the previous PR landed, which is exactly when GitHub is busy
+// recomputing — from being reported as a stack that is not ready to merge.
+func mergeabilityPending(st StackStatus) bool {
+	if !st.GitHub.Available || !st.Stack.BaseChainOK {
+		return false
+	}
+	bottom := bottomOpenPR(st.Commits)
+	if bottom == nil {
+		return false
+	}
+	if bottom.Mergeable != "" && bottom.Mergeable != "UNKNOWN" {
+		return false
+	}
+	return mergeReadyApartFromMergeability(bottom, st.MainBranch)
+}
+
+// awaitMergeReady re-reads status for as long as the merge is blocked only by
+// GitHub's pending mergeability calculation, returning as soon as that resolves —
+// or when the settle budget runs out, leaving mergeArgs to report whatever the
+// real state turned out to be. A stack blocked for any other reason returns
+// immediately, so a genuinely unmergeable stack still fails fast.
+func awaitMergeReady(p Params, st StackStatus) StackStatus {
+	if !mergeabilityPending(st) {
+		return st
+	}
+	deadline := time.Now().Add(postMergeSettleTimeout)
+	interval := postMergeSettleInterval
+	for time.Now().Before(deadline) {
+		interval = settlePoll(interval)
+		fresh, err := Status(p)
+		if err != nil {
+			return st
+		}
+		st = fresh
+		if !mergeabilityPending(st) {
+			return st
+		}
+	}
+	return st
 }
 
 // mergeArgs validates fresh status and builds the guarded gh command. GitHub's
@@ -179,6 +234,13 @@ func Merge(o MergeOptions) (MergeResult, error) {
 	if err != nil {
 		return res, err
 	}
+
+	// Give GitHub's mergeability calculation a chance to land before judging the
+	// stack. Polling uses o.Params, not p: the fetch p asks for has already
+	// happened, and mergeability is remote state a git fetch cannot advance.
+	st = awaitMergeReady(o.Params, st)
+	res.Status = st
+
 	args, err := mergeArgs(st)
 	if err != nil {
 		return res, err
@@ -186,6 +248,9 @@ func Merge(o MergeOptions) (MergeResult, error) {
 	if _, err := runGH(p.WorktreeDir, args...); err != nil {
 		return res, fmt.Errorf("merging PR #%d: %w", st.MergeHint.Number, err)
 	}
+	// Stamped before any cleanup step can fail: past this line the squash has
+	// landed on GitHub, whatever else goes wrong.
+	res.Merged = st.MergeHint.Number
 	res.Executed = append(res.Executed, fmt.Sprintf("merged PR #%d (squash)", st.MergeHint.Number))
 
 	merged := bottomOpenCommit(st.Commits)

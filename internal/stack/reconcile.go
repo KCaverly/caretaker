@@ -326,13 +326,20 @@ func nextAction(commits []Commit, stk Stack, mainBranch string) string {
 // on main, affirmatively mergeable, checks passing (or none), and either approved or with
 // no review requested. The caller additionally gates on a well-formed base chain.
 func mergeEligible(pr *PR, mainBranch string) bool {
+	// The first clause guarantees pr is non-nil, so the mergeability read is safe.
+	return mergeReadyApartFromMergeability(pr, mainBranch) && pr.Mergeable == "MERGEABLE"
+}
+
+// mergeReadyApartFromMergeability is mergeEligible with the mergeability clause
+// left out: the base, the checks and the review are all clear. It is split out
+// because GitHub's mergeability is the one input that is *computed on demand* and
+// so has a legitimate in-flight value, which callers must be able to tell apart
+// from a stack that is genuinely not landable.
+func mergeReadyApartFromMergeability(pr *PR, mainBranch string) bool {
 	if pr == nil {
 		return false
 	}
 	if pr.Base != mainBranch {
-		return false
-	}
-	if pr.Mergeable != "MERGEABLE" {
 		return false
 	}
 	if pr.Checks.Summary != "passing" && pr.Checks.Summary != "none" {

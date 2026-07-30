@@ -281,10 +281,17 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 		t.Errorf("ready stack should advertise M merge:\n%s", out)
 	}
 	m.stackMerge = func(stack.MergeOptions) (stack.MergeResult, error) { return stack.MergeResult{}, nil }
+	// M no longer confirms straight from the cached rollup: it re-reads GitHub
+	// first (issue #57), so the confirmation opens only once the preflight lands.
 	mm, cmd := m.handleStack(tea.KeyPressMsg{Code: 'M', Text: "M"})
 	m = mm.(Model)
-	if m.mode != modeConfirmMerge || cmd != nil || m.confirm.cursor != 0 {
-		t.Fatal("M should open the merge confirmation on its safe option")
+	if m.mode == modeConfirmMerge || cmd == nil || !m.stackView.working {
+		t.Fatal("M should kick a merge preflight rather than confirm from the cache")
+	}
+	mm, _ = m.Update(mergePreflightMsg{key: key, params: stack.Params{}, status: ready})
+	m = mm.(Model)
+	if m.mode != modeConfirmMerge || m.confirm.cursor != 0 {
+		t.Fatal("a ready preflight should open the merge confirmation on its safe option")
 	}
 	if out := m.renderConfirm(m.height - barHeight); !strings.Contains(out, "PR #10") ||
 		!strings.Contains(out, "merge PR #10 into main") || !strings.Contains(out, "checks: unknown") {
@@ -313,9 +320,16 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 		t.Fatal("command palette should offer merge for a mergeable main PR")
 	}
 
+	// The palette row goes through the same preflight: it reads the deck's cache,
+	// which is the staleness issue #57 was about.
 	cmd = runPaletteRow(t, &m, "merge PR: repo/wt")
-	if m.mode != modeConfirmMerge || cmd != nil || !m.stackOpen {
-		t.Fatal("palette merge should open the shared confirmation")
+	if m.mode == modeConfirmMerge || cmd == nil || !m.stackOpen {
+		t.Fatal("palette merge should open the stack overlay and kick a preflight")
+	}
+	mm, _ = m.Update(mergePreflightMsg{key: key, params: stack.Params{}, status: ready})
+	m = mm.(Model)
+	if m.mode != modeConfirmMerge {
+		t.Fatal("a ready preflight should open the shared confirmation")
 	}
 	mm, _ = m.handleConfirmMergeKey(tea.KeyPressMsg{Code: tea.KeyEscape})
 	m = mm.(Model)
@@ -325,8 +339,90 @@ func TestMergeActionRequiresMergeableMainPR(t *testing.T) {
 
 	m.stackAutoMerge = true
 	cmd = runPaletteRow(t, &m, "merge PR: repo/wt")
+	if cmd == nil {
+		t.Fatal("auto_merge should still preflight from the palette")
+	}
+	mm, cmd = m.Update(mergePreflightMsg{key: key, params: stack.Params{}, status: ready})
+	m = mm.(Model)
 	if m.mode != modeNormal || !m.stackView.working || cmd == nil {
-		t.Fatal("auto_merge should execute immediately from the palette")
+		t.Fatal("auto_merge should execute as soon as the preflight clears")
+	}
+}
+
+// TestMergePreflightRefusesStaleReadiness is the regression for issue #57: the UI
+// offered a merge from a cache up to stackFreshFor old, and stack.Merge then
+// refused against fresh state. The preflight must catch that itself, keep the
+// fresh rollup on screen, and not open the confirmation.
+func TestMergePreflightRefusesStaleReadiness(t *testing.T) {
+	ready := statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "merge",
+			Counts: map[stack.State]int{stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateOpen, Subject: "ready",
+			PR: &stack.PR{Number: 10, Base: "main", Mergeable: "MERGEABLE"}})
+	ready.MergeHint = &stack.MergeHint{Number: 10, Subject: "ready", Body: "body"}
+
+	// What the fresh read found: CI went red while the cache said merge.
+	moved := statusWith(
+		stack.Stack{Size: 1, BaseChainOK: true, NextAction: "fix-ci",
+			Counts: map[stack.State]int{stack.StateOpen: 1}},
+		stack.Commit{State: stack.StateOpen, Subject: "ready",
+			PR: &stack.PR{Number: 10, Base: "main", Mergeable: "MERGEABLE",
+				Checks: stack.Checks{Summary: "failing"}}})
+
+	m, key := stackModel()
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{})
+	m.stackView.working = false
+	m.stackView.status = &ready
+
+	mm, _ := m.Update(mergePreflightMsg{
+		key: key, params: stack.Params{}, status: moved,
+		notReady: "stack is no longer ready to merge (next action: fix-ci)",
+	})
+	m = mm.(Model)
+	if m.mode == modeConfirmMerge {
+		t.Fatal("a refused preflight must not open the merge confirmation")
+	}
+	if m.stackView.working {
+		t.Fatal("a refused preflight must leave the overlay out of its working state")
+	}
+	if m.stackView.status == nil || m.stackView.status.Stack.NextAction != "fix-ci" {
+		t.Fatal("the refusing status should replace the stale one that offered the merge")
+	}
+	if !strings.Contains(m.status, "no longer ready") {
+		t.Errorf("status line should explain the refusal, got %q", m.status)
+	}
+}
+
+// TestMergeCleanupFailureIsNotAFailedMerge covers the other half of issue #57:
+// when the squash landed and a later step failed, the overlay must not say
+// "merge failed" — that reads as "nothing happened" and invites a retry against
+// an already-closed PR.
+func TestMergeCleanupFailureIsNotAFailedMerge(t *testing.T) {
+	m, key := stackModel()
+	m = m.enterStackOverlay(key, "repo", "wt", stack.Params{})
+
+	m.applyStackMerge(stackMergeMsg{
+		key: key,
+		res: stack.MergeResult{
+			Merged:   10,
+			Executed: []string{"merged PR #10 (squash)"},
+		},
+		err: errors.New("deleting merged remote branch ct/wt/aaaaaaaa: permission denied"),
+	})
+	body := strings.Join(m.stackView.body, "\n")
+	if strings.Contains(body, "merge failed") {
+		t.Errorf("a landed merge must not be reported as failed:\n%s", body)
+	}
+	for _, want := range []string{"PR #10 merged", "cleanup after it did not finish", "merged PR #10 (squash)"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q:\n%s", want, body)
+		}
+	}
+
+	// A merge that never ran keeps the plain wording.
+	m.applyStackMerge(stackMergeMsg{key: key, res: stack.MergeResult{}, err: errors.New("stack is not ready to merge")})
+	if body := strings.Join(m.stackView.body, "\n"); !strings.Contains(body, "merge failed") {
+		t.Errorf("a merge that never ran should still read as failed:\n%s", body)
 	}
 }
 

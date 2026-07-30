@@ -62,6 +62,72 @@ func TestMergeArgsGuardsAndMessage(t *testing.T) {
 	}
 }
 
+// TestMergeabilityPending is the other half of issue #57: GitHub reports UNKNOWN
+// mergeability while it recomputes, which reconciles to "wait" and made a cascade
+// merge issued moments after the previous land read as a stack that was not
+// ready. Only that one in-flight input may be waited out — every other reason to
+// refuse must still fail fast.
+func TestMergeabilityPending(t *testing.T) {
+	base := func(mergeable string, checks Checks, review, prBase string) StackStatus {
+		return StackStatus{
+			MainBranch: "main",
+			GitHub:     GitHub{Available: true},
+			Stack:      Stack{BaseChainOK: true, NextAction: "wait"},
+			Commits: []Commit{{State: StateOpen, PR: &PR{
+				Number: 11, Base: prBase, Mergeable: mergeable, Review: review, Checks: checks,
+			}}},
+		}
+	}
+	passing := Checks{Summary: "passing"}
+
+	cases := []struct {
+		name    string
+		st      StackStatus
+		pending bool
+	}{
+		{"UNKNOWN with everything else clear", base("UNKNOWN", passing, "", "main"), true},
+		{"empty mergeability is also in flight", base("", passing, "", "main"), true},
+		{"approved and UNKNOWN", base("UNKNOWN", passing, "APPROVED", "main"), true},
+		{"no checks at all", base("UNKNOWN", Checks{Summary: "none"}, "", "main"), true},
+
+		{"already mergeable is not pending", base("MERGEABLE", passing, "", "main"), false},
+		{"conflicting is a real refusal", base("CONFLICTING", passing, "", "main"), false},
+		{"failing checks are a real refusal", base("UNKNOWN", Checks{Summary: "failing"}, "", "main"), false},
+		{"pending checks are a real refusal", base("UNKNOWN", Checks{Summary: "pending"}, "", "main"), false},
+		{"review outstanding is a real refusal", base("UNKNOWN", passing, "REVIEW_REQUIRED", "main"), false},
+		{"wrong base is a real refusal", base("UNKNOWN", passing, "", "ct/wt/aaaaaaaa"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeabilityPending(tc.st); got != tc.pending {
+				t.Fatalf("mergeabilityPending = %v, want %v", got, tc.pending)
+			}
+		})
+	}
+
+	t.Run("broken base chain is a real refusal", func(t *testing.T) {
+		st := base("UNKNOWN", passing, "", "main")
+		st.Stack.BaseChainOK = false
+		if mergeabilityPending(st) {
+			t.Fatal("a broken base chain is not something waiting will fix")
+		}
+	})
+	t.Run("github unavailable is a real refusal", func(t *testing.T) {
+		st := base("UNKNOWN", passing, "", "main")
+		st.GitHub.Available = false
+		if mergeabilityPending(st) {
+			t.Fatal("without GitHub there is nothing to wait for")
+		}
+	})
+	t.Run("no open PR is a real refusal", func(t *testing.T) {
+		st := base("UNKNOWN", passing, "", "main")
+		st.Commits = nil
+		if mergeabilityPending(st) {
+			t.Fatal("nothing to merge is not a pending calculation")
+		}
+	})
+}
+
 func TestPostMergeSettled(t *testing.T) {
 	commit := func(state State, number int, base, mergeable string) Commit {
 		return Commit{State: state, PR: &PR{Number: number, Base: base, Mergeable: mergeable}}
