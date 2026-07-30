@@ -436,23 +436,31 @@ func (m *Manager) resizeLocked(ws *Workspace, w, h int) {
 	for _, a := range ws.Agents {
 		a.Resize(w, h)
 	}
-	if ws.TermLayout != nil {
-		for _, b := range ComputePaneBounds(ws.TermLayout, 0, 0, w, h) {
-			if b.Idx < len(ws.Terms) && ws.Terms[b.Idx] != nil {
-				ws.Terms[b.Idx].Resize(b.W, b.H)
-			}
-		}
-	}
+	m.layoutTermPanesLocked(ws, w, h)
 }
 
-// ResizeTermPanes recomputes pane bounds from the split tree and resizes each
-// terminal session to its assigned rectangle. w and h are the body dimensions
-// (terminal height minus the status-bar chrome).
-func (m *Manager) ResizeTermPanes(key string, w, h int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ws, ok := m.spaces[key]
-	if !ok || ws.TermLayout == nil {
+// layoutTermPanesLocked sizes the terminal panes for the workspace's current
+// presentation: when zoomed, the focused pane owns the whole body, and otherwise
+// each pane takes its rectangle from the split tree. Callers must hold m.mu.
+//
+// The zoom case has to be handled here and not only in the renderer. A pane's
+// emulator is what decides how many rows and columns of output exist, so a zoomed
+// pane still sized to its split rectangle renders at that size: the divider
+// disappears and the terminal keeps drawing in half the screen (issue #59). The
+// branch condition deliberately mirrors renderTermPanes' — the sizer and the
+// renderer have to agree about which pane occupies what, or one of them is wrong.
+//
+// Panes hidden by the zoom keep their old size until it is released, which is
+// harmless because nothing draws them; the unzoom runs this again and puts every
+// pane back on the split tree.
+func (m *Manager) layoutTermPanesLocked(ws *Workspace, w, h int) {
+	if len(ws.Terms) == 0 {
+		return
+	}
+	if ws.TermZoomed || len(ws.Terms) == 1 || ws.TermLayout == nil {
+		if s := ws.ActiveTermSession(); s != nil {
+			s.Resize(w, h)
+		}
 		return
 	}
 	for _, b := range ComputePaneBounds(ws.TermLayout, 0, 0, w, h) {
@@ -460,6 +468,19 @@ func (m *Manager) ResizeTermPanes(key string, w, h int) {
 			ws.Terms[b.Idx].Resize(b.W, b.H)
 		}
 	}
+}
+
+// ResizeTermPanes resizes each terminal session to the rectangle it currently
+// occupies — the whole body when zoomed, otherwise its slot in the split tree. w
+// and h are the body dimensions (terminal height minus the status-bar chrome).
+func (m *Manager) ResizeTermPanes(key string, w, h int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.spaces[key]
+	if !ok {
+		return
+	}
+	m.layoutTermPanesLocked(ws, w, h)
 }
 
 // SplitTermPane spawns a new terminal session and inserts it into the pane

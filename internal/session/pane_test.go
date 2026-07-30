@@ -464,3 +464,50 @@ func TestManagerSplitAndCloseTermPane(t *testing.T) {
 		t.Fatalf("after final close: %d terms layout=%v", len(ws.Terms), ws.TermLayout)
 	}
 }
+
+// TestZoomedPaneTakesTheWholeBody is the regression for issue #59. A pane's
+// emulator decides how much output exists, so the sizer has to agree with the
+// renderer about which pane occupies what. It didn't: the split tree drove every
+// resize regardless of the zoom, so a zoomed pane in a horizontal split kept
+// rendering into half the screen with the divider merely gone.
+func TestZoomedPaneTakesTheWholeBody(t *testing.T) {
+	m := NewManager()
+	defer m.CloseAll()
+
+	sleep := []string{"sh", "-c", "sleep 5"}
+	ws, err := m.Activate("r/w", t.TempDir(), []Spec{{Kind: Terminal, Argv: sleep}}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A horizontal split halves the height, which is the shape the bug reported.
+	if _, err := m.SplitTermPane("r/w", t.TempDir(), Spec{Kind: Terminal, Argv: sleep}, SplitH, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	m.ResizeTermPanes("r/w", 80, 24)
+	if _, h := ws.Terms[ws.ActiveTerm].Size(); h >= 24 {
+		t.Fatalf("split pane height = %d, want less than the full body", h)
+	}
+
+	m.ZoomTermPane("r/w")
+	m.ResizeTermPanes("r/w", 80, 24)
+	if w, h := ws.Terms[ws.ActiveTerm].Size(); w != 80 || h != 24 {
+		t.Fatalf("zoomed pane = %dx%d, want the whole body 80x24", w, h)
+	}
+
+	// A window resize while still zoomed must keep the whole body, not fall back
+	// to the split rectangle.
+	m.ResizeWorkspace("r/w", 100, 30)
+	if w, h := ws.Terms[ws.ActiveTerm].Size(); w != 100 || h != 30 {
+		t.Fatalf("zoomed pane after window resize = %dx%d, want 100x30", w, h)
+	}
+
+	// Unzooming puts every pane back on the split tree.
+	m.ZoomTermPane("r/w")
+	m.ResizeTermPanes("r/w", 100, 30)
+	for i, s := range ws.Terms {
+		if _, h := s.Size(); h >= 30 {
+			t.Fatalf("pane %d height = %d after unzoom, want its split share", i, h)
+		}
+	}
+}
