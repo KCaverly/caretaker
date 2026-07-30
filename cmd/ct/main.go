@@ -469,7 +469,17 @@ func runStackMerge(args []string) int {
 	}
 	res, err := stack.Merge(stack.MergeOptions{Params: params})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "ct stack merge:", err)
+		// Report the steps that did land, as submit does, and distinguish a merge
+		// that never happened from one that happened and whose cleanup did not —
+		// only the former should be retried.
+		for _, done := range res.Executed {
+			fmt.Fprintln(os.Stderr, "  did:", done)
+		}
+		if res.Merged > 0 {
+			fmt.Fprintf(os.Stderr, "ct stack merge: PR #%d merged, but the cleanup after it did not finish: %v\n", res.Merged, err)
+		} else {
+			fmt.Fprintln(os.Stderr, "ct stack merge:", err)
+		}
 		return 1
 	}
 	fmt.Print(stack.Render(res.Status))

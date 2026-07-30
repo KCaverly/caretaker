@@ -624,6 +624,22 @@ type archivePreflightMsg struct {
 	err         error
 }
 
+// mergePreflightMsg carries the freshly re-read status behind a merge request, so
+// the confirm panel (or the auto_merge fast path) acts on the stack as it is now
+// rather than on the deck's cached copy. params is the caller's original — the
+// preflight's own fetch is not passed on to Merge.
+//
+// notReady and err are deliberately separate: notReady means the read succeeded
+// and the merge gate declined the result, so that status is good and worth
+// showing, whereas err means there is no status to show at all.
+type mergePreflightMsg struct {
+	key      string
+	params   stack.Params
+	status   stack.StackStatus
+	notReady string
+	err      error
+}
+
 type dirtyMsg struct{}
 
 // diffMsg carries one diff fetch's results back to the UI goroutine. It stamps
@@ -1080,6 +1096,27 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.beginArchive(msg), nil
+
+	case mergePreflightMsg:
+		if msg.err != nil {
+			m.applyStackStatus(stackStatusMsg{key: msg.key, err: msg.err})
+			m.stackView.working = false
+			m.setError("merge: " + msg.err.Error())
+			return m, m.ensureSplitDiff()
+		}
+		// The fresh status replaces the cached one that offered the merge, so a
+		// refusal leaves the overlay showing the rollup that actually refused
+		// rather than the stale one that looked ready.
+		m.applyStackStatus(stackStatusMsg{key: msg.key, status: msg.status})
+		if msg.notReady != "" {
+			m.setError("merge: " + msg.notReady)
+			return m, m.ensureSplitDiff()
+		}
+		if m.stackAutoMerge {
+			m.stackView.working = true
+			return m, m.mergeStackCmd(msg.key, msg.params)
+		}
+		return m.beginMergeConfirm(msg.key, msg.params, msg.status), m.ensureSplitDiff()
 
 	case dirtyMsg:
 		return m, m.repaintCmd()
@@ -3833,14 +3870,44 @@ func (m Model) beginAgentRestartConfirm(r boardRow) Model {
 	return m
 }
 
-// requestStackMerge either executes immediately for the explicit auto_merge
-// opt-in or opens the shared destructive-action confirmation panel.
+// requestStackMerge re-reads GitHub before committing to a merge, then either
+// executes immediately for the explicit auto_merge opt-in or opens the shared
+// destructive-action confirmation panel.
+//
+// The preflight is the fix for a merge that failed from the UI while the same
+// merge succeeded from the CLI (issue #57). Both surfaces call the same
+// stack.Merge, which re-validates against fresh state — but the UI reached it
+// from the deck's passive stack cache, which is allowed to be up to
+// stackFreshFor (5 minutes) old. Anything that moved in that window — CI
+// restarting, a review request appearing, GitHub recomputing mergeability after a
+// neighbouring land — made the UI offer a merge that Merge then refused, while a
+// CLI run computed its own state at the moment of the command and agreed with
+// itself. Archive already re-validated this way; merge did not.
 func (m Model) requestStackMerge(key string, p stack.Params, st stack.StackStatus) (tea.Model, tea.Cmd) {
-	if m.stackAutoMerge {
-		m.stackView.working = true
-		return m, m.mergeStackCmd(key, p)
+	m.stackView.working = true
+	return m, mergePreflightCmd(key, p)
+}
+
+// mergePreflightCmd re-reads the stack with a fetch and re-applies the merge gate
+// to the fresh result, so the confirmation panel describes the stack as it is now
+// rather than as the cache last saw it.
+func mergePreflightCmd(key string, p stack.Params) tea.Cmd {
+	return func() tea.Msg {
+		// A copy carries the fetch: the params handed to Merge must keep the
+		// caller's Fetch setting, or its post-merge settle loop would fetch on
+		// every poll.
+		fresh := p
+		fresh.Fetch = true
+		st, err := stack.Status(fresh)
+		if err != nil {
+			return mergePreflightMsg{key: key, params: p, err: err}
+		}
+		notReady := ""
+		if !stackCanMerge(st) {
+			notReady = fmt.Sprintf("stack is no longer ready to merge (next action: %s)", st.Stack.NextAction)
+		}
+		return mergePreflightMsg{key: key, params: p, status: st, notReady: notReady}
 	}
-	return m.beginMergeConfirm(key, p, st), nil
 }
 
 func (m Model) beginMergeConfirm(key string, p stack.Params, st stack.StackStatus) Model {

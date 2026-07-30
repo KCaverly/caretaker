@@ -617,7 +617,14 @@ func (m *Model) applyStackMerge(msg stackMergeMsg) {
 	m.stackView.offset = 0
 	if msg.err != nil {
 		m.stackView.status = nil
-		m.stackView.body = stackErrorBody("merge failed: "+msg.err.Error(), msg.res.Executed)
+		// A failure after the squash landed is not a failed merge, and must not
+		// read as one: "merge failed" invites a retry that would try to merge a PR
+		// GitHub has already closed. Name what happened instead.
+		headline := "merge failed: "
+		if msg.res.Merged > 0 {
+			headline = fmt.Sprintf("PR #%d merged, but the cleanup after it did not finish: ", msg.res.Merged)
+		}
+		m.stackView.body = stackErrorBody(headline+msg.err.Error(), msg.res.Executed)
 		return
 	}
 	st := msg.res.Status
