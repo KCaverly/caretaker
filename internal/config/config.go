@@ -195,6 +195,11 @@ type Keys struct {
 	TermFocusDown  string `toml:"term_focus_down"`
 	TermFocusUp    string `toml:"term_focus_up"`
 	TermFocusRight string `toml:"term_focus_right"`
+	// Terminal scrollback (only intercepted on the terminal screen). These walk
+	// the focused pane's history a screenful at a time; the mouse wheel scrolls it
+	// too. Any other key returns the pane to live output.
+	TermScrollUp   string `toml:"term_scroll_up"`
+	TermScrollDown string `toml:"term_scroll_down"`
 	// Usage opens the usage overlay on the agent screen.
 	Usage string `toml:"usage"`
 	// CommandPalette opens the command palette: a fuzzy-searchable list of every
@@ -232,6 +237,9 @@ func Default() Config {
 			TermZoom: "alt+z", TermClose: "alt+x",
 			TermFocusLeft: "alt+h", TermFocusDown: "alt+j",
 			TermFocusUp: "alt+k", TermFocusRight: "alt+l",
+			// The conventional terminal scrollback chord, and free of the alt+
+			// family the pane keys already occupy.
+			TermScrollUp: "shift+pgup", TermScrollDown: "shift+pgdown",
 			Usage: "alt+u", CommandPalette: "alt+p",
 		},
 		Usage:   Usage{Threshold: 50},

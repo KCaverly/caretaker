@@ -757,3 +757,178 @@ func TestManagerReplaceAgentErrorsForMissingTarget(t *testing.T) {
 		t.Fatalf("missing agent error = %v, want %v", err, errNoAgent)
 	}
 }
+
+// startNumbered launches a shell that prints n numbered lines into a w×h pane and
+// then idles, so the pane has more history than it can show.
+func startNumbered(t *testing.T, n, w, h int) *Session {
+	t.Helper()
+	s, err := Start(Terminal, "t", t.TempDir(),
+		[]string{"sh", "-c", fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done; sleep 30", n)},
+		w, h, func(*Session) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	// Wait for the output to arrive rather than for a fixed slice of time.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(s.Render(), fmt.Sprintf("line-%d", n)) {
+			return s
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pane never showed line-%d", n)
+	return nil
+}
+
+// TestScrollbackWalksHistory is the core of issue #58: a terminal pane could not
+// be scrolled at all, even though the emulator had been keeping scrollback the
+// whole time.
+func TestScrollbackWalksHistory(t *testing.T) {
+	s := startNumbered(t, 60, 20, 10)
+
+	live := s.Render()
+	if !strings.Contains(live, "line-60") {
+		t.Fatalf("live frame should end at the newest line:\n%s", live)
+	}
+	if s.Scrolled() {
+		t.Fatal("a fresh pane should be at the live output")
+	}
+
+	// Back five lines: the frame shifts by exactly five and stays a screenful.
+	if !s.ScrollBy(-5) {
+		t.Fatal("ScrollBy back should move a pane with scrollback")
+	}
+	if s.ScrollOffset() != 5 || !s.Scrolled() {
+		t.Fatalf("offset = %d, scrolled = %v; want 5, true", s.ScrollOffset(), s.Scrolled())
+	}
+	back := s.Render()
+	if lines := strings.Split(back, "\n"); len(lines) != 10 {
+		t.Errorf("scrolled frame has %d lines, want the pane height 10", len(lines))
+	}
+	if !strings.Contains(back, "line-55") || strings.Contains(back, "line-60") {
+		t.Errorf("scrolling back 5 should end at line-55, not line-60:\n%s", back)
+	}
+
+	// Forward again returns exactly to the live frame.
+	if !s.ScrollBy(+5) || s.Scrolled() {
+		t.Fatal("scrolling forward by the same amount should reach the live output")
+	}
+	if s.Render() != live {
+		t.Error("returning to the bottom should reproduce the live frame")
+	}
+}
+
+func TestScrollbackClampsAtBothEnds(t *testing.T) {
+	s := startNumbered(t, 60, 20, 10)
+
+	if s.ScrollBy(+1) {
+		t.Error("scrolling forward from the live output should report no change")
+	}
+	// Far past the top lands on the oldest line kept and then refuses to move.
+	if !s.ScrollBy(-10000) {
+		t.Fatal("scrolling back should move")
+	}
+	atTop := s.ScrollOffset()
+	if atTop == 0 {
+		t.Fatal("offset should be non-zero at the top of the scrollback")
+	}
+	if s.ScrollBy(-10000) {
+		t.Error("scrolling back from the oldest line should report no change")
+	}
+	if s.ScrollOffset() != atTop {
+		t.Errorf("offset drifted past the top: %d, want %d", s.ScrollOffset(), atTop)
+	}
+}
+
+// TestTypingResumesLiveOutput pins the escape hatch: input the user cannot see
+// the result of is worse than losing a scroll position.
+func TestTypingResumesLiveOutput(t *testing.T) {
+	s := startNumbered(t, 60, 20, 10)
+	if !s.ScrollBy(-5) {
+		t.Fatal("expected to scroll back")
+	}
+	s.SendKey(uv.KeyPressEvent{Code: 'x', Text: "x"})
+	if s.Scrolled() {
+		t.Errorf("typing should return the pane to live output, offset = %d", s.ScrollOffset())
+	}
+}
+
+// TestResizeResumesLiveOutput covers the other snap-back: a resize reflows the
+// buffer, so a parked offset no longer names the same content.
+func TestResizeResumesLiveOutput(t *testing.T) {
+	s := startNumbered(t, 60, 20, 10)
+	if !s.ScrollBy(-5) {
+		t.Fatal("expected to scroll back")
+	}
+	s.Resize(30, 12)
+	if s.Scrolled() {
+		t.Errorf("resize should return the pane to live output, offset = %d", s.ScrollOffset())
+	}
+}
+
+// TestScrolledViewHoldsStillUnderOutput is the anchor: new output pushes lines
+// into scrollback, which moves the boundary the offset is measured from. Without
+// compensating, a parked view drifts through its own history at the speed of the
+// output.
+func TestScrolledViewHoldsStillUnderOutput(t *testing.T) {
+	s := startNumbered(t, 40, 20, 10)
+	if !s.ScrollBy(-6) {
+		t.Fatal("expected to scroll back")
+	}
+	parked := s.Render()
+
+	// Ten more lines arrive while the view is parked. They are written straight to
+	// the emulator, exactly as the pty pump does, so the test does not depend on a
+	// shell reading its stdin or on output timing.
+	feed(s, 41, 50)
+
+	if !strings.Contains(s.emu.Render(), "line-50") {
+		t.Fatal("the injected output never reached the screen")
+	}
+	if got := s.Render(); got != parked {
+		t.Errorf("parked view drifted under new output:\nwant:\n%s\ngot:\n%s", parked, got)
+	}
+	if !s.Scrolled() {
+		t.Error("output alone should not resume the live view")
+	}
+
+	// The live output did move on, so releasing the scroll shows the new tail.
+	s.ScrollToBottom()
+	if live := s.Render(); !strings.Contains(live, "line-50") {
+		t.Errorf("live frame should show the newest output:\n%s", live)
+	}
+}
+
+// feed writes numbered lines into the emulator the way the pty pump would,
+// including the dirty flag that a real write sets.
+func feed(s *Session, from, to int) {
+	for i := from; i <= to; i++ {
+		_, _ = fmt.Fprintf(s.emu, "line-%d\r\n", i)
+	}
+	s.renderCacheDirty.Store(true)
+}
+
+// TestAltScreenPaneDoesNotScroll pins the boundary: nvim, less and the agent TUIs
+// own the viewport and implement their own scrolling, and they push nothing into
+// scrollback, so scrolling "behind" them would show history from before they
+// started. The wheel handler relies on this returning false to hand the event on.
+func TestAltScreenPaneDoesNotScroll(t *testing.T) {
+	s := startNumbered(t, 60, 20, 10)
+	if !s.ScrollBy(-3) {
+		t.Fatal("a normal pane should scroll")
+	}
+	s.ScrollToBottom()
+
+	// Enter the alternate screen, as a full-screen program does on startup.
+	_, _ = s.emu.Write([]byte("\x1b[?1049h"))
+	if !s.emu.IsAltScreen() {
+		t.Fatal("expected the emulator to be on the alternate screen")
+	}
+	if s.ScrollBy(-3) {
+		t.Error("an alt-screen pane must decline the scroll so the program gets it")
+	}
+	if s.Scrolled() {
+		t.Error("an alt-screen pane must stay on the live screen")
+	}
+}

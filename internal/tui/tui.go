@@ -953,6 +953,48 @@ func (m Model) toggleZoom() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// termScrollWheelLines is how far one wheel notch moves a pane's scrollback.
+// Three lines is the conventional notch and is what the deck and diff wheels use.
+const termScrollWheelLines = 3
+
+// scrollTermPane walks the focused terminal pane's scrollback by pages: negative
+// is back into history, positive is toward live output. A page is the pane's own
+// height less one line, so consecutive presses keep one line of overlap and the
+// reader never has to guess whether anything was skipped.
+//
+// It flashes when there is nothing to scroll, because the alternative — a key that
+// silently does nothing — reads as the pane being unscrollable, which is the
+// complaint this answers.
+func (m Model) scrollTermPane(pages int) (tea.Model, tea.Cmd) {
+	s := m.activeSession()
+	if s == nil || m.screen != screenTerminal {
+		return m, nil
+	}
+	_, h := s.Size()
+	if s.ScrollBy(pages * max(1, h-1)) {
+		return m, nil
+	}
+	if pages < 0 {
+		return m, m.flashCmd("no more scrollback")
+	}
+	return m, m.flashCmd("already at the live output")
+}
+
+// scrollTermPaneWheel scrolls the pane under the wheel by a notch and reports
+// whether it consumed the event. It declines for an alt-screen program: nvim,
+// less and the agent TUIs implement their own scrolling and the event belongs to
+// them.
+func (m Model) scrollTermPaneWheel(s *session.Session, up bool) bool {
+	if s == nil {
+		return false
+	}
+	delta := termScrollWheelLines
+	if up {
+		delta = -termScrollWheelLines
+	}
+	return s.ScrollBy(delta)
+}
+
 func (m Model) activeSession() *session.Session {
 	if m.current == nil || m.current.ws == nil {
 		return nil
@@ -3026,7 +3068,8 @@ func (m Model) isReservedActionKey(s string) bool {
 	if m.screen == screenTerminal {
 		switch s {
 		case m.keys.TermSplitV, m.keys.TermSplitH, m.keys.TermZoom, m.keys.TermClose,
-			m.keys.TermFocusLeft, m.keys.TermFocusDown, m.keys.TermFocusUp, m.keys.TermFocusRight:
+			m.keys.TermFocusLeft, m.keys.TermFocusDown, m.keys.TermFocusUp, m.keys.TermFocusRight,
+			m.keys.TermScrollUp, m.keys.TermScrollDown:
 			return true
 		}
 	}
@@ -3118,6 +3161,10 @@ func (m Model) handleSessionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.toggleZoom()
 		case m.keys.TermClose:
 			return m.closeTermPane()
+		case m.keys.TermScrollUp:
+			return m.scrollTermPane(-1)
+		case m.keys.TermScrollDown:
+			return m.scrollTermPane(+1)
 		}
 	}
 
@@ -3548,6 +3595,14 @@ func (m Model) forwardMouse(msg tea.MouseMsg) {
 				_, _ = s.WriteInput([]byte(seq))
 				return
 			}
+		}
+		// A terminal pane running an ordinary shell keeps scrollback but never
+		// requests a mouse mode, so forwarding the notch to the program discards
+		// it — which is what made panes look unscrollable. Scroll the pane's own
+		// history instead. ScrollBy declines for an alt-screen program, whose own
+		// scrolling then still receives the event below.
+		if m.screen == screenTerminal && m.scrollTermPaneWheel(s, e.Mouse().Button == tea.MouseWheelUp) {
+			return
 		}
 		s.SendMouse(uv.MouseWheelEvent(shift(e.Mouse())))
 	case tea.MouseMotionMsg:
