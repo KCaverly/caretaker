@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3517,5 +3518,102 @@ func TestDiffViewersAgreeOnFileJumps(t *testing.T) {
 	preview := ansi.Strip(sm.renderStackSplit(*sm.stackView.status, 0, sm.height-barHeight))
 	if !strings.Contains(preview, "] / [") {
 		t.Errorf("the stack preview should advertise the same spelling:\n%s", preview)
+	}
+}
+
+// TestCreatingWorktreeShowsInDeck covers issue #54: on a large repository the
+// fetch and checkout take long enough that a deck with no sign of the request
+// reads as ct having ignored it. The row has to appear the moment the name is
+// submitted, not when git finishes.
+func TestCreatingWorktreeShowsInDeck(t *testing.T) {
+	m := sampleModel()
+	m.groupsLoaded = true
+	m.focus = focusActive
+	// The first worktree in a fresh checkout is the worst case: nothing else on
+	// screen to reassure the user that anything is happening.
+	m.active = nil
+
+	body := strings.Join(m.renderActive(60, 12), "\n")
+	if !strings.Contains(body, "no workspaces yet") {
+		t.Fatalf("expected the empty state before any creation:\n%s", body)
+	}
+
+	m.beginCreating("repo", "feature-x")
+	body = strings.Join(m.renderActive(60, 12), "\n")
+	for _, want := range []string{"repo", "feature-x", "setting up worktree"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("deck missing %q while creating:\n%s", want, body)
+		}
+	}
+	// The empty-state invitation must not sit beside work already underway.
+	if strings.Contains(body, "no workspaces yet") {
+		t.Errorf("empty state shown alongside a pending creation:\n%s", body)
+	}
+
+	// The pending row is not selectable — there is no worktree to activate yet.
+	_, rowItem := m.activeDisplay(60)
+	for i, idx := range rowItem {
+		if idx != -1 {
+			t.Errorf("display row %d maps to active item %d; pending rows must be non-navigable", i, idx)
+		}
+	}
+
+	// With real worktrees present, the pending row groups under its own repo
+	// header and leaves the existing rows navigable.
+	grouped := sampleModel()
+	grouped.groupsLoaded = true
+	grouped.beginCreating("caretaker", "feature-y")
+	gBody := strings.Join(grouped.renderActive(60, 20), "\n")
+	if !strings.Contains(gBody, "feature-y") || !strings.Contains(gBody, "bugfix") {
+		t.Errorf("pending and real rows should coexist:\n%s", gBody)
+	}
+	navigable := 0
+	for _, idx := range func() []int { _, r := grouped.activeDisplay(60); return r }() {
+		if idx != -1 {
+			navigable++
+		}
+	}
+	if navigable != len(grouped.active) {
+		t.Errorf("%d navigable rows for %d active worktrees; the pending row must not be one", navigable, len(grouped.active))
+	}
+
+	// A finished creation retires the row, success or failure.
+	mm, _ := m.Update(createdMsg{repo: "repo", name: "feature-x", err: errors.New("nope")})
+	m = mm.(Model)
+	if len(m.creating) != 0 {
+		t.Errorf("a failed creation must still retire its row, %d left", len(m.creating))
+	}
+	if body := strings.Join(m.renderActive(60, 12), "\n"); strings.Contains(body, "feature-x") {
+		t.Errorf("retired row still drawn:\n%s", body)
+	}
+}
+
+// TestCreatingSpinnerTimerSelfDisarms pins the one-timer discipline: the tick
+// re-arms only while something is being set up, so no timer runs at rest and two
+// concurrent creations do not animate at double speed.
+func TestCreatingSpinnerTimerSelfDisarms(t *testing.T) {
+	m := sampleModel()
+	m.beginCreating("repo", "a")
+
+	// Update arms exactly one tick, and will not arm a second while it is pending.
+	mm, cmd := m.Update(dirtyMsg{})
+	m = mm.(Model)
+	if !m.creatingTicking || cmd == nil {
+		t.Fatal("a pending creation should arm the spinner tick")
+	}
+	m.beginCreating("repo", "b")
+	mm, _ = m.Update(dirtyMsg{})
+	m = mm.(Model)
+	if !m.creatingTicking {
+		t.Fatal("the tick should stay armed for a second concurrent creation")
+	}
+
+	// With both creations retired, the next tick disarms instead of re-arming.
+	m.endCreating("repo", "a")
+	m.endCreating("repo", "b")
+	mm, cmd = m.Update(creatingTickMsg{})
+	m = mm.(Model)
+	if m.creatingTicking || cmd != nil {
+		t.Fatal("the tick should disarm once nothing is being set up")
 	}
 }
