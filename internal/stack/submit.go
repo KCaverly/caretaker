@@ -346,7 +346,7 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		if rt.AfterPush {
 			continue
 		}
-		if err := retargetAndVerify(dir, st2.Worktree, rt); err != nil {
+		if err := retargetAndVerify(dir, rt); err != nil {
 			return res, err
 		}
 		res.Executed = append(res.Executed, fmt.Sprintf("retargeted PR #%d -> %s", rt.Number, rt.NewBase))
@@ -389,7 +389,7 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		if !rt.AfterPush {
 			continue
 		}
-		if err := retargetAndVerify(dir, st2.Worktree, rt); err != nil {
+		if err := retargetAndVerify(dir, rt); err != nil {
 			return res, err
 		}
 		res.Executed = append(res.Executed, fmt.Sprintf("retargeted PR #%d -> %s", rt.Number, rt.NewBase))
@@ -429,26 +429,30 @@ func execute(o SubmitOptions, p Params, st StackStatus, res SubmitResult) (Submi
 		}
 	}
 
-	// 10. Report the converged status.
-	stFinal, _, err := gatherStatus(p)
-	if err != nil {
-		return res, err
-	}
-	stFinal.Fetched = true
-	res.Status = stFinal
+	// 10. Report the converged status. The nav pass above only rewrites PR bodies,
+	// and a body is not part of a StackStatus, so st3 already *is* the converged
+	// status — re-gathering it would repeat every git and GitHub read to produce
+	// the same answer.
+	st3.Fetched = true
+	res.Status = st3
 	return res, nil
 }
 
-func retargetAndVerify(dir, worktree string, rt RetargetAction) error {
+// retargetAndVerify moves a PR onto a new base and reads that one PR back to
+// confirm it took. The read is a single-PR query rather than a whole-stack
+// gather: the question is about one PR, and a submit retargets every PR in the
+// stack, so a gather here would multiply the stack's size by itself.
+func retargetAndVerify(dir string, rt RetargetAction) error {
 	if err := ghEditBase(dir, rt.Number, rt.NewBase); err != nil {
 		return fmt.Errorf("retargeting PR #%d: %w", rt.Number, err)
 	}
-	prs, gh := gatherGitHub(dir, worktree)
-	if !gh.Available {
-		return fmt.Errorf("verifying retarget of PR #%d: %s", rt.Number, strings.Join(gh.Warnings, "; "))
+	state, base, err := ghPRBase(dir, rt.Number)
+	if err != nil {
+		return fmt.Errorf("verifying retarget of PR #%d: %w", rt.Number, err)
 	}
-	if !prOpenOnBase(prs, rt.Number, rt.NewBase) {
-		return fmt.Errorf("PR #%d was not open on %s after retargeting", rt.Number, rt.NewBase)
+	if state != "OPEN" || base != rt.NewBase {
+		return fmt.Errorf("PR #%d was not open on %s after retargeting (state %s, base %s)",
+			rt.Number, rt.NewBase, state, base)
 	}
 	return nil
 }

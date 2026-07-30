@@ -120,11 +120,13 @@ func Repair(o RepairOptions) (RepairResult, error) {
 	}
 	res.Executed = append(res.Executed, fmt.Sprintf("retargeted PR #%d -> %s", o.PR, res.Plan.NewBase))
 
-	fresh, gh := gatherGitHub(o.WorktreeDir, st.Worktree)
-	if !gh.Available || !prOpenOnBase(fresh, o.PR, res.Plan.NewBase) {
+	// One PR's state and base is the whole question here, so it is read directly
+	// rather than through a stack-wide gather.
+	state, base, err := ghPRBase(o.WorktreeDir, o.PR)
+	if err != nil || state != "OPEN" || base != res.Plan.NewBase {
 		return res, fmt.Errorf("PR #%d was not open on %s after recovery; temporary base %s was preserved", o.PR, res.Plan.NewBase, res.Plan.FormerBase)
 	}
-	if err := ensureBranchHasNoOpenDependents(o.WorktreeDir, st.Worktree, res.Plan.FormerBase); err != nil {
+	if err := ensureBranchHasNoOpenDependents(o.WorktreeDir, st.Worktree, st.MainBranch, res.Plan.FormerBase); err != nil {
 		return res, err
 	}
 	if err := deleteRemoteBranch(o.WorktreeDir, res.Plan.FormerBase); err != nil {

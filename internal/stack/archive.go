@@ -54,10 +54,10 @@ func ArchiveCleanup(p Params) (ArchiveResult, error) {
 	if err != nil {
 		return res, err
 	}
+	if err := ensureBranchesHaveNoOpenDependents(p.WorktreeDir, st.Worktree, st.MainBranch, res.BranchDeletes); err != nil {
+		return res, err
+	}
 	for _, branch := range res.BranchDeletes {
-		if err := ensureBranchHasNoOpenDependents(p.WorktreeDir, st.Worktree, branch); err != nil {
-			return res, err
-		}
 		if err := deleteRemoteBranch(p.WorktreeDir, branch); err != nil {
 			return res, fmt.Errorf("deleting landed remote branch %s: %w", branch, err)
 		}

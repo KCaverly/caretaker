@@ -162,7 +162,10 @@ func gatherStatus(p Params) (StackStatus, []prRecord, error) {
 	if err != nil {
 		return st, nil, err
 	}
-	prs, gh := gatherGitHub(p.WorktreeDir, p.WorktreeName)
+	// The GitHub query is scoped to the branches these two local reads already
+	// name, so it is handed the derived refs rather than re-running them.
+	prs, gh := gatherGitHubFor(p.WorktreeDir, p.WorktreeName,
+		headRefsFrom(p.WorktreeName, commits, remotes))
 	st.GitHub = gh
 
 	st.Stack, st.Commits = reconcile(p.WorktreeName, p.MainBranch, commits, remotes, prs)

@@ -7,9 +7,22 @@ import (
 )
 
 const (
-	postMergeSettleTimeout  = 12 * time.Second
-	postMergeSettleInterval = 500 * time.Millisecond
+	postMergeSettleTimeout = 12 * time.Second
+	// postMergeSettleInterval is the first gap between settle polls; it doubles up
+	// to postMergeSettleMaxInterval. Each poll is a full status (git reads plus a
+	// GitHub round trip), and GitHub's post-merge consistency lag is measured in
+	// seconds, so a fixed half-second cadence spent most of its budget on queries
+	// that could not yet have a different answer.
+	postMergeSettleInterval    = 500 * time.Millisecond
+	postMergeSettleMaxInterval = 3 * time.Second
 )
+
+// settlePoll sleeps before the next poll of an eventual-consistency loop and
+// returns the next (doubled, capped) interval.
+func settlePoll(interval time.Duration) time.Duration {
+	time.Sleep(interval)
+	return min(interval*2, postMergeSettleMaxInterval)
+}
 
 type MergeOptions struct{ Params Params }
 
@@ -71,6 +84,7 @@ func postMergeSettled(st StackStatus, mergedNumber int) bool {
 // transient restack → wait → merge sequence from being presented as real work.
 func settledStatus(p Params, mergedNumber int) (StackStatus, error) {
 	deadline := time.Now().Add(postMergeSettleTimeout)
+	interval := postMergeSettleInterval
 	var latest StackStatus
 	for {
 		st, err := Status(p)
@@ -81,7 +95,7 @@ func settledStatus(p Params, mergedNumber int) (StackStatus, error) {
 		if postMergeSettled(st, mergedNumber) || time.Now().After(deadline) {
 			return latest, nil
 		}
-		time.Sleep(postMergeSettleInterval)
+		interval = settlePoll(interval)
 	}
 }
 
@@ -90,6 +104,7 @@ func settledStatus(p Params, mergedNumber int) (StackStatus, error) {
 // on the repository's automatic branch-deletion setting.
 func waitForMerged(p Params, mergedNumber int) (StackStatus, error) {
 	deadline := time.Now().Add(postMergeSettleTimeout)
+	interval := postMergeSettleInterval
 	for {
 		st, err := Status(p)
 		if err != nil {
@@ -103,7 +118,7 @@ func waitForMerged(p Params, mergedNumber int) (StackStatus, error) {
 		if time.Now().After(deadline) {
 			return st, fmt.Errorf("GitHub did not reflect merge of PR #%d within %s", mergedNumber, postMergeSettleTimeout)
 		}
-		time.Sleep(postMergeSettleInterval)
+		interval = settlePoll(interval)
 	}
 }
 
@@ -111,25 +126,29 @@ func waitForMerged(p Params, mergedNumber int) (StackStatus, error) {
 // newBase and verifies the resulting state. Usually there is one immediate
 // child, but handling all matches keeps cleanup safe in a malformed or
 // concurrently-edited stack.
-func retargetOpenDependents(dir, worktree, oldBase, newBase string) ([]string, error) {
-	prs, gh := gatherGitHub(dir, worktree)
+func retargetOpenDependents(dir, worktree, mainBranch, oldBase, newBase string) ([]string, error) {
+	prs, gh := gatherGitHub(dir, worktree, mainBranch)
 	if !gh.Available {
 		return nil, fmt.Errorf("cannot verify dependents of %s: %s", oldBase, strings.Join(gh.Warnings, "; "))
 	}
 	var changed []string
 	for _, p := range openPRsBasedOn(prs, oldBase) {
 		if err := ghEditBase(dir, p.Number, newBase); err != nil {
-			// GitHub may have auto-retargeted between the read and edit. Verify
-			// the desired state before treating that race as a failure.
-			fresh, freshGH := gatherGitHub(dir, worktree)
-			if !freshGH.Available || !prOpenOnBase(fresh, p.Number, newBase) {
+			// GitHub may have auto-retargeted between the read and edit. Verify the
+			// desired state before treating that race as a failure — a single-PR
+			// read, since the question is about this one PR.
+			state, base, verr := ghPRBase(dir, p.Number)
+			if verr != nil || state != "OPEN" || base != newBase {
 				return changed, fmt.Errorf("retargeting dependent PR #%d from %s to %s: %w", p.Number, oldBase, newBase, err)
 			}
 		}
 		changed = append(changed, fmt.Sprintf("retargeted dependent PR #%d -> %s", p.Number, newBase))
 	}
 
-	fresh, freshGH := gatherGitHub(dir, worktree)
+	// One re-read of the whole scope, not one per dependent: the closing guarantee
+	// is a set property (nothing open still targets oldBase), including a PR that
+	// appeared after the snapshot above.
+	fresh, freshGH := gatherGitHub(dir, worktree, mainBranch)
 	if !freshGH.Available {
 		return changed, fmt.Errorf("cannot verify dependents of %s after retargeting: %s", oldBase, strings.Join(freshGH.Warnings, "; "))
 	}
@@ -176,12 +195,12 @@ func Merge(o MergeOptions) (MergeResult, error) {
 	if _, err := waitForMerged(o.Params, st.MergeHint.Number); err != nil {
 		return res, err
 	}
-	steps, err := retargetOpenDependents(p.WorktreeDir, st.Worktree, *merged.RemoteBranch, merged.PR.Base)
+	steps, err := retargetOpenDependents(p.WorktreeDir, st.Worktree, st.MainBranch, *merged.RemoteBranch, merged.PR.Base)
 	res.Executed = append(res.Executed, steps...)
 	if err != nil {
 		return res, err
 	}
-	if err := ensureBranchHasNoOpenDependents(p.WorktreeDir, st.Worktree, *merged.RemoteBranch); err != nil {
+	if err := ensureBranchHasNoOpenDependents(p.WorktreeDir, st.Worktree, st.MainBranch, *merged.RemoteBranch); err != nil {
 		return res, err
 	}
 	if err := deleteRemoteBranch(p.WorktreeDir, *merged.RemoteBranch); err != nil {
